@@ -143,17 +143,36 @@ def get_marginal_rates(taxable_ordinary: float, cap_gains: float, filing_status:
 
 	return marginal_ordinary, marginal_cg
 
+
+def process_rmd(tda_stocks_mv: float, tda_bonds_mv: float, current_age: int, rmd_start_age: int, table):
+	"""Calculate and withdraw RMD for one person; returns updated balances plus rmd amount and divisor used."""
+	rmd = 0.0
+	divisor = None
+	if current_age >= rmd_start_age:
+		divisor = table.get(current_age)
+		if divisor is None:
+			divisor = max(1.0, 25.0 - (current_age - rmd_start_age))
+		total_tda_balance = tda_stocks_mv + tda_bonds_mv
+		rmd = total_tda_balance / divisor if divisor > 0 else 0.0
+		take_rmd = min(rmd, total_tda_balance)
+		tda_stock_ratio = (tda_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
+		tda_stocks_mv -= take_rmd * tda_stock_ratio
+		tda_bonds_mv -= take_rmd * (1 - tda_stock_ratio)
+	return tda_stocks_mv, tda_bonds_mv, rmd, divisor
+
 def rebalance_accounts(target_stock_pct: float,
 					   taxable_stock_mv: float,
 					   taxable_bond_mv: float,
 					   taxable_stock_basis: float,
 					   taxable_bond_basis: float,
-					   tda_mv: float,
+					   tda1_mv: float,
+					   tda2_mv: float,
 					   roth_mv: float):
-	total_household = taxable_stock_mv + taxable_bond_mv + tda_mv + roth_mv
+	"""Rebalance household portfolio (taxable + two TDAs + Roth) to target stock %, rounded to nearest 10% per account."""
+	total_household = taxable_stock_mv + taxable_bond_mv + tda1_mv + tda2_mv + roth_mv
 	if total_household <= 0:
 		return (taxable_stock_mv, taxable_bond_mv, taxable_stock_basis, taxable_bond_basis,
-				0.0, 0.0, 0.0, 0.0)
+				0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 	desired_stock = total_household * target_stock_pct
 	remaining = desired_stock
@@ -169,9 +188,15 @@ def rebalance_accounts(target_stock_pct: float,
 	remaining -= taxable_stock
 	taxable_bond = taxable_total - taxable_stock
 
-	# TDA: fill the rest
-	tda_stock = min(tda_mv, remaining)
-	tda_bond = tda_mv - tda_stock
+	# TDA 1: fill next
+	tda1_stock = min(tda1_mv, remaining)
+	remaining -= tda1_stock
+	tda1_bond = tda1_mv - tda1_stock
+
+	# TDA 2: remaining stock allocation
+	tda2_stock = min(tda2_mv, remaining)
+	remaining -= tda2_stock
+	tda2_bond = tda2_mv - tda2_stock
 
 	def round_account(stock, bond):
 		total = stock + bond
@@ -185,7 +210,8 @@ def rebalance_accounts(target_stock_pct: float,
 		return stock_new, bond_new
 
 	taxable_stock, taxable_bond = round_account(taxable_stock, taxable_bond)
-	tda_stock, tda_bond = round_account(tda_stock, tda_bond)
+	tda1_stock, tda1_bond = round_account(tda1_stock, tda1_bond)
+	tda2_stock, tda2_bond = round_account(tda2_stock, tda2_bond)
 	roth_stock, roth_bond = round_account(roth_stock, roth_bond)
 
 	# adjust taxable basis proportionally
@@ -198,9 +224,10 @@ def rebalance_accounts(target_stock_pct: float,
 		taxable_bond_basis = taxable_bond_basis
 
 	return (taxable_stock, taxable_bond, taxable_stock_basis, taxable_bond_basis,
-			tda_stock, tda_bond, roth_stock, roth_bond)
+			tda1_stock, tda1_bond, tda2_stock, tda2_bond, roth_stock, roth_bond)
 
-def simulate_withdrawals(start_age: int,
+def simulate_withdrawals(start_age_primary: int,
+						 start_age_spouse: int,
 						 years: int,
 						 taxable_start: float,
 						 stock_total_return: float,
@@ -209,15 +236,19 @@ def simulate_withdrawals(start_age: int,
 						 bond_return: float,
 						 roth_start: float,
 						 tda_start: float,
+						 tda_spouse_start: float,
 						 withdraw_amount: float,
 						 target_stock_pct: float,
 						 taxable_stock_basis_pct: float,
 						 taxable_bond_basis_pct: float,
 						 gross_up_withdrawals: bool = True,
 						 rmd_start_age: int = 73,
+						 rmd_start_age_spouse: int = 73,
 						 ss_income_annual: float = 0.0,
+						 ss_income_spouse_annual: float = 0.0,
 						 ss_cola: float = 0.0,
 						 pension_income_annual: float = 0.0,
+						 pension_income_spouse_annual: float = 0.0,
 						 pension_cola: float = 0.0,
 						 other_income_annual: float = 0.0,
 						 filing_status: str = 'single',
@@ -240,26 +271,29 @@ def simulate_withdrawals(start_age: int,
 	bonds_basis = bonds_mv * taxable_bond_basis_pct
 
 	# initial TDA/Roth totals
-	tda_total = float(tda_start)
+	tda1_total = float(tda_start)
+	tda2_total = float(tda_spouse_start)
 	roth_total = float(roth_start)
 
 	(stocks_mv, bonds_mv, stocks_basis, bonds_basis,
-		tda_stocks_mv, tda_bonds_mv, roth_stocks_mv, roth_bonds_mv) = rebalance_accounts(
+		tda1_stocks_mv, tda1_bonds_mv, tda2_stocks_mv, tda2_bonds_mv, roth_stocks_mv, roth_bonds_mv) = rebalance_accounts(
 		target_stock_pct,
 		stocks_mv, bonds_mv, stocks_basis, bonds_basis,
-		tda_total, roth_total
+		tda1_total, tda2_total, roth_total
 	)
 
 	rows = []
 
 	for y in range(1, years+1):
-		age = start_age + y - 1
+		age_p1 = start_age_primary + y - 1
+		age_p2 = start_age_spouse + y - 1
 		# rebalance at start of each year to target allocation with rounding
 		(stocks_mv, bonds_mv, stocks_basis, bonds_basis,
-			tda_stocks_mv, tda_bonds_mv, roth_stocks_mv, roth_bonds_mv) = rebalance_accounts(
+			tda1_stocks_mv, tda1_bonds_mv, tda2_stocks_mv, tda2_bonds_mv, roth_stocks_mv, roth_bonds_mv) = rebalance_accounts(
 			target_stock_pct,
 			stocks_mv, bonds_mv, stocks_basis, bonds_basis,
-			tda_stocks_mv + tda_bonds_mv,
+			tda1_stocks_mv + tda1_bonds_mv,
+			tda2_stocks_mv + tda2_bonds_mv,
 			roth_stocks_mv + roth_bonds_mv
 		)
 		cap_gain_rate_for_grossup = 0.20
@@ -268,24 +302,27 @@ def simulate_withdrawals(start_age: int,
 		start_bonds_mv = bonds_mv
 		start_stocks_basis = stocks_basis
 		start_bonds_basis = bonds_basis
-		start_tda = tda_stocks_mv + tda_bonds_mv
+		start_tda = tda1_stocks_mv + tda1_bonds_mv
+		start_tda_spouse = tda2_stocks_mv + tda2_bonds_mv
 		start_roth = roth_stocks_mv + roth_bonds_mv
 
 		# apply Roth conversion at start of year before growth
-		conversion_gross = min(roth_conversion_amount, tda_stocks_mv + tda_bonds_mv) if y <= roth_conversion_years else 0.0
+		conversion_gross = min(roth_conversion_amount, tda1_stocks_mv + tda1_bonds_mv) if y <= roth_conversion_years else 0.0
 		if conversion_gross > 0:
-			total_tda_balance = tda_stocks_mv + tda_bonds_mv
-			tda_stock_ratio = (tda_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
-			tda_stocks_mv -= conversion_gross * tda_stock_ratio
-			tda_bonds_mv -= conversion_gross * (1 - tda_stock_ratio)
+			total_tda_balance = tda1_stocks_mv + tda1_bonds_mv
+			tda_stock_ratio = (tda1_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
+			tda1_stocks_mv -= conversion_gross * tda_stock_ratio
+			tda1_bonds_mv -= conversion_gross * (1 - tda_stock_ratio)
 			# temporarily park converted amount; taxes handled after computing tax delta
 			pending_roth_conversion = conversion_gross
 		else:
 			pending_roth_conversion = 0.0
 
 		# grow TDA (per user mix) and Roth (per user mix)
-		tda_stocks_mv *= (1 + stock_total_return)
-		tda_bonds_mv *= (1 + bond_return)
+		tda1_stocks_mv *= (1 + stock_total_return)
+		tda1_bonds_mv *= (1 + bond_return)
+		tda2_stocks_mv *= (1 + stock_total_return)
+		tda2_bonds_mv *= (1 + bond_return)
 		roth_stocks_mv *= (1 + stock_total_return)
 		roth_bonds_mv *= (1 + bond_return)
 
@@ -312,169 +349,114 @@ def simulate_withdrawals(start_age: int,
 		stocks_mv = stocks_mv  # unchanged net of round trip
 		stocks_basis = stocks_basis - turnover_basis_sold + turnover_sale
 
-		# compute RMD from TDA if applicable
-		rmd = 0.0
-		divisor = None
-		if age >= rmd_start_age:
-			divisor = table.get(age)
-			if divisor is None:
-				divisor = max(1.0, 25.0 - (age - rmd_start_age))
-			total_tda_balance = tda_stocks_mv + tda_bonds_mv
-			rmd = total_tda_balance / divisor if divisor > 0 else 0.0
+		# compute RMD for each spouse if applicable
+		tda1_stocks_mv, tda1_bonds_mv, rmd_p1, divisor_p1 = process_rmd(tda1_stocks_mv, tda1_bonds_mv, age_p1, rmd_start_age, table)
+		tda2_stocks_mv, tda2_bonds_mv, rmd_p2, divisor_p2 = process_rmd(tda2_stocks_mv, tda2_bonds_mv, age_p2, rmd_start_age_spouse, table)
 
 		# Begin withdrawal processing
 		wanted = withdraw_amount
 		out_taxable_cash = 0.0
-		withdraw_from_tda = 0.0
+		withdraw_from_tda = rmd_p1 + rmd_p2
 		withdraw_from_roth = 0.0
 		gross_sold_taxable_stocks = 0.0
 		gross_sold_taxable_bonds = 0.0
 		realized_gains_from_sales = 0.0
 		rmd_excess_to_taxable = 0.0
 
-		if rmd > 0:
-			total_tda_balance = tda_stocks_mv + tda_bonds_mv
-			take_rmd = min(rmd, total_tda_balance)
-			tda_stock_ratio = (tda_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
-			tda_stocks_mv -= take_rmd * tda_stock_ratio
-			tda_bonds_mv -= take_rmd * (1 - tda_stock_ratio)
-			withdraw_from_tda += take_rmd
+		def gross_for_net(net, mv, basis, cap_rate):
+			# Solve S such that S - tax = net, tax = (S - basis*(S/mv))*cap_rate
+			if mv <= 0 or net <= 0:
+				return 0.0
+			basis_ratio = basis / mv if mv > 0 else 0.0
+			denom = 1.0 - cap_rate * (1.0 - basis_ratio)
+			if denom <= 0:
+				return mv
+			S = net / denom
+			return min(S, mv)
 
-			if take_rmd > wanted:
-				# excess goes into taxable account (we'll allocate proportionally to current assets)
-				excess = take_rmd - wanted
+		total_rmd_cash = rmd_p1 + rmd_p2
+		if total_rmd_cash > 0:
+			if total_rmd_cash > wanted:
+				excess = total_rmd_cash - wanted
 				rmd_excess_to_taxable = excess
-				# allocate to stocks/bonds in proportion to their market values
 				total_mv = stocks_mv + bonds_mv
 				if total_mv > 0:
 					stocks_mv += excess * (stocks_mv / total_mv)
 					bonds_mv += excess * (bonds_mv / total_mv)
 					# assume excess increases basis proportionally (treated as deposit)
-					stocks_basis += excess * (stocks_basis / (stocks_basis + bonds_basis)) if (stocks_basis + bonds_basis) > 0 else excess * (stocks_mv / (stocks_mv + bonds_mv))
-					bonds_basis += excess * (bonds_basis / (stocks_basis + bonds_basis)) if (stocks_basis + bonds_basis) > 0 else excess * (bonds_mv / (stocks_mv + bonds_mv))
+					if (stocks_basis + bonds_basis) > 0:
+						stocks_basis += excess * (stocks_basis / (stocks_basis + bonds_basis))
+						bonds_basis += excess * (bonds_basis / (stocks_basis + bonds_basis))
+					else:
+						stocks_basis += excess * 0.5
+						bonds_basis += excess * 0.5
 				else:
 					stocks_mv += excess * 0.5
 					bonds_mv += excess * 0.5
 					stocks_basis += excess * 0.5
 					bonds_basis += excess * 0.5
+				remaining = 0.0
 			else:
-				remaining = wanted - take_rmd
-				# withdraw from taxable (gross-up to deliver net if requested)
-				net_needed = remaining
-				# attempt to satisfy from taxable assets
-				def gross_for_net(net, mv, basis, cap_rate):
-					# Solve S such that S - tax = net, tax = (S - basis*(S/mv))*cap_rate
-					# basis_sold = S * (basis/mv)
-					# realized_gain = S - basis_sold = S*(1 - basis/mv)
-					# tax = S*(1 - basis/mv)*cap_rate
-					# net = S - tax = S*(1 - cap_rate*(1 - basis/mv))
-					if mv <= 0 or net <= 0:
-						return 0.0
-					basis_ratio = basis / mv if mv > 0 else 0.0
-					denom = 1.0 - cap_rate * (1.0 - basis_ratio)
-					if denom <= 0:
-						# fallback: sell everything
-						return mv
-					S = net / denom
-					return min(S, mv)
-
-				# try bonds first
-				if net_needed > 0 and bonds_mv > 0:
-					S = gross_for_net(net_needed, bonds_mv, bonds_basis, cap_gain_rate_for_grossup)
-					basis_sold = S * (bonds_basis / bonds_mv) if bonds_mv > 0 else 0.0
-					realized = max(0.0, S - basis_sold)
-					gross_sold_taxable_bonds += S
-					realized_gains_from_sales += realized
-					# apply sale
-					bonds_mv -= S
-					bonds_basis -= basis_sold
-					net_needed -= S
-
-				# if still need, take from stocks
-				if net_needed > 1e-8 and stocks_mv > 0:
-					S = gross_for_net(net_needed, stocks_mv, stocks_basis, cap_gain_rate_for_grossup)
-					basis_sold = S * (stocks_basis / stocks_mv) if stocks_mv > 0 else 0.0
-					realized = max(0.0, S - basis_sold)
-					realized_gains_from_sales += realized
-					gross_sold_taxable_stocks += S
-					stocks_mv -= S
-					stocks_basis -= basis_sold
-					net_needed -= S
-
-				out_taxable_cash += (remaining - max(0.0, net_needed))
-				# if still short after taxable, take from tda then roth
-				if net_needed > 1e-8:
-					total_tda_balance = tda_stocks_mv + tda_bonds_mv
-					take_tda2 = min(net_needed, total_tda_balance)
-					tda_stock_ratio = (tda_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
-					tda_stocks_mv -= take_tda2 * tda_stock_ratio
-					tda_bonds_mv -= take_tda2 * (1 - tda_stock_ratio)
-					withdraw_from_tda += take_tda2
-					net_needed -= take_tda2
-				if net_needed > 1e-8:
-					total_roth_balance = roth_stocks_mv + roth_bonds_mv
-					take_roth = min(net_needed, total_roth_balance)
-					roth_stock_ratio = (roth_stocks_mv / total_roth_balance) if total_roth_balance > 0 else 1.0
-					roth_stocks_mv -= take_roth * roth_stock_ratio
-					roth_bonds_mv -= take_roth * (1 - roth_stock_ratio)
-					withdraw_from_roth += take_roth
-					net_needed -= take_roth
-
+				remaining = wanted - total_rmd_cash
 		else:
-			# no RMD: withdraw desired amount from taxable first
-			net_needed = wanted
-			def gross_for_net(net, mv, basis, cap_rate):
-				if mv <= 0 or net <= 0:
-					return 0.0
-				basis_ratio = basis / mv if mv > 0 else 0.0
-				denom = 1.0 - cap_rate * (1.0 - basis_ratio)
-				if denom <= 0:
-					return mv
-				S = net / denom
-				return min(S, mv)
+			remaining = wanted
 
-			if net_needed > 0 and bonds_mv > 0:
-				S = gross_for_net(net_needed, bonds_mv, bonds_basis, cap_gain_rate_for_grossup)
-				basis_sold = S * (bonds_basis / bonds_mv) if bonds_mv > 0 else 0.0
-				realized = max(0.0, S - basis_sold)
-				realized_gains_from_sales += realized
-				gross_sold_taxable_bonds += S
-				bonds_mv -= S
-				bonds_basis -= basis_sold
-				net_needed -= S
+		# withdraw from taxable (gross-up to deliver net if requested)
+		net_needed = remaining
+		if net_needed > 0 and bonds_mv > 0:
+			S = gross_for_net(net_needed, bonds_mv, bonds_basis, cap_gain_rate_for_grossup) if gross_up_withdrawals else min(net_needed, bonds_mv)
+			basis_sold = S * (bonds_basis / bonds_mv) if bonds_mv > 0 else 0.0
+			realized = max(0.0, S - basis_sold)
+			gross_sold_taxable_bonds += S
+			realized_gains_from_sales += realized
+			bonds_mv -= S
+			bonds_basis -= basis_sold
+			net_needed -= S if gross_up_withdrawals else S
 
-			if net_needed > 1e-8 and stocks_mv > 0:
-				S = gross_for_net(net_needed, stocks_mv, stocks_basis, cap_gain_rate_for_grossup)
-				basis_sold = S * (stocks_basis / stocks_mv) if stocks_mv > 0 else 0.0
-				realized = max(0.0, S - basis_sold)
-				realized_gains_from_sales += realized
-				gross_sold_taxable_stocks += S
-				stocks_mv -= S
-				stocks_basis -= basis_sold
-				net_needed -= S
+		if net_needed > 1e-8 and stocks_mv > 0:
+			S = gross_for_net(net_needed, stocks_mv, stocks_basis, cap_gain_rate_for_grossup) if gross_up_withdrawals else min(net_needed, stocks_mv)
+			basis_sold = S * (stocks_basis / stocks_mv) if stocks_mv > 0 else 0.0
+			realized = max(0.0, S - basis_sold)
+			realized_gains_from_sales += realized
+			gross_sold_taxable_stocks += S
+			stocks_mv -= S
+			stocks_basis -= basis_sold
+			net_needed -= S if gross_up_withdrawals else S
 
-			out_taxable_cash += (wanted - max(0.0, net_needed))
+		out_taxable_cash += (remaining - max(0.0, net_needed))
 
-			if net_needed > 1e-8:
-				total_tda_balance = tda_stocks_mv + tda_bonds_mv
-				take_tda = min(net_needed, total_tda_balance)
-				tda_stock_ratio = (tda_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
-				tda_stocks_mv -= take_tda * tda_stock_ratio
-				tda_bonds_mv -= take_tda * (1 - tda_stock_ratio)
-				withdraw_from_tda += take_tda
-				net_needed -= take_tda
-			if net_needed > 1e-8:
-				total_roth_balance = roth_stocks_mv + roth_bonds_mv
-				take_roth = min(net_needed, total_roth_balance)
-				roth_stock_ratio = (roth_stocks_mv / total_roth_balance) if total_roth_balance > 0 else 1.0
-				roth_stocks_mv -= take_roth * roth_stock_ratio
-				roth_bonds_mv -= take_roth * (1 - roth_stock_ratio)
-				withdraw_from_roth += take_roth
-				net_needed -= take_roth
+		if net_needed > 1e-8:
+			total_tda_balance = tda1_stocks_mv + tda1_bonds_mv
+			take_tda = min(net_needed, total_tda_balance)
+			tda_stock_ratio = (tda1_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
+			tda1_stocks_mv -= take_tda * tda_stock_ratio
+			tda1_bonds_mv -= take_tda * (1 - tda_stock_ratio)
+			withdraw_from_tda += take_tda
+			net_needed -= take_tda
+		if net_needed > 1e-8:
+			total_tda2_balance = tda2_stocks_mv + tda2_bonds_mv
+			take_tda2 = min(net_needed, total_tda2_balance)
+			tda_stock_ratio2 = (tda2_stocks_mv / total_tda2_balance) if total_tda2_balance > 0 else 0.5
+			tda2_stocks_mv -= take_tda2 * tda_stock_ratio2
+			tda2_bonds_mv -= take_tda2 * (1 - tda_stock_ratio2)
+			withdraw_from_tda += take_tda2
+			net_needed -= take_tda2
+		if net_needed > 1e-8:
+			total_roth_balance = roth_stocks_mv + roth_bonds_mv
+			take_roth = min(net_needed, total_roth_balance)
+			roth_stock_ratio = (roth_stocks_mv / total_roth_balance) if total_roth_balance > 0 else 1.0
+			roth_stocks_mv -= take_roth * roth_stock_ratio
+			roth_bonds_mv -= take_roth * (1 - roth_stock_ratio)
+			withdraw_from_roth += take_roth
+			net_needed -= take_roth
 
 		# Other income items (Social Security and pension grow with COLA)
-		ss_income = ss_income_annual * ((1 + ss_cola) ** (y - 1))
-		pension_income = pension_income_annual * ((1 + pension_cola) ** (y - 1))
+		ss_income_p1 = ss_income_annual * ((1 + ss_cola) ** (y - 1))
+		ss_income_p2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1))
+		ss_income = ss_income_p1 + ss_income_p2
+		pension_income_p1 = pension_income_annual * ((1 + pension_cola) ** (y - 1))
+		pension_income_p2 = pension_income_spouse_annual * ((1 + pension_cola) ** (y - 1))
+		pension_income = pension_income_p1 + pension_income_p2
 		other_income = other_income_annual
 
 		# Ordinary income before deductions (exclude cap gains/qualified dividends for stacking)
@@ -535,24 +517,29 @@ def simulate_withdrawals(start_age: int,
 
 		rows.append({
 			'year': y,
-			'age': age,
+			'age_p1': age_p1,
+			'age_p2': age_p2,
 			'start_stocks_mv': start_stocks_mv,
 			'start_bonds_mv': start_bonds_mv,
 			'start_stocks_basis': start_stocks_basis,
 			'start_bonds_basis': start_bonds_basis,
-			'start_tda': start_tda,
+			'start_tda_p1': start_tda,
+			'start_tda_p2': start_tda_spouse,
 			'start_roth': start_roth,
-			'rmd_divisor': divisor,
-			'rmd': rmd,
+			'rmd_divisor_p1': divisor_p1,
+			'rmd_divisor_p2': divisor_p2,
+			'rmd_p1': rmd_p1,
+			'rmd_p2': rmd_p2,
+			'rmd_total': rmd_p1 + rmd_p2,
 			'withdraw_from_taxable_net': out_taxable_cash,
 			'withdraw_from_tda': withdraw_from_tda,
 			'withdraw_from_roth': withdraw_from_roth,
 			'rmd_excess_to_taxable': rmd_excess_to_taxable,
 			'gross_sold_taxable_bonds': gross_sold_taxable_bonds,
 			'gross_sold_taxable_stocks': gross_sold_taxable_stocks,
-			'ss_income': ss_income,
+			'ss_income_total': ss_income,
 			'taxable_social_security': taxable_ss,
-			'pension_income': pension_income,
+			'pension_income_total': pension_income,
 			'other_income': other_income,
 			'roth_conversion': pending_roth_conversion,
 			'roth_conversion_tax': roth_conversion_tax_delta,
@@ -571,7 +558,9 @@ def simulate_withdrawals(start_age: int,
 			'end_taxable_total': stocks_mv + bonds_mv,
 			'end_stocks_basis': stocks_basis,
 			'end_bonds_basis': bonds_basis,
-			'end_tda': tda_stocks_mv + tda_bonds_mv,
+			'end_tda_p1': tda1_stocks_mv + tda1_bonds_mv,
+			'end_tda_p2': tda2_stocks_mv + tda2_bonds_mv,
+			'end_tda_total': (tda1_stocks_mv + tda1_bonds_mv + tda2_stocks_mv + tda2_bonds_mv),
 			'end_roth': roth_stocks_mv + roth_bonds_mv,
 		})
 
@@ -583,13 +572,15 @@ def main():
 
 	with st.sidebar:
 		st.header('Inputs')
-		start_age = st.number_input('Starting age', min_value=18, max_value=120, value=60)
+		start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=60)
+		start_age_spouse = st.number_input('Starting age (person 2)', min_value=18, max_value=120, value=60)
 		years = st.number_input('Years to simulate', min_value=1, max_value=100, value=30)
 		taxable_start = st.number_input('Taxable account starting balance', value=300000.0, step=1000.0)
 		taxable_stock_basis_pct = st.number_input('Taxable stock basis % of market value', value=50.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
 		taxable_bond_basis_pct = st.number_input('Taxable bond basis % of market value', value=100.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
 		roth_start = st.number_input('Roth account starting balance', value=0.0, step=1000.0)
-		tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k)', value=700000.0, step=1000.0)
+		tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=700000.0, step=1000.0)
+		tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=0.0, step=1000.0)
 		st.markdown('**Household allocation target**')
 		# household target allocation
 		target_stock_pct = st.slider('Household target % in stocks', min_value=0, max_value=100, value=60, step=10) / 100.0
@@ -599,12 +590,15 @@ def main():
 
 		st.markdown('---')
 		withdraw_amount = st.number_input('Desired annual withdrawal', value=40000.0, step=1000.0)
-		rmd_start_age = st.number_input('RMD start age', min_value=65, max_value=90, value=73)
+		rmd_start_age = st.number_input('RMD start age (person 1)', min_value=65, max_value=90, value=73)
+		rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73)
 
 		st.markdown('Other income (all taxed as ordinary for now)')
-		ss_income_input = st.number_input('Annual Social Security (current year)', value=40000.0, step=1000.0)
+		ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=40000.0, step=1000.0)
+		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=0.0, step=1000.0)
 		ss_cola = st.number_input('Social Security COLA', value=0.02, format="%.4f")
-		pension_income_input = st.number_input('Annual pension income', value=24000.0, step=1000.0)
+		pension_income_input = st.number_input('Annual pension income - person 1', value=24000.0, step=1000.0)
+		pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=0.0, step=1000.0)
 		pension_cola = st.number_input('Pension COLA', value=0.00, format="%.4f")
 		other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0)
 
@@ -628,7 +622,8 @@ def main():
 
 	df = None
 	if st.button('Run simulation'):
-		df = simulate_withdrawals(start_age=int(start_age),
+		df = simulate_withdrawals(start_age_primary=int(start_age),
+								  start_age_spouse=int(start_age_spouse),
 								  years=int(years),
 								  taxable_start=float(taxable_start),
 								  stock_total_return=float(stock_total_return),
@@ -637,15 +632,19 @@ def main():
 								  bond_return=float(bond_return),
 								  roth_start=float(roth_start),
 								  tda_start=float(tda_start),
+								  tda_spouse_start=float(tda_spouse_start),
 								  target_stock_pct=float(target_stock_pct),
 								  taxable_stock_basis_pct=float(taxable_stock_basis_pct),
 								  taxable_bond_basis_pct=float(taxable_bond_basis_pct),
 								  withdraw_amount=float(withdraw_amount),
 								  gross_up_withdrawals=bool(gross_up),
 								  rmd_start_age=int(rmd_start_age),
+								  rmd_start_age_spouse=int(rmd_start_age_spouse),
 								  ss_income_annual=float(ss_income_input),
+								  ss_income_spouse_annual=float(ss_income_spouse_input),
 								  ss_cola=float(ss_cola),
 								  pension_income_annual=float(pension_income_input),
+								  pension_income_spouse_annual=float(pension_income_spouse_input),
 								  pension_cola=float(pension_cola),
 								  other_income_annual=float(other_income_input),
 								  filing_status=filing_status_key,
@@ -660,17 +659,17 @@ def main():
 		st.subheader('Year-by-year table')
 		st.dataframe(df.round(int(display_decimals)).style.format({
 			'start_stocks_mv': currency_fmt, 'start_bonds_mv': currency_fmt, 'start_stocks_basis': currency_fmt, 'start_bonds_basis': currency_fmt,
-			'start_tda': currency_fmt, 'start_roth': currency_fmt,
-			'rmd': currency_fmt, 'withdraw_from_taxable_net': currency_fmt, 'withdraw_from_tda': currency_fmt, 'withdraw_from_roth': currency_fmt,
+			'start_tda_p1': currency_fmt, 'start_tda_p2': currency_fmt, 'start_roth': currency_fmt,
+			'rmd_p1': currency_fmt, 'rmd_p2': currency_fmt, 'rmd_total': currency_fmt, 'withdraw_from_taxable_net': currency_fmt, 'withdraw_from_tda': currency_fmt, 'withdraw_from_roth': currency_fmt,
 			'rmd_excess_to_taxable': currency_fmt,
 			'gross_sold_taxable_bonds': currency_fmt, 'gross_sold_taxable_stocks': currency_fmt,
-			'ss_income': currency_fmt, 'taxable_social_security': currency_fmt, 'pension_income': currency_fmt, 'other_income': currency_fmt,
+			'ss_income_total': currency_fmt, 'taxable_social_security': currency_fmt, 'pension_income_total': currency_fmt, 'other_income': currency_fmt,
 			'roth_conversion': currency_fmt, 'roth_conversion_tax': currency_fmt,
 			'deduction_applied': currency_fmt, 'ordinary_taxable_income': currency_fmt,
 			'capital_gains': currency_fmt,
 			'end_stocks_mv': currency_fmt, 'end_bonds_mv': currency_fmt, 'end_stocks_basis': currency_fmt, 'end_bonds_basis': currency_fmt,
 			'end_taxable_total': currency_fmt,
-			'end_tda': currency_fmt, 'end_roth': currency_fmt,
+			'end_tda_p1': currency_fmt, 'end_tda_p2': currency_fmt, 'end_tda_total': currency_fmt, 'end_roth': currency_fmt,
 			'ordinary_tax_total': currency_fmt, 'capital_gains_tax': currency_fmt, 'niit_tax': currency_fmt, 'total_taxes': currency_fmt,
 			'marginal_ordinary_rate': '{:.2%}'.format, 'marginal_cap_gains_rate': '{:.2%}'.format
 		}))
@@ -683,7 +682,7 @@ def main():
 		st.area_chart(chart_df)
 
 		st.subheader('Account balances over time')
-		bal_df = currency_round[['year','end_taxable_total','end_tda','end_roth']].set_index('year')
+		bal_df = currency_round[['year','end_taxable_total','end_tda_total','end_roth']].set_index('year')
 		st.line_chart(bal_df)
 
 		st.subheader('Taxes paid per year')
@@ -728,13 +727,13 @@ def main():
 
 		# Store latest summary in session for post-run saving
 		last = df.iloc[-1]
-		total_accounts = last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda'] + last['end_roth']
+		total_accounts = last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth']
 		st.session_state['last_summary'] = {
 			'label': f"conversion ${roth_conversion_amount:,.0f} for {roth_conversion_years} yrs, taxes from {roth_conversion_tax_source}",
 			'total_taxes': float(lifetime_taxes),
 			'total_accounts': float(total_accounts),
 			'taxable_end': float(last['end_stocks_mv'] + last['end_bonds_mv']),
-			'tda_end': float(last['end_tda']),
+			'tda_end': float(last['end_tda_total']),
 			'roth_end': float(last['end_roth']),
 		}
 
@@ -742,9 +741,9 @@ def main():
 		st.write('Ending balances')
 		last = currency_round.iloc[-1]
 		taxable_total_end = last['end_stocks_mv'] + last['end_bonds_mv']
-		st.write({'taxable_end': taxable_total_end, 'stocks_end': last['end_stocks_mv'], 'stocks_end_basis': last['end_stocks_basis'], 'bonds_end': last['end_bonds_mv'], 'bonds_end_basis': last['end_bonds_basis'], 'tda_end': last['end_tda'], 'roth_end': last['end_roth']})
+		st.write({'taxable_end': taxable_total_end, 'stocks_end': last['end_stocks_mv'], 'stocks_end_basis': last['end_stocks_basis'], 'bonds_end': last['end_bonds_mv'], 'bonds_end_basis': last['end_bonds_basis'], 'tda_end': last['end_tda_total'], 'roth_end': last['end_roth']})
 	else:
-		st.info('Set inputs and click "Run simulation" to see results.')
+		st.info('Set inputs and click \"Run simulation\" to see results.')
 
 	# Scenario saving/comparison (up to 5), available after a run
 	scenario_name_default = st.session_state.get('last_summary', {}).get('name', 'Scenario 1')
