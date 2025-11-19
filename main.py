@@ -349,6 +349,15 @@ def simulate_withdrawals(start_age_primary: int,
 		stocks_mv = stocks_mv  # unchanged net of round trip
 		stocks_basis = stocks_basis - turnover_basis_sold + turnover_sale
 
+		# capture portfolio growth before any withdrawals/RMDs/taxes
+		start_total_balance = start_stocks_mv + start_bonds_mv + start_tda + start_tda_spouse + start_roth
+		investable_start_total = start_total_balance - conversion_gross
+		total_after_return = (stocks_mv + bonds_mv +
+							  tda1_stocks_mv + tda1_bonds_mv +
+							  tda2_stocks_mv + tda2_bonds_mv +
+							  roth_stocks_mv + roth_bonds_mv)
+		investment_return_dollars = total_after_return - investable_start_total
+
 		# compute RMD for each spouse if applicable
 		tda1_stocks_mv, tda1_bonds_mv, rmd_p1, divisor_p1 = process_rmd(tda1_stocks_mv, tda1_bonds_mv, age_p1, rmd_start_age, table)
 		tda2_stocks_mv, tda2_bonds_mv, rmd_p2, divisor_p2 = process_rmd(tda2_stocks_mv, tda2_bonds_mv, age_p2, rmd_start_age_spouse, table)
@@ -558,6 +567,7 @@ def simulate_withdrawals(start_age_primary: int,
 			'end_taxable_total': stocks_mv + bonds_mv,
 			'end_stocks_basis': stocks_basis,
 			'end_bonds_basis': bonds_basis,
+			'investment_return_dollars': investment_return_dollars,
 			'end_tda_p1': tda1_stocks_mv + tda1_bonds_mv,
 			'end_tda_p2': tda2_stocks_mv + tda2_bonds_mv,
 			'end_tda_total': (tda1_stocks_mv + tda1_bonds_mv + tda2_stocks_mv + tda2_bonds_mv),
@@ -594,10 +604,10 @@ def main():
 		rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73)
 
 		st.markdown('Other income (all taxed as ordinary for now)')
-		ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=40000.0, step=1000.0)
-		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=0.0, step=1000.0)
+		ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=30000.0, step=1000.0)
+		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=20000.0, step=1000.0)
 		ss_cola = st.number_input('Social Security COLA', value=0.02, format="%.4f")
-		pension_income_input = st.number_input('Annual pension income - person 1', value=24000.0, step=1000.0)
+		pension_income_input = st.number_input('Annual pension income - person 1', value=10000.0, step=1000.0)
 		pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=0.0, step=1000.0)
 		pension_cola = st.number_input('Pension COLA', value=0.00, format="%.4f")
 		other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0)
@@ -668,7 +678,7 @@ def main():
 			'deduction_applied': currency_fmt, 'ordinary_taxable_income': currency_fmt,
 			'capital_gains': currency_fmt,
 			'end_stocks_mv': currency_fmt, 'end_bonds_mv': currency_fmt, 'end_stocks_basis': currency_fmt, 'end_bonds_basis': currency_fmt,
-			'end_taxable_total': currency_fmt,
+			'end_taxable_total': currency_fmt, 'investment_return_dollars': currency_fmt,
 			'end_tda_p1': currency_fmt, 'end_tda_p2': currency_fmt, 'end_tda_total': currency_fmt, 'end_roth': currency_fmt,
 			'ordinary_tax_total': currency_fmt, 'capital_gains_tax': currency_fmt, 'niit_tax': currency_fmt, 'total_taxes': currency_fmt,
 			'marginal_ordinary_rate': '{:.2%}'.format, 'marginal_cap_gains_rate': '{:.2%}'.format
