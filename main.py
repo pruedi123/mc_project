@@ -572,15 +572,15 @@ def main():
 
 	with st.sidebar:
 		st.header('Inputs')
-		start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=60)
+		start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65)
 		start_age_spouse = st.number_input('Starting age (person 2)', min_value=18, max_value=120, value=60)
 		years = st.number_input('Years to simulate', min_value=1, max_value=100, value=30)
 		taxable_start = st.number_input('Taxable account starting balance', value=300000.0, step=1000.0)
 		taxable_stock_basis_pct = st.number_input('Taxable stock basis % of market value', value=50.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
 		taxable_bond_basis_pct = st.number_input('Taxable bond basis % of market value', value=100.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
 		roth_start = st.number_input('Roth account starting balance', value=0.0, step=1000.0)
-		tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=700000.0, step=1000.0)
-		tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=0.0, step=1000.0)
+		tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=400000.0, step=1000.0)
+		tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=300000.0, step=1000.0)
 		st.markdown('**Household allocation target**')
 		# household target allocation
 		target_stock_pct = st.slider('Household target % in stocks', min_value=0, max_value=100, value=60, step=10) / 100.0
