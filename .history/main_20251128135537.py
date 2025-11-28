@@ -675,7 +675,7 @@ def main():
 		taxable_log_volatility = st.number_input('Taxable/TDA log volatility (σ)', value=0.127, format="%.4f")
 		roth_log_drift = 0.090382612
 		roth_log_volatility = 0.204852769
-		random_seed_input = st.number_input('Random seed for returns', value=44, step=1)
+		random_seed_input = st.number_input('Random seed for returns', value=43, step=1)
 		seed_mode = st.radio('Seed mode', ['Random each run', 'Fixed at 42'], horizontal=True)
 		stock_dividend_yield = st.number_input('Stock dividend (qualified) yield', value=0.02, format="%.4f")
 		stock_turnover = st.number_input('Stock turnover rate', value=0.10, format="%.4f")
@@ -684,7 +684,7 @@ def main():
 		gross_up = st.checkbox('Gross-up taxable sales to deliver requested net withdrawal (recommended)', value=True)
 		display_decimals = st.number_input('Decimal places for tables/charts', min_value=0, max_value=6, value=0, step=1)
 
-	years = max(1, max(life_expectancy_primary - start_age + 1, life_expectancy_spouse - start_age_spouse + 1))
+	years = max(1, max(life_expectancy_primary - start_age, life_expectancy_spouse - start_age_spouse) + 2)
 
 	df = None
 	if st.button('Run simulation'):
@@ -744,15 +744,6 @@ def main():
 		display_df = df.round(int(display_decimals)).copy()
 		display_df['portfolio_return'] = df['portfolio_return']
 		display_df['roth_return_used'] = df['roth_return_used']
-
-		years_simulated = len(df)
-		final_total = float(last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth'])
-		portfolio_cagr = ((final_total / initial_total) ** (1.0 / years_simulated) - 1.0) if initial_total > 0 and years_simulated > 0 else 0.0
-		roth_growth_factor = (df['roth_return_used'] + 1.0).prod()
-		roth_cagr = (roth_growth_factor ** (1.0 / years_simulated) - 1.0) if years_simulated > 0 else 0.0
-		c1, c2 = st.columns(2)
-		c1.metric('Portfolio CAGR', f"{portfolio_cagr:.2%}")
-		c2.metric('Roth CAGR', f"{roth_cagr:.2%}")
 
 		st.subheader('Year-by-year table')
 		st.caption(f'Years simulated: {len(df)}')
@@ -829,6 +820,9 @@ def main():
 		portfolio_cagr = ((final_total / initial_total) ** (1.0 / years_simulated) - 1.0) if initial_total > 0 and years_simulated > 0 else 0.0
 		roth_growth_factor = (df['roth_return_used'] + 1.0).prod()
 		roth_cagr = (roth_growth_factor ** (1.0 / years_simulated) - 1.0) if years_simulated > 0 else 0.0
+		st.metric('Portfolio CAGR', f"{portfolio_cagr:.2%}")
+		st.metric('Roth CAGR', f"{roth_cagr:.2%}")
+
 		# Store latest summary in session for post-run saving
 		last = df.iloc[-1]
 		total_accounts = last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth']

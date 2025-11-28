@@ -259,7 +259,6 @@ def simulate_withdrawals(start_age_primary: int,
 						 roth_conversion_years: int = 0,
 						 stock_return_series: Optional[Sequence[float]] = None,
 						 bond_return_series: Optional[Sequence[float]] = None,
-						 roth_return_series: Optional[Sequence[float]] = None,
 						 life_expectancy_primary: int = 120,
 						 life_expectancy_spouse: int = 120):
 	table = get_uniform_lifetime_table()
@@ -291,8 +290,6 @@ def simulate_withdrawals(start_age_primary: int,
 		raise ValueError('stock_return_series must have at least `years` entries')
 	if bond_return_series is not None and len(bond_return_series) < years:
 		raise ValueError('bond_return_series must have at least `years` entries')
-	if roth_return_series is not None and len(roth_return_series) < years:
-		raise ValueError('roth_return_series must have at least `years` entries')
 
 	rows = []
 
@@ -335,17 +332,15 @@ def simulate_withdrawals(start_age_primary: int,
 
 		stock_return_year = stock_return_series[y-1] if stock_return_series is not None else stock_total_return
 		bond_return_year = bond_return_series[y-1] if bond_return_series is not None else bond_return
-		roth_return_year = roth_return_series[y-1] if roth_return_series is not None else stock_return_year
 
 		# grow TDA (per user mix) and Roth (per user mix)
 		tda1_stocks_mv *= (1 + stock_return_year)
 		tda1_bonds_mv *= (1 + bond_return_year)
 		tda2_stocks_mv *= (1 + stock_return_year)
 		tda2_bonds_mv *= (1 + bond_return_year)
-		roth_stocks_mv *= (1 + roth_return_year)
-		roth_bonds_mv *= (1 + roth_return_year)
+		roth_stocks_mv *= (1 + stock_return_year)
+		roth_bonds_mv *= (1 + bond_return_year)
 
-		# Stocks: split total return into price appreciation and dividend yield
 		# Stocks: split total return into price appreciation and dividend yield
 		price_return = (1 + stock_return_year) / (1 + stock_dividend_yield) - 1
 		# apply price appreciation
@@ -488,7 +483,7 @@ def simulate_withdrawals(start_age_primary: int,
 			net_needed -= take_roth
 
 		filing_status_this_year = filing_status
-		if filing_status == 'mfj' and (not spouse_alive or not primary_alive):
+		if filing_status == 'mfj' and not spouse_alive:
 			filing_status_this_year = 'single'
 
 		# Other income items (Social Security and pension grow with COLA)
@@ -559,7 +554,6 @@ def simulate_withdrawals(start_age_primary: int,
 		rows.append({
 			'year': y,
 			'portfolio_return': stock_return_year,
-			'roth_return_used': roth_return_year,
 			'age_p1': age_p1,
 			'age_p2': age_p2,
 			'start_stocks_mv': start_stocks_mv,
@@ -623,8 +617,8 @@ def main():
 		st.header('Inputs')
 		start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65)
 		start_age_spouse = st.number_input('Starting age (person 2)', min_value=18, max_value=120, value=60)
-		life_expectancy_primary = st.number_input('Primary life expectancy (last age lived through)', min_value=int(start_age), max_value=120, value=84, step=1)
-		life_expectancy_spouse = st.number_input('Spouse life expectancy (last age lived through)', min_value=int(start_age_spouse), max_value=120, value=89, step=1)
+		life_expectancy_primary = st.number_input('Primary life expectancy (last age lived through)', min_value=int(start_age), max_value=120, value=95, step=1)
+		life_expectancy_spouse = st.number_input('Spouse life expectancy (last age lived through)', min_value=int(start_age_spouse), max_value=120, value=84, step=1)
 		taxable_start = st.number_input('Taxable account starting balance', value=300000.0, step=1000.0)
 		taxable_stock_basis_pct = st.number_input('Taxable stock basis % of market value', value=50.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
 		taxable_bond_basis_pct = st.number_input('Taxable bond basis % of market value', value=100.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
@@ -659,24 +653,23 @@ def main():
 		use_itemized = st.checkbox('Use itemized deductions instead of standard', value=False)
 		itemized_deduction_input = st.number_input('Itemized deduction amount', value=0.0, step=500.0)
 		st.caption(f'Standard deduction used if not itemizing: ${standard_deduction_display:,.0f}')
-		inheritor_marginal_rate = st.number_input(
-			'Inheritor marginal tax rate on TDAs',
-			value=0.22,
-			min_value=0.0,
-			max_value=0.37,
-			format="%.4f"
-		)
 
 		st.markdown('Expected annual returns and taxable details')
-		st.caption('Taxable/TDA follow lognormal 7% drift / 12.7% vol; Roth uses 9.038% / 20.485% (log parameters).')
+		use_lognormal_returns = st.checkbox('Generate lognormal portfolio returns', value=True)
 		stock_total_return = 0.0
 		bond_return = 0.0
-		taxable_log_drift = st.number_input('Taxable/TDA log drift (µ)', value=0.07, format="%.4f")
-		taxable_log_volatility = st.number_input('Taxable/TDA log volatility (σ)', value=0.127, format="%.4f")
-		roth_log_drift = 0.090382612
-		roth_log_volatility = 0.204852769
-		random_seed_input = st.number_input('Random seed for returns', value=44, step=1)
-		seed_mode = st.radio('Seed mode', ['Random each run', 'Fixed at 42'], horizontal=True)
+		portfolio_log_drift = 0.07
+		portfolio_log_volatility = 0.127
+		random_seed = 42
+		if use_lognormal_returns:
+			st.caption('Each year uses a draw from a single lognormal return distribution instead of fixed yields.')
+			with st.expander('Lognormal return parameters', expanded=True):
+				portfolio_log_drift = st.number_input('Log return drift (µ)', value=0.07, format="%.4f")
+				portfolio_log_volatility = st.number_input('Log return volatility (σ)', value=0.127, format="%.4f")
+				random_seed = st.number_input('Random seed for returns', value=42, step=1)
+		else:
+			stock_total_return = st.number_input('Stock total return', value=0.10, format="%.4f")
+			bond_return = st.number_input('Bond interest yield', value=0.04, format="%.4f")
 		stock_dividend_yield = st.number_input('Stock dividend (qualified) yield', value=0.02, format="%.4f")
 		stock_turnover = st.number_input('Stock turnover rate', value=0.10, format="%.4f")
 		st.info('You can set stock/bond splits separately for Roth and tax-deferred in the balances section.')
@@ -684,20 +677,18 @@ def main():
 		gross_up = st.checkbox('Gross-up taxable sales to deliver requested net withdrawal (recommended)', value=True)
 		display_decimals = st.number_input('Decimal places for tables/charts', min_value=0, max_value=6, value=0, step=1)
 
-	years = max(1, max(life_expectancy_primary - start_age + 1, life_expectancy_spouse - start_age_spouse + 1))
+	years = max(1, max(life_expectancy_primary - start_age, life_expectancy_spouse - start_age_spouse) + 1)
 
 	df = None
 	if st.button('Run simulation'):
 		stock_return_series = None
 		bond_return_series = None
 		sim_years = int(years)
-		if seed_mode == 'Fixed at 42':
-			seed_value = 42
-		else:
-			seed_value = np.random.default_rng().integers(0, 2**32 - 1)
-		rng = np.random.default_rng(seed_value)
-		taxable_return_series = sample_lognormal_returns(sim_years, float(taxable_log_drift), float(taxable_log_volatility), rng)
-		roth_return_series = sample_lognormal_returns(sim_years, float(roth_log_drift), float(roth_log_volatility), rng)
+		if use_lognormal_returns:
+			rng = np.random.default_rng(int(random_seed))
+			portfolio_return_series = sample_lognormal_returns(sim_years, float(portfolio_log_drift), float(portfolio_log_volatility), rng)
+			stock_return_series = portfolio_return_series.tolist()
+			bond_return_series = stock_return_series
 		df = simulate_withdrawals(start_age_primary=int(start_age),
 				start_age_spouse=int(start_age_spouse),
 				years=sim_years,
@@ -729,30 +720,16 @@ def main():
 				roth_conversion_amount=float(roth_conversion_amount),
 				roth_conversion_years=int(roth_conversion_years),
 				roth_conversion_tax_source='taxable' if roth_conversion_tax_source == 'Taxable' else 'tda',
-				stock_return_series=taxable_return_series,
-				bond_return_series=taxable_return_series,
-				roth_return_series=roth_return_series,
+				stock_return_series=stock_return_series,
+				bond_return_series=bond_return_series,
 				life_expectancy_primary=int(life_expectancy_primary),
 				life_expectancy_spouse=int(life_expectancy_spouse))
 
 
-	initial_total = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
-
 	if df is not None:
-		last = df.iloc[-1]
 		currency_fmt = f'${{:,.{int(display_decimals)}f}}'
 		display_df = df.round(int(display_decimals)).copy()
 		display_df['portfolio_return'] = df['portfolio_return']
-		display_df['roth_return_used'] = df['roth_return_used']
-
-		years_simulated = len(df)
-		final_total = float(last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth'])
-		portfolio_cagr = ((final_total / initial_total) ** (1.0 / years_simulated) - 1.0) if initial_total > 0 and years_simulated > 0 else 0.0
-		roth_growth_factor = (df['roth_return_used'] + 1.0).prod()
-		roth_cagr = (roth_growth_factor ** (1.0 / years_simulated) - 1.0) if years_simulated > 0 else 0.0
-		c1, c2 = st.columns(2)
-		c1.metric('Portfolio CAGR', f"{portfolio_cagr:.2%}")
-		c2.metric('Roth CAGR', f"{roth_cagr:.2%}")
 
 		st.subheader('Year-by-year table')
 		st.caption(f'Years simulated: {len(df)}')
@@ -771,8 +748,7 @@ def main():
 			'end_tda_p1': currency_fmt, 'end_tda_p2': currency_fmt, 'end_tda_total': currency_fmt, 'end_roth': currency_fmt,
 			'ordinary_tax_total': currency_fmt, 'capital_gains_tax': currency_fmt, 'niit_tax': currency_fmt, 'total_taxes': currency_fmt,
 			'marginal_ordinary_rate': '{:.2%}'.format, 'marginal_cap_gains_rate': '{:.2%}'.format,
-			'portfolio_return': '{:.2%}'.format,
-			'roth_return_used': '{:.2%}'.format
+			'portfolio_return': '{:.2%}'.format
 		}))
 
 		currency_round = df.round(int(display_decimals))
@@ -824,17 +800,9 @@ def main():
 		st.metric('Total lifetime taxes paid', currency_fmt.format(lifetime_taxes))
 		st.caption(f'Ordinary: {currency_fmt.format(lifetime_ordinary_tax)} | Capital gains/QD: {currency_fmt.format(lifetime_cap_gains_tax)}')
 
-		years_simulated = len(df)
-		final_total = float(last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth'])
-		portfolio_cagr = ((final_total / initial_total) ** (1.0 / years_simulated) - 1.0) if initial_total > 0 and years_simulated > 0 else 0.0
-		roth_growth_factor = (df['roth_return_used'] + 1.0).prod()
-		roth_cagr = (roth_growth_factor ** (1.0 / years_simulated) - 1.0) if years_simulated > 0 else 0.0
 		# Store latest summary in session for post-run saving
 		last = df.iloc[-1]
 		total_accounts = last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth']
-		after_tax_end = float(last['end_stocks_mv'] + last['end_bonds_mv'])
-		after_tax_end += float(last['end_roth'])
-		after_tax_end += float(last['end_tda_total']) * max(0.0, 1.0 - inheritor_marginal_rate)
 		st.session_state['last_summary'] = {
 			'label': f"conversion ${roth_conversion_amount:,.0f} for {roth_conversion_years} yrs, taxes from {roth_conversion_tax_source}",
 			'total_taxes': float(lifetime_taxes),
@@ -842,17 +810,13 @@ def main():
 			'taxable_end': float(last['end_stocks_mv'] + last['end_bonds_mv']),
 			'tda_end': float(last['end_tda_total']),
 			'roth_end': float(last['end_roth']),
-			'inheritor_marginal_rate': float(inheritor_marginal_rate),
-			'after_tax_end': after_tax_end,
-			'portfolio_cagr': portfolio_cagr,
-			'roth_cagr': roth_cagr,
 		}
 
 		st.markdown('---')
 		st.write('Ending balances')
-		last_row = currency_round.iloc[-1]
-		taxable_total_end = last_row['end_stocks_mv'] + last_row['end_bonds_mv']
-		st.write({'taxable_end': taxable_total_end, 'stocks_end': last_row['end_stocks_mv'], 'stocks_end_basis': last_row['end_stocks_basis'], 'bonds_end': last_row['end_bonds_mv'], 'bonds_end_basis': last_row['end_bonds_basis'], 'tda_end': last_row['end_tda_total'], 'roth_end': last_row['end_roth']})
+		last = currency_round.iloc[-1]
+		taxable_total_end = last['end_stocks_mv'] + last['end_bonds_mv']
+		st.write({'taxable_end': taxable_total_end, 'stocks_end': last['end_stocks_mv'], 'stocks_end_basis': last['end_stocks_basis'], 'bonds_end': last['end_bonds_mv'], 'bonds_end_basis': last['end_bonds_basis'], 'tda_end': last['end_tda_total'], 'roth_end': last['end_roth']})
 	else:
 		st.info('Set inputs and click "Run simulation" to see results.')
 
@@ -884,11 +848,7 @@ def main():
 			'total_taxes': currency_fmt if 'currency_fmt' in locals() else '${:,.0f}',
 			'taxable_end': currency_fmt if 'currency_fmt' in locals() else '${:,.0f}',
 			'tda_end': currency_fmt if 'currency_fmt' in locals() else '${:,.0f}',
-			'roth_end': currency_fmt if 'currency_fmt' in locals() else '${:,.0f}',
-			'after_tax_end': currency_fmt if 'currency_fmt' in locals() else '${:,.0f}',
-			'inheritor_marginal_rate': '{:.2%}'.format,
-			'portfolio_cagr': '{:.2%}'.format,
-			'roth_cagr': '{:.2%}'.format
+			'roth_end': currency_fmt if 'currency_fmt' in locals() else '${:,.0f}'
 		}))
 
 

@@ -668,15 +668,14 @@ def main():
 		)
 
 		st.markdown('Expected annual returns and taxable details')
-		st.caption('Taxable/TDA follow lognormal 7% drift / 12.7% vol; Roth uses 9.038% / 20.485% (log parameters).')
+		st.caption('Taxable/TDA follow lognormal 7% drift / 12.7% vol; Roth uses 12% / 18.5%.')
 		stock_total_return = 0.0
 		bond_return = 0.0
 		taxable_log_drift = st.number_input('Taxable/TDA log drift (µ)', value=0.07, format="%.4f")
 		taxable_log_volatility = st.number_input('Taxable/TDA log volatility (σ)', value=0.127, format="%.4f")
-		roth_log_drift = 0.090382612
-		roth_log_volatility = 0.204852769
-		random_seed_input = st.number_input('Random seed for returns', value=44, step=1)
-		seed_mode = st.radio('Seed mode', ['Random each run', 'Fixed at 42'], horizontal=True)
+		roth_log_drift = 0.12
+		roth_log_volatility = 0.185
+		random_seed = st.number_input('Random seed for returns', value=42, step=1)
 		stock_dividend_yield = st.number_input('Stock dividend (qualified) yield', value=0.02, format="%.4f")
 		stock_turnover = st.number_input('Stock turnover rate', value=0.10, format="%.4f")
 		st.info('You can set stock/bond splits separately for Roth and tax-deferred in the balances section.')
@@ -684,18 +683,14 @@ def main():
 		gross_up = st.checkbox('Gross-up taxable sales to deliver requested net withdrawal (recommended)', value=True)
 		display_decimals = st.number_input('Decimal places for tables/charts', min_value=0, max_value=6, value=0, step=1)
 
-	years = max(1, max(life_expectancy_primary - start_age + 1, life_expectancy_spouse - start_age_spouse + 1))
+	years = max(1, max(life_expectancy_primary - start_age, life_expectancy_spouse - start_age_spouse) + 2)
 
 	df = None
 	if st.button('Run simulation'):
 		stock_return_series = None
 		bond_return_series = None
 		sim_years = int(years)
-		if seed_mode == 'Fixed at 42':
-			seed_value = 42
-		else:
-			seed_value = np.random.default_rng().integers(0, 2**32 - 1)
-		rng = np.random.default_rng(seed_value)
+		rng = np.random.default_rng(int(random_seed))
 		taxable_return_series = sample_lognormal_returns(sim_years, float(taxable_log_drift), float(taxable_log_volatility), rng)
 		roth_return_series = sample_lognormal_returns(sim_years, float(roth_log_drift), float(roth_log_volatility), rng)
 		df = simulate_withdrawals(start_age_primary=int(start_age),
@@ -739,20 +734,10 @@ def main():
 	initial_total = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
 
 	if df is not None:
-		last = df.iloc[-1]
 		currency_fmt = f'${{:,.{int(display_decimals)}f}}'
 		display_df = df.round(int(display_decimals)).copy()
 		display_df['portfolio_return'] = df['portfolio_return']
 		display_df['roth_return_used'] = df['roth_return_used']
-
-		years_simulated = len(df)
-		final_total = float(last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth'])
-		portfolio_cagr = ((final_total / initial_total) ** (1.0 / years_simulated) - 1.0) if initial_total > 0 and years_simulated > 0 else 0.0
-		roth_growth_factor = (df['roth_return_used'] + 1.0).prod()
-		roth_cagr = (roth_growth_factor ** (1.0 / years_simulated) - 1.0) if years_simulated > 0 else 0.0
-		c1, c2 = st.columns(2)
-		c1.metric('Portfolio CAGR', f"{portfolio_cagr:.2%}")
-		c2.metric('Roth CAGR', f"{roth_cagr:.2%}")
 
 		st.subheader('Year-by-year table')
 		st.caption(f'Years simulated: {len(df)}')
@@ -827,8 +812,10 @@ def main():
 		years_simulated = len(df)
 		final_total = float(last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth'])
 		portfolio_cagr = ((final_total / initial_total) ** (1.0 / years_simulated) - 1.0) if initial_total > 0 and years_simulated > 0 else 0.0
-		roth_growth_factor = (df['roth_return_used'] + 1.0).prod()
-		roth_cagr = (roth_growth_factor ** (1.0 / years_simulated) - 1.0) if years_simulated > 0 else 0.0
+		roth_cagr = ((last['end_roth'] / roth_start) ** (1.0 / years_simulated) - 1.0) if roth_start > 0 and years_simulated > 0 else 0.0
+		st.metric('Portfolio CAGR', f"{portfolio_cagr:.2%}")
+		st.metric('Roth CAGR', f"{roth_cagr:.2%}")
+
 		# Store latest summary in session for post-run saving
 		last = df.iloc[-1]
 		total_accounts = last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth']
@@ -850,9 +837,9 @@ def main():
 
 		st.markdown('---')
 		st.write('Ending balances')
-		last_row = currency_round.iloc[-1]
-		taxable_total_end = last_row['end_stocks_mv'] + last_row['end_bonds_mv']
-		st.write({'taxable_end': taxable_total_end, 'stocks_end': last_row['end_stocks_mv'], 'stocks_end_basis': last_row['end_stocks_basis'], 'bonds_end': last_row['end_bonds_mv'], 'bonds_end_basis': last_row['end_bonds_basis'], 'tda_end': last_row['end_tda_total'], 'roth_end': last_row['end_roth']})
+		last = currency_round.iloc[-1]
+		taxable_total_end = last['end_stocks_mv'] + last['end_bonds_mv']
+		st.write({'taxable_end': taxable_total_end, 'stocks_end': last['end_stocks_mv'], 'stocks_end_basis': last['end_stocks_basis'], 'bonds_end': last['end_bonds_mv'], 'bonds_end_basis': last['end_bonds_basis'], 'tda_end': last['end_tda_total'], 'roth_end': last['end_roth']})
 	else:
 		st.info('Set inputs and click "Run simulation" to see results.')
 
