@@ -41,9 +41,12 @@ def sample_bond_returns(years: int, bond_factors: np.ndarray, rng: np.random.Gen
 	indices = rng.integers(0, len(bond_factors), size=years)
 	return bond_factors[indices]
 
-def forward_success_rate(portfolio, annual_withdrawal, years_remaining, blended_mu, blended_sigma, n_sims=200):
-	"""Fast vectorized MC to estimate probability portfolio survives years_remaining years.
+def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu, blended_sigma, n_sims=200):
+	"""Fast vectorized MC to estimate probability portfolio survives the remaining schedule.
+	remaining_schedule is a list of base withdrawal amounts for each remaining year.
+	scale_factor is a multiplier applied to every element of the schedule.
 	Uses a simplified single-asset lognormal model (no tax engine)."""
+	years_remaining = len(remaining_schedule)
 	if years_remaining <= 0:
 		return 1.0
 	if portfolio <= 0:
@@ -54,28 +57,32 @@ def forward_success_rate(portfolio, annual_withdrawal, years_remaining, blended_
 	balances = np.full(n_sims, portfolio, dtype=np.float64)
 	for y in range(years_remaining):
 		balances *= growth_factors[:, y]
-		balances -= annual_withdrawal
+		balances -= remaining_schedule[y] * scale_factor
 		balances = np.maximum(balances, 0.0)
 	return float(np.mean(balances > 0))
 
-def find_sustainable_withdrawal(portfolio, years_remaining, blended_mu, blended_sigma, target_success=0.85, n_sims=200, tol=500.0):
-	"""Binary search for the withdrawal amount giving target_success survival rate.
+def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, blended_sigma, target_success=0.85, n_sims=200, tol=0.005):
+	"""Binary search for the scaling factor on the remaining withdrawal schedule
+	that gives target_success survival rate.
+	Returns a multiplier (e.g. 1.0 = base schedule, 0.85 = 85% of base, 1.2 = 120% of base).
 	Pre-generates one random return matrix and reuses it across all iterations for stability."""
+	years_remaining = len(remaining_schedule)
 	if portfolio <= 0 or years_remaining <= 0:
 		return 0.0
 	rng = np.random.default_rng()
 	log_returns = rng.normal(loc=blended_mu, scale=blended_sigma, size=(n_sims, years_remaining))
 	growth_factors = np.exp(log_returns)
 
-	def check_survival(withdrawal):
+	def check_survival(scale):
 		balances = np.full(n_sims, portfolio, dtype=np.float64)
 		for y in range(years_remaining):
 			balances *= growth_factors[:, y]
-			balances -= withdrawal
+			balances -= remaining_schedule[y] * scale
 			balances = np.maximum(balances, 0.0)
 		return float(np.mean(balances > 0))
 
-	lo, hi = 0.0, portfolio * 0.15
+	lo, hi = 0.0, 3.0
+	# expand hi if needed
 	for _ in range(10):
 		if check_survival(hi) < target_success:
 			break
@@ -178,7 +185,7 @@ def run_monte_carlo(num_runs: int,
 					roth_start: float,
 					tda_start: float,
 					tda_spouse_start: float,
-					withdraw_amount: float,
+					withdrawal_schedule: Sequence[float],
 					target_stock_pct: float,
 					taxable_stock_basis_pct: float,
 					taxable_bond_basis_pct: float,
@@ -230,7 +237,7 @@ def run_monte_carlo(num_runs: int,
 			roth_start=roth_start,
 			tda_start=tda_start,
 			tda_spouse_start=tda_spouse_start,
-			withdraw_amount=withdraw_amount,
+			withdrawal_schedule=withdrawal_schedule,
 			target_stock_pct=target_stock_pct,
 			taxable_stock_basis_pct=taxable_stock_basis_pct,
 			taxable_bond_basis_pct=taxable_bond_basis_pct,
@@ -487,7 +494,7 @@ def simulate_withdrawals(start_age_primary: int,
 						 roth_start: float,
 						 tda_start: float,
 						 tda_spouse_start: float,
-						 withdraw_amount: float,
+						 withdrawal_schedule: Sequence[float],
 						 target_stock_pct: float,
 						 taxable_stock_basis_pct: float,
 						 taxable_bond_basis_pct: float,
@@ -551,18 +558,18 @@ def simulate_withdrawals(start_age_primary: int,
 
 	rows = []
 
-	# Guardrail: compute initial sustainable withdrawal via binary search
+	# Guardrail: compute initial scaling factor via binary search
 	if guardrails_enabled:
 		total_portfolio_init = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
-		current_withdrawal = find_sustainable_withdrawal(
-			total_portfolio_init, years, blended_mu, blended_sigma,
+		current_scale_factor = find_sustainable_scale_factor(
+			total_portfolio_init, list(withdrawal_schedule), blended_mu, blended_sigma,
 			guardrail_target, guardrail_inner_sims)
-		# Apply max spending cap if set
+		# Apply max spending cap to scale factor
 		if guardrail_max_spending_pct > 0:
-			max_withdrawal = withdraw_amount * (1 + guardrail_max_spending_pct / 100.0)
-			current_withdrawal = min(current_withdrawal, max_withdrawal)
+			max_scale = 1.0 + guardrail_max_spending_pct / 100.0
+			current_scale_factor = min(current_scale_factor, max_scale)
 	else:
-		current_withdrawal = withdraw_amount
+		current_scale_factor = 1.0
 
 	for y in range(1, years+1):
 		age_p1 = start_age_primary + y - 1
@@ -582,18 +589,18 @@ def simulate_withdrawals(start_age_primary: int,
 				tda1_stocks_mv + tda1_bonds_mv +
 				tda2_stocks_mv + tda2_bonds_mv +
 				roth_stocks_mv + roth_bonds_mv)
-			years_left = years - y + 1
-			if years_left > 1 and total_portfolio_now > 0:
-				sr = forward_success_rate(total_portfolio_now, current_withdrawal,
-					years_left, blended_mu, blended_sigma, guardrail_inner_sims)
+			remaining_schedule = list(withdrawal_schedule[y-1:])
+			if len(remaining_schedule) > 1 and total_portfolio_now > 0:
+				sr = forward_success_rate(total_portfolio_now, remaining_schedule,
+					current_scale_factor, blended_mu, blended_sigma, guardrail_inner_sims)
 				if sr < guardrail_lower or sr > guardrail_upper:
-					current_withdrawal = find_sustainable_withdrawal(
-						total_portfolio_now, years_left, blended_mu, blended_sigma,
+					current_scale_factor = find_sustainable_scale_factor(
+						total_portfolio_now, remaining_schedule, blended_mu, blended_sigma,
 						guardrail_target, guardrail_inner_sims)
-					# Apply max spending cap if set
+					# Apply max spending cap to scale factor
 					if guardrail_max_spending_pct > 0:
-						max_withdrawal = withdraw_amount * (1 + guardrail_max_spending_pct / 100.0)
-						current_withdrawal = min(current_withdrawal, max_withdrawal)
+						max_scale = 1.0 + guardrail_max_spending_pct / 100.0
+						current_scale_factor = min(current_scale_factor, max_scale)
 
 		cap_gain_rate_for_grossup = 0.20
 
@@ -676,7 +683,8 @@ def simulate_withdrawals(start_age_primary: int,
 			divisor_p2 = None
 
 		# Begin withdrawal processing
-		wanted = current_withdrawal
+		base_withdrawal_this_year = withdrawal_schedule[y-1]
+		wanted = base_withdrawal_this_year * current_scale_factor
 		out_taxable_cash = 0.0
 		withdraw_from_tda = rmd_p1 + rmd_p2
 		withdraw_from_roth = 0.0
@@ -932,9 +940,9 @@ def main():
 		taxable_start = st.number_input('Taxable account starting balance', value=300000.0, step=1000.0)
 		taxable_stock_basis_pct = st.number_input('Taxable stock basis % of market value', value=50.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
 		taxable_bond_basis_pct = st.number_input('Taxable bond basis % of market value', value=100.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
-		roth_start = st.number_input('Roth account starting balance', value=0.0, step=1000.0)
-		tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=400000.0, step=1000.0)
-		tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=300000.0, step=1000.0)
+		roth_start = st.number_input('Roth account starting balance', value=100000.0, step=1000.0)
+		tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=800000.0, step=1000.0)
+		tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=0.0, step=1000.0)
 		st.markdown('**Household allocation target**')
 		# household target allocation
 		target_stock_pct = st.slider('Household target % in stocks', min_value=0, max_value=100, value=60, step=10) / 100.0
@@ -943,7 +951,31 @@ def main():
 		roth_conversion_tax_source = st.radio('Pay conversion taxes from', ['Taxable', 'TDA (reduce net conversion)'], horizontal=False)
 
 		st.markdown('---')
-		withdraw_amount = st.number_input('Desired annual withdrawal', value=40000.0, step=1000.0)
+		st.markdown('**Withdrawal schedule**')
+		# Compute horizon years early so the UI can reference it
+		_horizon = max(1, max(int(life_expectancy_primary) - int(start_age),
+							  int(life_expectancy_spouse) - int(start_age_spouse)) + 1)
+		num_withdrawal_periods = st.number_input('Number of withdrawal periods', value=1, min_value=1, max_value=10, step=1)
+		withdrawal_schedule_inputs = []
+		period_start = 1
+		for i in range(int(num_withdrawal_periods)):
+			is_last = (i == int(num_withdrawal_periods) - 1)
+			if is_last:
+				# Last period: fixed from period_start through end of horizon
+				period_end = _horizon
+				st.markdown(f'**Period {i+1}:** years {period_start}–{period_end}')
+				period_amount = st.number_input(f'Period {i+1} annual withdrawal', value=40000.0, step=1000.0, key=f'wd_amount_{i}')
+			else:
+				# Non-last period: user picks ending year
+				max_end = _horizon - (int(num_withdrawal_periods) - 1 - i)  # leave room for remaining periods
+				default_end = min(period_start + 4, max_end)  # default 5-year span
+				period_end = st.number_input(
+					f'Period {i+1}: years {period_start} through',
+					value=default_end, min_value=period_start, max_value=max_end, step=1, key=f'wd_end_{i}')
+				period_amount = st.number_input(f'Period {i+1} annual withdrawal', value=40000.0, step=1000.0, key=f'wd_amount_{i}')
+			num_years = int(period_end) - period_start + 1
+			withdrawal_schedule_inputs.append((num_years, float(period_amount)))
+			period_start = int(period_end) + 1
 		rmd_start_age = st.number_input('RMD start age (person 1)', min_value=65, max_value=89, value=73)
 		rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73)
 
@@ -1027,6 +1059,18 @@ def main():
 		monte_carlo_runs = st.number_input('Monte Carlo runs', min_value=50, max_value=5000, value=500, step=50)
 
 	years = max(1, max(life_expectancy_primary - start_age, life_expectancy_spouse - start_age_spouse) + 1)
+	st.markdown(f"**Beginning portfolio: ${float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start):,.0f}**")
+
+	# Build year-by-year withdrawal schedule from period inputs
+	withdrawal_schedule = []
+	for period_years, period_amount in withdrawal_schedule_inputs:
+		withdrawal_schedule.extend([period_amount] * period_years)
+	# Pad or trim to match simulation years
+	if len(withdrawal_schedule) < years:
+		last_val = withdrawal_schedule[-1] if withdrawal_schedule else 0.0
+		withdrawal_schedule.extend([last_val] * (years - len(withdrawal_schedule)))
+	withdrawal_schedule = withdrawal_schedule[:years]
+	withdraw_amount = withdrawal_schedule[0]  # for backward-compat references
 
 	currency_fmt = f'${{:,.{int(display_decimals)}f}}'
 
@@ -1040,7 +1084,7 @@ def main():
 		target_stock_pct=float(target_stock_pct),
 		taxable_stock_basis_pct=float(taxable_stock_basis_pct),
 		taxable_bond_basis_pct=float(taxable_bond_basis_pct),
-		withdraw_amount=float(withdraw_amount), gross_up_withdrawals=bool(gross_up),
+		withdrawal_schedule=withdrawal_schedule, gross_up_withdrawals=bool(gross_up),
 		rmd_start_age=int(rmd_start_age), rmd_start_age_spouse=int(rmd_start_age_spouse),
 		ss_income_annual=float(ss_income_input), ss_income_spouse_annual=float(ss_income_spouse_input),
 		ss_cola=float(ss_cola),
@@ -1137,7 +1181,7 @@ def main():
 					roth_start=float(roth_start),
 					tda_start=float(tda_start),
 					tda_spouse_start=float(tda_spouse_start),
-					withdraw_amount=float(withdraw_amount),
+					withdrawal_schedule=withdrawal_schedule,
 					target_stock_pct=float(target_stock_pct),
 					taxable_stock_basis_pct=float(taxable_stock_basis_pct),
 					taxable_bond_basis_pct=float(taxable_bond_basis_pct),
@@ -1220,12 +1264,13 @@ def main():
 				'total_lifetime_after_tax_spending': np.percentile(run_spending['total_after_tax_spending'], p),
 			})
 		spending_pct_df = pd.DataFrame(spending_pct_rows)
-		base_wd = sim_params.get('withdraw_amount', 0)
-		if base_wd > 0:
+		sched = sim_params.get('withdrawal_schedule', [])
+		base_avg_wd = np.mean(sched) if sched else 0
+		if base_avg_wd > 0:
 			median_avg_wd = np.percentile(run_spending['avg_annual_withdrawal'], 50)
-			pct_above = (median_avg_wd / base_wd - 1) * 100
+			pct_above = (median_avg_wd / base_avg_wd - 1) * 100
 			direction = 'above' if pct_above >= 0 else 'below'
-			st.caption(f'Base withdrawal target: {currency_fmt.format(base_wd)} | '
+			st.caption(f'Base avg withdrawal target: {currency_fmt.format(base_avg_wd)} | '
 					   f'Median avg annual withdrawal: {currency_fmt.format(median_avg_wd)} '
 					   f'({abs(pct_above):.1f}% {direction} target)')
 		st.dataframe(spending_pct_df.style.format({
@@ -1359,10 +1404,16 @@ def main():
 		portfolio_cagr = (portfolio_growth_factor ** (1.0 / years_simulated) - 1.0) if years_simulated > 0 else 0.0
 		roth_cagr = (roth_growth_factor ** (1.0 / years_simulated) - 1.0) if years_simulated > 0 else 0.0
 		avg_annual_after_tax = df['after_tax_spending'].mean()
-		c1, c2, c3 = st.columns(3)
-		c1.metric('Portfolio CAGR', f"{portfolio_cagr:.2%}")
-		c2.metric('Roth CAGR', f"{roth_cagr:.2%}")
-		c3.metric('Avg Annual After-Tax Spending', f"${avg_annual_after_tax:,.0f}")
+		first = df.iloc[0]
+		beginning_portfolio = first['start_stocks_mv'] + first['start_bonds_mv'] + first['start_tda_p1'] + first['start_tda_p2'] + first['start_roth']
+		after_tax_ending = (last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_roth'] +
+			last['end_tda_total'] * max(0.0, 1.0 - float(inheritor_marginal_rate)))
+		c1, c2, c3, c4, c5 = st.columns(5)
+		c1.metric('Beginning Portfolio', f"${beginning_portfolio:,.0f}")
+		c2.metric('After-Tax Ending Value', f"${after_tax_ending:,.0f}")
+		c3.metric('Portfolio CAGR', f"{portfolio_cagr:.2%}")
+		c4.metric('Roth CAGR', f"{roth_cagr:.2%}")
+		c5.metric('Avg Annual After-Tax Spending', f"${avg_annual_after_tax:,.0f}")
 
 		st.subheader('Year-by-year detail — single run')
 		st.caption(f'Years simulated: {len(df)} | This is one complete simulation path.')
@@ -1410,6 +1461,21 @@ def main():
 		chart_df = currency_round[['year','withdraw_from_taxable_net','withdraw_from_tda','withdraw_from_roth']].set_index('year')
 		chart_df.columns = ['Taxable', 'TDA', 'Roth']
 		st.bar_chart(chart_df)
+
+		st.subheader('After-tax spending over time — single run')
+		spending_chart_data = df[['year', 'after_tax_spending']].copy()
+		spending_chart_data['goal'] = [withdrawal_schedule[i] if i < len(withdrawal_schedule) else withdrawal_schedule[-1] for i in range(len(spending_chart_data))]
+		spending_chart_data['status'] = spending_chart_data.apply(
+			lambda r: 'Below goal' if r['after_tax_spending'] < r['goal'] else 'At or above goal', axis=1)
+		import altair as alt
+		spend_bar = alt.Chart(spending_chart_data).mark_bar().encode(
+			x=alt.X('year:O', title='Year'),
+			y=alt.Y('after_tax_spending:Q', title='After-Tax Spending ($)'),
+			color=alt.Color('status:N',
+				scale=alt.Scale(domain=['Below goal', 'At or above goal'], range=['#d62728', '#1f77b4']),
+				legend=alt.Legend(title=''))
+		).properties(height=400)
+		st.altair_chart(spend_bar, use_container_width=True)
 
 		st.subheader('Account balances over time — single run')
 		bal_df = currency_round[['year','end_taxable_total','end_tda_total','end_roth']].set_index('year')
