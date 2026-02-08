@@ -1,33 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import altair as alt
 from typing import Dict, Optional, Sequence
 
 st.set_page_config(page_title='Withdrawal + RMD Simulator', layout='wide')
-
-def interactive_line_chart(data_df, y_title='Value', fmt='$,.0f', height=400):
-	"""Convert a DataFrame (index=x, columns=series) to an interactive Altair line chart with tooltips."""
-	long = data_df.reset_index().melt(data_df.index.name or 'index', var_name='Series', value_name='value')
-	x_col = data_df.index.name or 'index'
-	nearest = alt.selection_point(nearest=True, on='pointerover', fields=[x_col], empty=False)
-	base = alt.Chart(long).encode(
-		x=alt.X(f'{x_col}:Q', title=x_col.replace('_', ' ').title()),
-		y=alt.Y('value:Q', title=y_title, axis=alt.Axis(format=fmt)),
-		color=alt.Color('Series:N', legend=alt.Legend(title='')),
-	)
-	lines = base.mark_line()
-	points = base.mark_point(size=60, filled=True, opacity=0).encode(
-		opacity=alt.condition(nearest, alt.value(1), alt.value(0)),
-		tooltip=[alt.Tooltip(f'{x_col}:Q', title=x_col.replace('_', ' ').title())] +
-			[alt.Tooltip('Series:N', title='Series'),
-			 alt.Tooltip('value:Q', title=y_title, format=fmt)]
-	).add_params(nearest)
-	rules = alt.Chart(long).mark_rule(color='gray', strokeDash=[4, 4]).encode(
-		x=f'{x_col}:Q',
-	).transform_filter(nearest)
-	chart = (lines + points + rules).properties(height=height).interactive()
-	st.altair_chart(chart, use_container_width=True)
 
 @st.cache_data
 def load_master_global():
@@ -65,11 +41,10 @@ def sample_bond_returns(years: int, bond_factors: np.ndarray, rng: np.random.Gen
 	indices = rng.integers(0, len(bond_factors), size=years)
 	return bond_factors[indices]
 
-def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu, blended_sigma, n_sims=200, income_schedule=None):
+def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu, blended_sigma, n_sims=200):
 	"""Fast vectorized MC to estimate probability portfolio survives the remaining schedule.
 	remaining_schedule is a list of base withdrawal amounts for each remaining year.
 	scale_factor is a multiplier applied to every element of the schedule.
-	income_schedule offsets spending (SS, pension, other) so only the net draw hits the portfolio.
 	Uses a simplified single-asset lognormal model (no tax engine)."""
 	years_remaining = len(remaining_schedule)
 	if years_remaining <= 0:
@@ -81,18 +56,15 @@ def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu
 	growth_factors = np.exp(log_returns)
 	balances = np.full(n_sims, portfolio, dtype=np.float64)
 	for y in range(years_remaining):
-		inc = income_schedule[y] if income_schedule is not None and y < len(income_schedule) else 0.0
-		net_draw = max(0.0, remaining_schedule[y] * scale_factor - inc)
 		balances *= growth_factors[:, y]
-		balances -= net_draw
+		balances -= remaining_schedule[y] * scale_factor
 		balances = np.maximum(balances, 0.0)
 	return float(np.mean(balances > 0))
 
-def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, blended_sigma, target_success=0.85, n_sims=200, tol=0.005, income_schedule=None):
+def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, blended_sigma, target_success=0.85, n_sims=200, tol=0.005):
 	"""Binary search for the scaling factor on the remaining withdrawal schedule
 	that gives target_success survival rate.
 	Returns a multiplier (e.g. 1.0 = base schedule, 0.85 = 85% of base, 1.2 = 120% of base).
-	income_schedule offsets spending so only the net portfolio draw is used.
 	Pre-generates one random return matrix and reuses it across all iterations for stability."""
 	years_remaining = len(remaining_schedule)
 	if portfolio <= 0 or years_remaining <= 0:
@@ -104,10 +76,8 @@ def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, ble
 	def check_survival(scale):
 		balances = np.full(n_sims, portfolio, dtype=np.float64)
 		for y in range(years_remaining):
-			inc = income_schedule[y] if income_schedule is not None and y < len(income_schedule) else 0.0
-			net_draw = max(0.0, remaining_schedule[y] * scale - inc)
 			balances *= growth_factors[:, y]
-			balances -= net_draw
+			balances -= remaining_schedule[y] * scale
 			balances = np.maximum(balances, 0.0)
 		return float(np.mean(balances > 0))
 
@@ -204,83 +174,53 @@ def compute_summary_metrics(df: pd.DataFrame, inheritor_rate: float) -> Dict[str
 		'roth_cagr': (roth_growth ** (1.0 / years) - 1.0) if years > 0 else 0.0,
 	}
 
-def build_scenario_params(base_params: dict, overrides: dict, stock_mu: float = 0.0, stock_sigma: float = 0.0, bond_mu: float = 0.0, bond_sigma: float = 0.0) -> dict:
-	"""Return a copy of base_params with scenario-specific overrides applied."""
-	params = dict(base_params)
-	if 'spend_scale' in overrides:
-		params['withdrawal_schedule'] = [v * overrides['spend_scale'] for v in params['withdrawal_schedule']]
-	elif 'spend_flat' in overrides:
-		params['withdrawal_schedule'] = [overrides['spend_flat']] * len(params['withdrawal_schedule'])
-	if 'target_stock_pct' in overrides:
-		params['target_stock_pct'] = overrides['target_stock_pct']
-		if params.get('guardrails_enabled'):
-			pct = overrides['target_stock_pct']
-			params['blended_mu'] = pct * stock_mu + (1 - pct) * bond_mu
-			params['blended_sigma'] = pct * stock_sigma + (1 - pct) * bond_sigma
-	if 'roth_conversion_amount' in overrides:
-		params['roth_conversion_amount'] = overrides['roth_conversion_amount']
-	if 'roth_conversion_years' in overrides:
-		params['roth_conversion_years'] = overrides['roth_conversion_years']
-	return params
-
-def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) -> str:
-	"""Generate a descriptive name from what differs vs baseline."""
-	if not overrides:
-		return "Baseline"
-	parts = []
-	if 'spend_scale' in overrides:
-		parts.append(f"Spend {overrides['spend_scale'] * 100:.0f}%")
-	elif 'spend_flat' in overrides:
-		parts.append(f"Spend ${overrides['spend_flat']:,.0f}")
-	if 'target_stock_pct' in overrides:
-		parts.append(f"{overrides['target_stock_pct'] * 100:.0f}% stocks")
-	if 'roth_conversion_amount' in overrides:
-		amt = overrides['roth_conversion_amount']
-		yrs = overrides.get('roth_conversion_years', base_params.get('roth_conversion_years', 0))
-		if amt == 0 or yrs == 0:
-			parts.append("No Roth conv")
-		else:
-			parts.append(f"Roth ${amt / 1000:.0f}k x {yrs}yr")
-	return " | ".join(parts) if parts else f"Scenario {scenario_idx}"
-
-def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFrame, inheritor_rate: float) -> dict:
-	"""Compute percentile summary for one scenario run. Returns a summary dict."""
-	mc_df = pd.DataFrame(results)
-	percentiles_list = [0, 10, 25, 50, 75, 90]
-	summary_cols = ['after_tax_end', 'total_taxes', 'effective_tax_rate', 'portfolio_cagr', 'roth_cagr']
-	pct_rows = []
-	for p in percentiles_list:
-		row = {'percentile': p}
-		for col in summary_cols:
-			row[col] = np.percentile(mc_df[col], p)
-		pct_rows.append(row)
-	pct_non_positive = float((mc_df['after_tax_end'] <= 0).mean())
-	run_spending = all_yearly_df.groupby('run').agg(
-		total_after_tax_spending=('after_tax_spending', 'sum'),
-		years_in_run=('year', 'count'),
-	)
-	run_spending['avg_annual_after_tax_spending'] = run_spending['total_after_tax_spending'] / run_spending['years_in_run']
-	spending_pct_rows = []
-	for p in percentiles_list:
-		spending_pct_rows.append({
-			'percentile': p,
-			'avg_annual_after_tax_spending': np.percentile(run_spending['avg_annual_after_tax_spending'], p),
-			'total_lifetime_after_tax_spending': np.percentile(run_spending['total_after_tax_spending'], p),
-		})
-	return {
-		'name': name,
-		'percentile_rows': pct_rows,
-		'pct_non_positive': pct_non_positive,
-		'spending_percentiles': spending_pct_rows,
-		'all_yearly_df': all_yearly_df,
-		'num_sims': len(results),
-	}
-
-def run_monte_carlo(num_runs: int, years: int, inheritor_rate: float,
-					taxable_log_drift: float, taxable_log_volatility: float,
-					bond_log_drift: float, bond_log_volatility: float,
-					**sim_params):
-	"""Run lognormal MC simulations. sim_params passed through to simulate_withdrawals."""
+def run_monte_carlo(num_runs: int,
+					start_age: int,
+					start_age_spouse: int,
+					taxable_start: float,
+					stock_total_return: float,
+					stock_dividend_yield: float,
+					stock_turnover: float,
+					bond_return: float,
+					roth_start: float,
+					tda_start: float,
+					tda_spouse_start: float,
+					withdrawal_schedule: Sequence[float],
+					target_stock_pct: float,
+					taxable_stock_basis_pct: float,
+					taxable_bond_basis_pct: float,
+					gross_up_withdrawals: bool,
+					rmd_start_age: int,
+					rmd_start_age_spouse: int,
+					ss_income_annual: float,
+					ss_income_spouse_annual: float,
+					ss_cola: float,
+					pension_income_annual: float,
+					pension_income_spouse_annual: float,
+					pension_cola: float,
+					other_income_annual: float,
+					filing_status: str,
+					use_itemized_deductions: bool,
+					itemized_deduction_amount: float,
+					roth_conversion_amount: float,
+					roth_conversion_years: int,
+					roth_conversion_tax_source: str,
+					taxable_log_drift: float,
+					taxable_log_volatility: float,
+					bond_log_drift: float,
+					bond_log_volatility: float,
+					life_expectancy_primary: int,
+					life_expectancy_spouse: int,
+					inheritor_rate: float,
+					years: int,
+					guardrails_enabled: bool = False,
+					guardrail_lower: float = 0.75,
+					guardrail_upper: float = 0.90,
+					guardrail_target: float = 0.85,
+					guardrail_inner_sims: int = 200,
+					blended_mu: float = 0.0,
+					blended_sigma: float = 0.0,
+					guardrail_max_spending_pct: float = 0.0):
 	results = []
 	all_yearly = []
 	for run_idx in range(num_runs):
@@ -288,10 +228,48 @@ def run_monte_carlo(num_runs: int, years: int, inheritor_rate: float,
 		taxable_series = sample_lognormal_returns(years, taxable_log_drift, taxable_log_volatility, rng)
 		bond_series = sample_lognormal_returns(years, bond_log_drift, bond_log_volatility, rng)
 		df_run = simulate_withdrawals(
+			start_age_primary=start_age, start_age_spouse=start_age_spouse,
 			years=years,
+			taxable_start=taxable_start,
+			stock_total_return=stock_total_return,
+			stock_dividend_yield=stock_dividend_yield,
+			stock_turnover=stock_turnover,
+			bond_return=bond_return,
+			roth_start=roth_start,
+			tda_start=tda_start,
+			tda_spouse_start=tda_spouse_start,
+			withdrawal_schedule=withdrawal_schedule,
+			target_stock_pct=target_stock_pct,
+			taxable_stock_basis_pct=taxable_stock_basis_pct,
+			taxable_bond_basis_pct=taxable_bond_basis_pct,
+			gross_up_withdrawals=gross_up_withdrawals,
+			rmd_start_age=rmd_start_age,
+			rmd_start_age_spouse=rmd_start_age_spouse,
+			ss_income_annual=ss_income_annual,
+			ss_income_spouse_annual=ss_income_spouse_annual,
+			ss_cola=ss_cola,
+			pension_income_annual=pension_income_annual,
+			pension_income_spouse_annual=pension_income_spouse_annual,
+			pension_cola=pension_cola,
+			other_income_annual=other_income_annual,
+			filing_status=filing_status,
+			use_itemized_deductions=use_itemized_deductions,
+			itemized_deduction_amount=itemized_deduction_amount,
+			roth_conversion_amount=roth_conversion_amount,
+			roth_conversion_years=roth_conversion_years,
+			roth_conversion_tax_source=roth_conversion_tax_source,
 			stock_return_series=taxable_series,
 			bond_return_series=bond_series,
-			**sim_params,
+			life_expectancy_primary=life_expectancy_primary,
+			life_expectancy_spouse=life_expectancy_spouse,
+			guardrails_enabled=guardrails_enabled,
+			guardrail_lower=guardrail_lower,
+			guardrail_upper=guardrail_upper,
+			guardrail_target=guardrail_target,
+			guardrail_inner_sims=guardrail_inner_sims,
+			blended_mu=blended_mu,
+			blended_sigma=blended_sigma,
+			guardrail_max_spending_pct=guardrail_max_spending_pct,
 		)
 		df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
 		metrics = compute_summary_metrics(df_run, inheritor_rate)
@@ -521,6 +499,7 @@ def simulate_withdrawals(start_age_primary: int,
 						 target_stock_pct: float,
 						 taxable_stock_basis_pct: float,
 						 taxable_bond_basis_pct: float,
+						 gross_up_withdrawals: bool = True,
 						 rmd_start_age: int = 73,
 						 rmd_start_age_spouse: int = 73,
 						 ss_income_annual: float = 0.0,
@@ -536,11 +515,6 @@ def simulate_withdrawals(start_age_primary: int,
 						 roth_conversion_amount: float = 0.0,
 						 roth_conversion_tax_source: str = 'taxable',
 						 roth_conversion_years: int = 0,
-						 roth_conversion_source: str = 'person1',
-						 ss_start_age_p1: int = 67,
-						 ss_start_age_p2: int = 67,
-						 state_tax_rate: float = 0.0,
-						 state_exempt_retirement: bool = False,
 						 stock_return_series: Optional[Sequence[float]] = None,
 						 bond_return_series: Optional[Sequence[float]] = None,
 						 life_expectancy_primary: int = 120,
@@ -552,8 +526,7 @@ def simulate_withdrawals(start_age_primary: int,
 						 guardrail_inner_sims: int = 200,
 						 blended_mu: float = 0.0,
 						 blended_sigma: float = 0.0,
-						 guardrail_max_spending_pct: float = 0.0,
-						 taxes_enabled: bool = True):
+						 guardrail_max_spending_pct: float = 0.0):
 	table = get_uniform_lifetime_table()
 
 	# assume taxable holds 50% stocks / 50% bonds
@@ -586,33 +559,12 @@ def simulate_withdrawals(start_age_primary: int,
 
 	rows = []
 
-	# Build expected income schedule (SS + pension + other) for guardrail inner MC
-	income_schedule = []
-	for y in range(1, years + 1):
-		age_p1 = start_age_primary + y - 1
-		age_p2 = start_age_spouse + y - 1
-		p1_alive = age_p1 <= life_expectancy_primary
-		p2_alive = age_p2 <= life_expectancy_spouse
-		ss_b1 = ss_income_annual * ((1 + ss_cola) ** (y - 1))
-		ss_b2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1))
-		if p1_alive and p2_alive:
-			yr_ss = (ss_b1 if age_p1 >= ss_start_age_p1 else 0.0) + (ss_b2 if age_p2 >= ss_start_age_p2 else 0.0)
-		elif p1_alive:
-			yr_ss = max(ss_b1, ss_b2) if age_p1 >= ss_start_age_p1 else 0.0
-		elif p2_alive:
-			yr_ss = max(ss_b1, ss_b2) if age_p2 >= ss_start_age_p2 else 0.0
-		else:
-			yr_ss = 0.0
-		yr_pen = ((pension_income_annual * ((1 + pension_cola) ** (y - 1))) if p1_alive else 0.0) + \
-				 ((pension_income_spouse_annual * ((1 + pension_cola) ** (y - 1))) if p2_alive else 0.0)
-		income_schedule.append(yr_ss + yr_pen + other_income_annual)
-
 	# Guardrail: compute initial scaling factor via binary search
 	if guardrails_enabled:
 		total_portfolio_init = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
 		current_scale_factor = find_sustainable_scale_factor(
 			total_portfolio_init, list(withdrawal_schedule), blended_mu, blended_sigma,
-			guardrail_target, guardrail_inner_sims, income_schedule=income_schedule)
+			guardrail_target, guardrail_inner_sims)
 		# Apply max spending cap to scale factor
 		if guardrail_max_spending_pct > 0:
 			max_scale = 1.0 + guardrail_max_spending_pct / 100.0
@@ -623,21 +575,6 @@ def simulate_withdrawals(start_age_primary: int,
 	for y in range(1, years+1):
 		age_p1 = start_age_primary + y - 1
 		age_p2 = start_age_spouse + y - 1
-		primary_alive = age_p1 <= life_expectancy_primary
-		spouse_alive = age_p2 <= life_expectancy_spouse
-
-		# Inherited IRA rollover: merge deceased spouse's TDA into survivor's
-		if not primary_alive and (tda1_stocks_mv + tda1_bonds_mv) > 0 and spouse_alive:
-			tda2_stocks_mv += tda1_stocks_mv
-			tda2_bonds_mv += tda1_bonds_mv
-			tda1_stocks_mv = 0.0
-			tda1_bonds_mv = 0.0
-		if not spouse_alive and (tda2_stocks_mv + tda2_bonds_mv) > 0 and primary_alive:
-			tda1_stocks_mv += tda2_stocks_mv
-			tda1_bonds_mv += tda2_bonds_mv
-			tda2_stocks_mv = 0.0
-			tda2_bonds_mv = 0.0
-
 		# rebalance at start of each year to target allocation with rounding
 		(stocks_mv, bonds_mv, stocks_basis, bonds_basis,
 			tda1_stocks_mv, tda1_bonds_mv, tda2_stocks_mv, tda2_bonds_mv, roth_stocks_mv, roth_bonds_mv) = rebalance_accounts(
@@ -654,19 +591,19 @@ def simulate_withdrawals(start_age_primary: int,
 				tda2_stocks_mv + tda2_bonds_mv +
 				roth_stocks_mv + roth_bonds_mv)
 			remaining_schedule = list(withdrawal_schedule[y-1:])
-			remaining_income = income_schedule[y-1:]
 			if len(remaining_schedule) > 1 and total_portfolio_now > 0:
 				sr = forward_success_rate(total_portfolio_now, remaining_schedule,
-					current_scale_factor, blended_mu, blended_sigma, guardrail_inner_sims,
-					income_schedule=remaining_income)
+					current_scale_factor, blended_mu, blended_sigma, guardrail_inner_sims)
 				if sr < guardrail_lower or sr > guardrail_upper:
 					current_scale_factor = find_sustainable_scale_factor(
 						total_portfolio_now, remaining_schedule, blended_mu, blended_sigma,
-						guardrail_target, guardrail_inner_sims, income_schedule=remaining_income)
+						guardrail_target, guardrail_inner_sims)
 					# Apply max spending cap to scale factor
 					if guardrail_max_spending_pct > 0:
 						max_scale = 1.0 + guardrail_max_spending_pct / 100.0
 						current_scale_factor = min(current_scale_factor, max_scale)
+
+		cap_gain_rate_for_grossup = 0.20
 
 		start_stocks_mv = stocks_mv
 		start_bonds_mv = bonds_mv
@@ -676,26 +613,17 @@ def simulate_withdrawals(start_age_primary: int,
 		start_tda_spouse = tda2_stocks_mv + tda2_bonds_mv
 		start_roth = roth_stocks_mv + roth_bonds_mv
 
+		primary_alive = age_p1 <= life_expectancy_primary
+		spouse_alive = age_p2 <= life_expectancy_spouse
+
 		# apply Roth conversion at start of year before growth
-		if y <= roth_conversion_years:
-			if roth_conversion_source == 'person1' and primary_alive:
-				src_stocks, src_bonds = tda1_stocks_mv, tda1_bonds_mv
-			elif roth_conversion_source == 'person2' and spouse_alive:
-				src_stocks, src_bonds = tda2_stocks_mv, tda2_bonds_mv
-			else:
-				src_stocks, src_bonds = 0.0, 0.0
-			conversion_gross = min(roth_conversion_amount, src_stocks + src_bonds)
-		else:
-			conversion_gross = 0.0
+		conversion_gross = min(roth_conversion_amount, tda1_stocks_mv + tda1_bonds_mv) if (y <= roth_conversion_years and primary_alive) else 0.0
 		if conversion_gross > 0:
-			src_total = src_stocks + src_bonds
-			src_stock_ratio = (src_stocks / src_total) if src_total > 0 else 0.5
-			if roth_conversion_source == 'person1':
-				tda1_stocks_mv -= conversion_gross * src_stock_ratio
-				tda1_bonds_mv -= conversion_gross * (1 - src_stock_ratio)
-			else:
-				tda2_stocks_mv -= conversion_gross * src_stock_ratio
-				tda2_bonds_mv -= conversion_gross * (1 - src_stock_ratio)
+			total_tda_balance = tda1_stocks_mv + tda1_bonds_mv
+			tda_stock_ratio = (tda1_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
+			tda1_stocks_mv -= conversion_gross * tda_stock_ratio
+			tda1_bonds_mv -= conversion_gross * (1 - tda_stock_ratio)
+			# temporarily park converted amount; taxes handled after computing tax delta
 			pending_roth_conversion = conversion_gross
 		else:
 			pending_roth_conversion = 0.0
@@ -755,297 +683,185 @@ def simulate_withdrawals(start_age_primary: int,
 			rmd_p2 = 0.0
 			divisor_p2 = None
 
-		# Determine filing status and income for this year (needed by tax solve)
+		# Begin withdrawal processing
+		base_withdrawal_this_year = withdrawal_schedule[y-1]
+		wanted = base_withdrawal_this_year * current_scale_factor
+		out_taxable_cash = 0.0
+		withdraw_from_tda = rmd_p1 + rmd_p2
+		withdraw_from_roth = 0.0
+		gross_sold_taxable_stocks = 0.0
+		gross_sold_taxable_bonds = 0.0
+		realized_gains_from_sales = 0.0
+		rmd_excess_to_taxable = 0.0
+
+		def gross_for_net(net, mv, basis, cap_rate):
+			# Solve S such that S - tax = net, tax = (S - basis*(S/mv))*cap_rate
+			if mv <= 0 or net <= 0:
+				return 0.0
+			basis_ratio = basis / mv if mv > 0 else 0.0
+			denom = 1.0 - cap_rate * (1.0 - basis_ratio)
+			if denom <= 0:
+				return mv
+			S = net / denom
+			return min(S, mv)
+
+		total_rmd_cash = rmd_p1 + rmd_p2
+		if total_rmd_cash > 0:
+			if total_rmd_cash > wanted:
+				excess = total_rmd_cash - wanted
+				rmd_excess_to_taxable = excess
+				total_mv = stocks_mv + bonds_mv
+				if total_mv > 0:
+					stocks_mv += excess * (stocks_mv / total_mv)
+					bonds_mv += excess * (bonds_mv / total_mv)
+					# assume excess increases basis proportionally (treated as deposit)
+					if (stocks_basis + bonds_basis) > 0:
+						stocks_basis += excess * (stocks_basis / (stocks_basis + bonds_basis))
+						bonds_basis += excess * (bonds_basis / (stocks_basis + bonds_basis))
+					else:
+						stocks_basis += excess * 0.5
+						bonds_basis += excess * 0.5
+				else:
+					stocks_mv += excess * 0.5
+					bonds_mv += excess * 0.5
+					stocks_basis += excess * 0.5
+					bonds_basis += excess * 0.5
+				remaining = 0.0
+			else:
+				remaining = wanted - total_rmd_cash
+		else:
+			remaining = wanted
+
+		# withdraw from taxable (gross-up to deliver net if requested)
+		net_needed = remaining
+		if net_needed > 0 and bonds_mv > 0:
+			S = gross_for_net(net_needed, bonds_mv, bonds_basis, cap_gain_rate_for_grossup) if gross_up_withdrawals else min(net_needed, bonds_mv)
+			basis_sold = S * (bonds_basis / bonds_mv) if bonds_mv > 0 else 0.0
+			realized = max(0.0, S - basis_sold)
+			gross_sold_taxable_bonds += S
+			realized_gains_from_sales += realized
+			bonds_mv -= S
+			bonds_basis -= basis_sold
+			net_needed -= S if gross_up_withdrawals else S
+
+		if net_needed > 1e-8 and stocks_mv > 0:
+			S = gross_for_net(net_needed, stocks_mv, stocks_basis, cap_gain_rate_for_grossup) if gross_up_withdrawals else min(net_needed, stocks_mv)
+			basis_sold = S * (stocks_basis / stocks_mv) if stocks_mv > 0 else 0.0
+			realized = max(0.0, S - basis_sold)
+			realized_gains_from_sales += realized
+			gross_sold_taxable_stocks += S
+			stocks_mv -= S
+			stocks_basis -= basis_sold
+			net_needed -= S if gross_up_withdrawals else S
+
+		out_taxable_cash += (remaining - max(0.0, net_needed))
+
+		if net_needed > 1e-8:
+			total_tda_balance = tda1_stocks_mv + tda1_bonds_mv
+			take_tda = min(net_needed, total_tda_balance)
+			tda_stock_ratio = (tda1_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
+			tda1_stocks_mv -= take_tda * tda_stock_ratio
+			tda1_bonds_mv -= take_tda * (1 - tda_stock_ratio)
+			withdraw_from_tda += take_tda
+			net_needed -= take_tda
+		if net_needed > 1e-8:
+			total_tda2_balance = tda2_stocks_mv + tda2_bonds_mv
+			take_tda2 = min(net_needed, total_tda2_balance)
+			tda_stock_ratio2 = (tda2_stocks_mv / total_tda2_balance) if total_tda2_balance > 0 else 0.5
+			tda2_stocks_mv -= take_tda2 * tda_stock_ratio2
+			tda2_bonds_mv -= take_tda2 * (1 - tda_stock_ratio2)
+			withdraw_from_tda += take_tda2
+			net_needed -= take_tda2
+		if net_needed > 1e-8:
+			total_roth_balance = roth_stocks_mv + roth_bonds_mv
+			take_roth = min(net_needed, total_roth_balance)
+			roth_stock_ratio = (roth_stocks_mv / total_roth_balance) if total_roth_balance > 0 else 1.0
+			roth_stocks_mv -= take_roth * roth_stock_ratio
+			roth_bonds_mv -= take_roth * (1 - roth_stock_ratio)
+			withdraw_from_roth += take_roth
+			net_needed -= take_roth
+
 		filing_status_this_year = filing_status
 		if filing_status == 'mfj' and (not spouse_alive or not primary_alive):
 			filing_status_this_year = 'single'
-		# SS with start ages and survivor benefit rules
-		ss_benefit_p1 = ss_income_annual * ((1 + ss_cola) ** (y - 1))
-		ss_benefit_p2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1))
-		if primary_alive and spouse_alive:
-			ss_income_p1 = ss_benefit_p1 if age_p1 >= ss_start_age_p1 else 0.0
-			ss_income_p2 = ss_benefit_p2 if age_p2 >= ss_start_age_p2 else 0.0
-			ss_income = ss_income_p1 + ss_income_p2
-		elif primary_alive and not spouse_alive:
-			# Survivor gets the higher of own or deceased spouse's benefit
-			ss_income = max(ss_benefit_p1, ss_benefit_p2) if age_p1 >= ss_start_age_p1 else 0.0
-		elif spouse_alive and not primary_alive:
-			ss_income = max(ss_benefit_p1, ss_benefit_p2) if age_p2 >= ss_start_age_p2 else 0.0
-		else:
-			ss_income = 0.0
+
+		# Other income items (Social Security and pension grow with COLA)
+		ss_income_p1 = ss_income_annual * ((1 + ss_cola) ** (y - 1)) if primary_alive else 0.0
+		ss_income_p2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1)) if spouse_alive else 0.0
+		ss_income = ss_income_p1 + ss_income_p2
 		pension_income_p1 = pension_income_annual * ((1 + pension_cola) ** (y - 1)) if primary_alive else 0.0
 		pension_income_p2 = pension_income_spouse_annual * ((1 + pension_cola) ** (y - 1)) if spouse_alive else 0.0
 		pension_income = pension_income_p1 + pension_income_p2
 		other_income = other_income_annual
+
+		# Ordinary income before deductions (exclude cap gains/qualified dividends for stacking)
+		ordinary_income_pre_ss_base = interest + withdraw_from_tda + pension_income + other_income
+		ordinary_income_pre_ss_with_conv = ordinary_income_pre_ss_base + pending_roth_conversion
+		cap_gains_total = div + turnover_realized_gain + realized_gains_from_sales
+
 		deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(filing_status_this_year)
 
-		# Snapshot mutable balances (post-growth, post-RMD) for iterative solve
-		total_rmd_cash = rmd_p1 + rmd_p2
-		snap_stocks_mv = stocks_mv
-		snap_bonds_mv = bonds_mv
-		snap_stocks_basis = stocks_basis
-		snap_bonds_basis = bonds_basis
-		snap_tda1_stocks = tda1_stocks_mv
-		snap_tda1_bonds = tda1_bonds_mv
-		snap_tda2_stocks = tda2_stocks_mv
-		snap_tda2_bonds = tda2_bonds_mv
-		snap_roth_stocks = roth_stocks_mv
-		snap_roth_bonds = roth_bonds_mv
+		def compute_tax_bundle(ordinary_income_pre_ss_val, status):
+			taxable_ss_val = compute_taxable_social_security(ss_income, ordinary_income_pre_ss_val, cap_gains_total, status)
+			ordinary_income_total_val = ordinary_income_pre_ss_val + taxable_ss_val
+			taxable_ordinary_val = max(0.0, ordinary_income_total_val - deduction)
+			ordinary_tax_val = apply_brackets(taxable_ordinary_val, get_ordinary_brackets(status))
+			cap_gains_tax_val = compute_capital_gains_tax(taxable_ordinary_val, cap_gains_total, status)
+			total_val = ordinary_tax_val + cap_gains_tax_val
+			return taxable_ss_val, taxable_ordinary_val, ordinary_tax_val, cap_gains_tax_val, total_val
 
-		def try_gross_withdrawal(gross_target):
-			"""Run withdrawal waterfall + full tax computation for a given gross
-			withdrawal from portfolio. Returns (net_after_tax_spending, result_dict)."""
-			s_mv, b_mv = snap_stocks_mv, snap_bonds_mv
-			s_basis, b_basis = snap_stocks_basis, snap_bonds_basis
-			t1s, t1b = snap_tda1_stocks, snap_tda1_bonds
-			t2s, t2b = snap_tda2_stocks, snap_tda2_bonds
-			rs, rb = snap_roth_stocks, snap_roth_bonds
+		taxable_ss, taxable_ordinary, ordinary_tax_total, cap_gains_tax, total_taxes = compute_tax_bundle(ordinary_income_pre_ss_with_conv, filing_status_this_year)
+		_, _, _, _, total_tax_without_conv = compute_tax_bundle(ordinary_income_pre_ss_base, filing_status_this_year)
+		roth_conversion_tax_delta = max(0.0, total_taxes - total_tax_without_conv)
+		# NIIT approximation
+		niit_threshold = 200000 if filing_status_this_year == 'single' else 250000
+		agi_approx = ordinary_income_pre_ss_with_conv + taxable_ss + cap_gains_total
+		niit_base = max(0.0, agi_approx - niit_threshold)
+		net_investment_income = max(0.0, cap_gains_total + interest + div)
+		niit_tax = 0.038 * min(niit_base, net_investment_income)
+		total_taxes += niit_tax
+		marginal_ordinary_rate, marginal_cg_rate = get_marginal_rates(taxable_ordinary, cap_gains_total, filing_status_this_year)
+		if niit_base > 0 and cap_gains_total > 0:
+			marginal_cg_rate += 0.038
 
-			out_taxable_cash = 0.0
-			w_tda = total_rmd_cash
-			w_roth = 0.0
-			sold_bonds = 0.0
-			sold_stocks = 0.0
-			realized_gains = 0.0
-			rmd_excess = 0.0
-
-			if total_rmd_cash > gross_target:
-				rmd_excess = total_rmd_cash - gross_target
-				total_mv = s_mv + b_mv
-				if total_mv > 0:
-					s_mv += rmd_excess * (s_mv / total_mv)
-					b_mv += rmd_excess * (b_mv / total_mv)
-					total_basis = s_basis + b_basis
-					if total_basis > 0:
-						s_basis += rmd_excess * (s_basis / total_basis)
-						b_basis += rmd_excess * (b_basis / total_basis)
-					else:
-						s_basis += rmd_excess * 0.5
-						b_basis += rmd_excess * 0.5
-				else:
-					s_mv += rmd_excess * 0.5
-					b_mv += rmd_excess * 0.5
-					s_basis += rmd_excess * 0.5
-					b_basis += rmd_excess * 0.5
-				remaining = 0.0
+		# apply Roth conversion flow based on tax source
+		if pending_roth_conversion > 0:
+			if roth_conversion_tax_source == 'taxable':
+				# pay taxes from taxable balances (no gross-up)
+				tax_to_pay = roth_conversion_tax_delta
+				pay_from_bonds = min(tax_to_pay, bonds_mv)
+				if pay_from_bonds > 0 and bonds_mv > 0:
+					bonds_basis_ratio = bonds_basis / bonds_mv if bonds_mv > 0 else 0.0
+					bonds_basis -= pay_from_bonds * bonds_basis_ratio
+					bonds_mv -= pay_from_bonds
+				remaining_tax = tax_to_pay - pay_from_bonds
+				pay_from_stocks = min(remaining_tax, stocks_mv)
+				if pay_from_stocks > 0 and stocks_mv > 0:
+					stocks_basis_ratio = stocks_basis / stocks_mv if stocks_mv > 0 else 0.0
+					stocks_basis -= pay_from_stocks * stocks_basis_ratio
+					stocks_mv -= pay_from_stocks
+				remaining_tax -= pay_from_stocks
+				# if taxable couldn't cover all tax, pay leftover out of conversion (behave like TDA pay)
+				conversion_net_to_roth = max(0.0, pending_roth_conversion - remaining_tax)
 			else:
-				remaining = gross_target - total_rmd_cash
+				# taxes paid from conversion amount inside TDA, reducing what lands in Roth
+				conversion_net_to_roth = max(0.0, pending_roth_conversion - roth_conversion_tax_delta)
 
-			# Waterfall: taxable bonds -> stocks -> TDA -> Roth
-			if remaining > 0 and b_mv > 0:
-				take = min(remaining, b_mv)
-				basis_sold = take * (b_basis / b_mv) if b_mv > 0 else 0.0
-				realized_gains += max(0.0, take - basis_sold)
-				sold_bonds += take
-				b_mv -= take
-				b_basis -= basis_sold
-				out_taxable_cash += take
-				remaining -= take
+			# deposit into Roth (favor stocks; bonds only if necessary)
+			roth_stocks_mv += conversion_net_to_roth
 
-			if remaining > 1e-8 and s_mv > 0:
-				take = min(remaining, s_mv)
-				basis_sold = take * (s_basis / s_mv) if s_mv > 0 else 0.0
-				realized_gains += max(0.0, take - basis_sold)
-				sold_stocks += take
-				s_mv -= take
-				s_basis -= basis_sold
-				out_taxable_cash += take
-				remaining -= take
-
-			if remaining > 1e-8:
-				t1_total = t1s + t1b
-				take = min(remaining, t1_total)
-				ratio = (t1s / t1_total) if t1_total > 0 else 0.5
-				t1s -= take * ratio
-				t1b -= take * (1 - ratio)
-				w_tda += take
-				remaining -= take
-
-			if remaining > 1e-8:
-				t2_total = t2s + t2b
-				take = min(remaining, t2_total)
-				ratio = (t2s / t2_total) if t2_total > 0 else 0.5
-				t2s -= take * ratio
-				t2b -= take * (1 - ratio)
-				w_tda += take
-				remaining -= take
-
-			if remaining > 1e-8:
-				r_total = rs + rb
-				take = min(remaining, r_total)
-				ratio = (rs / r_total) if r_total > 0 else 1.0
-				rs -= take * ratio
-				rb -= take * (1 - ratio)
-				w_roth += take
-				remaining -= take
-
-			# Full tax computation
-			ordinary_pre_ss_base = interest + w_tda + pension_income + other_income
-			ordinary_pre_ss_with_conv = ordinary_pre_ss_base + pending_roth_conversion
-			cg_total = div + turnover_realized_gain + realized_gains
-
-			if taxes_enabled:
-				# With conversion
-				t_ss = compute_taxable_social_security(ss_income, ordinary_pre_ss_with_conv, cg_total, filing_status_this_year)
-				t_ordinary = max(0.0, ordinary_pre_ss_with_conv + t_ss - deduction)
-				ord_tax = apply_brackets(t_ordinary, get_ordinary_brackets(filing_status_this_year))
-				cg_tax = compute_capital_gains_tax(t_ordinary, cg_total, filing_status_this_year)
-				total_tax = ord_tax + cg_tax
-
-				# Without conversion (for delta — include state tax so conversion cost is accurate)
-				t_ss_nc = compute_taxable_social_security(ss_income, ordinary_pre_ss_base, cg_total, filing_status_this_year)
-				t_ordinary_nc = max(0.0, ordinary_pre_ss_base + t_ss_nc - deduction)
-				ord_tax_nc = apply_brackets(t_ordinary_nc, get_ordinary_brackets(filing_status_this_year))
-				cg_tax_nc = compute_capital_gains_tax(t_ordinary_nc, cg_total, filing_status_this_year)
-				total_tax_nc = ord_tax_nc + cg_tax_nc
-				total_tax_with = total_tax  # ord_tax + cg_tax (with conversion)
-				if state_tax_rate > 0:
-					if state_exempt_retirement:
-						# IL-style: only investment income (interest + div + cap gains) is taxable at state level
-						state_base_with = max(0.0, interest + cg_total)
-						state_base_nc = state_base_with  # conversion doesn't affect investment income
-					else:
-						state_base_with = t_ordinary + cg_total
-						state_base_nc = t_ordinary_nc + cg_total
-					total_tax_with += state_base_with * state_tax_rate
-					total_tax_nc += state_base_nc * state_tax_rate
-				conv_tax_delta = max(0.0, total_tax_with - total_tax_nc)
-
-				# NIIT
-				niit_threshold = 200000 if filing_status_this_year == 'single' else 250000
-				agi = ordinary_pre_ss_with_conv + t_ss + cg_total
-				niit_base_val = max(0.0, agi - niit_threshold)
-				net_inv = max(0.0, cg_total + interest + div)
-				niit = 0.038 * min(niit_base_val, net_inv)
-				total_tax += niit
-
-				# State income tax
-				if state_tax_rate > 0:
-					if state_exempt_retirement:
-						state_taxable = max(0.0, interest + cg_total)
-					else:
-						state_taxable = t_ordinary + cg_total
-					s_tax = state_taxable * state_tax_rate
-				else:
-					s_tax = 0.0
-				total_tax += s_tax
-
-				marg_ord, marg_cg = get_marginal_rates(t_ordinary, cg_total, filing_status_this_year)
-				if niit_base_val > 0 and cg_total > 0:
-					marg_cg += 0.038
-				if state_tax_rate > 0:
-					if not state_exempt_retirement:
-						marg_ord += state_tax_rate
-					marg_cg += state_tax_rate
-			else:
-				t_ss = 0.0
-				t_ordinary = 0.0
-				ord_tax = 0.0
-				cg_tax = 0.0
-				total_tax = 0.0
-				conv_tax_delta = 0.0
-				niit = 0.0
-				s_tax = 0.0
-				marg_ord = 0.0
-				marg_cg = 0.0
-
-			# Roth conversion tax payment
-			conv_net_to_roth = 0.0
-			if pending_roth_conversion > 0:
-				if roth_conversion_tax_source == 'taxable' and taxes_enabled:
-					tax_to_pay = conv_tax_delta
-					pay_b = min(tax_to_pay, b_mv)
-					if pay_b > 0 and b_mv > 0:
-						b_basis -= pay_b * (b_basis / b_mv)
-						b_mv -= pay_b
-					rem_tax = tax_to_pay - pay_b
-					pay_s = min(rem_tax, s_mv)
-					if pay_s > 0 and s_mv > 0:
-						s_basis -= pay_s * (s_basis / s_mv)
-						s_mv -= pay_s
-					rem_tax -= pay_s
-					conv_net_to_roth = max(0.0, pending_roth_conversion - rem_tax)
-				elif not taxes_enabled:
-					conv_net_to_roth = pending_roth_conversion
-				else:
-					conv_net_to_roth = max(0.0, pending_roth_conversion - conv_tax_delta)
-				rs += conv_net_to_roth
-
-			# Non-spending tax (portfolio drag, not spending reduction)
-			nst = (
-				rmd_excess * marg_ord
-				+ max(0.0, interest) * marg_ord
-				+ (div + turnover_realized_gain) * marg_cg
-			)
-			nst = max(0.0, min(nst, total_tax - conv_tax_delta))
-
-			net_spending = (out_taxable_cash + w_tda + w_roth
-				- rmd_excess + ss_income + pension_income + other_income
-				- (total_tax - conv_tax_delta - nst))
-
-			return net_spending, {
-				'stocks_mv': s_mv, 'bonds_mv': b_mv,
-				'stocks_basis': s_basis, 'bonds_basis': b_basis,
-				'tda1_stocks': t1s, 'tda1_bonds': t1b,
-				'tda2_stocks': t2s, 'tda2_bonds': t2b,
-				'roth_stocks': rs, 'roth_bonds': rb,
-				'out_taxable_cash': out_taxable_cash,
-				'withdraw_from_tda': w_tda, 'withdraw_from_roth': w_roth,
-				'rmd_excess_to_taxable': rmd_excess,
-				'gross_sold_taxable_bonds': sold_bonds,
-				'gross_sold_taxable_stocks': sold_stocks,
-				'taxable_ss': t_ss, 'taxable_ordinary': t_ordinary,
-				'ordinary_tax_total': ord_tax,
-				'cap_gains_total': cg_total, 'cap_gains_tax': cg_tax,
-				'niit_tax': niit, 'state_tax': s_tax, 'total_taxes': total_tax,
-				'roth_conversion_tax_delta': conv_tax_delta,
-				'non_spending_tax': nst,
-				'marginal_ordinary_rate': marg_ord, 'marginal_cg_rate': marg_cg,
-				'net_spending': net_spending,
-				'gross_target': gross_target,
-			}
-
-		# Binary search: find gross withdrawal that delivers the net spending target
-		base_withdrawal_this_year = withdrawal_schedule[y-1]
-		net_target = base_withdrawal_this_year * current_scale_factor
-
-		base_net, base_result = try_gross_withdrawal(0.0)
-
-		if net_target <= 0 or base_net >= net_target:
-			chosen = base_result
-		else:
-			max_available = (snap_stocks_mv + snap_bonds_mv +
-				snap_tda1_stocks + snap_tda1_bonds +
-				snap_tda2_stocks + snap_tda2_bonds +
-				snap_roth_stocks + snap_roth_bonds + total_rmd_cash)
-			lo = 0.0
-			hi = min(net_target * 2.5, max_available)
-			chosen = base_result
-			for _ in range(20):
-				mid = (lo + hi) / 2.0
-				mid_net, mid_result = try_gross_withdrawal(mid)
-				if mid_net < net_target - 5.0:
-					lo = mid
-				elif mid_net > net_target + 5.0:
-					hi = mid
-				else:
-					chosen = mid_result
-					break
-				chosen = mid_result
-				if hi - lo < 10.0:
-					break
-
-		# Commit the chosen withdrawal result
-		stocks_mv = chosen['stocks_mv']
-		bonds_mv = chosen['bonds_mv']
-		stocks_basis = chosen['stocks_basis']
-		bonds_basis = chosen['bonds_basis']
-		tda1_stocks_mv = chosen['tda1_stocks']
-		tda1_bonds_mv = chosen['tda1_bonds']
-		tda2_stocks_mv = chosen['tda2_stocks']
-		tda2_bonds_mv = chosen['tda2_bonds']
-		roth_stocks_mv = chosen['roth_stocks']
-		roth_bonds_mv = chosen['roth_bonds']
+		# Tax attributable to non-spending income (reinvested items):
+		# - RMD excess reinvested in taxable (ordinary income at marginal rate)
+		# - Bond interest reinvested (ordinary income at marginal rate)
+		# - Dividends reinvested (cap gains rate)
+		# - Turnover gains (cap gains rate, paper round-trip)
+		# These taxes are a portfolio drag, not a spending reduction.
+		non_spending_tax = (
+			rmd_excess_to_taxable * marginal_ordinary_rate
+			+ max(0.0, interest) * marginal_ordinary_rate
+			+ (div + turnover_realized_gain) * marginal_cg_rate
+		)
+		non_spending_tax = max(0.0, min(non_spending_tax, total_taxes - roth_conversion_tax_delta))
 
 		actual_portfolio_return = (investment_return_dollars / investable_start_total) if investable_start_total > 0 else 0.0
 		rows.append({
@@ -1066,29 +882,28 @@ def simulate_withdrawals(start_age_primary: int,
 			'rmd_p1': rmd_p1,
 			'rmd_p2': rmd_p2,
 			'rmd_total': rmd_p1 + rmd_p2,
-			'withdraw_from_taxable_net': chosen['out_taxable_cash'],
-			'withdraw_from_tda': chosen['withdraw_from_tda'],
-			'withdraw_from_roth': chosen['withdraw_from_roth'],
-			'rmd_excess_to_taxable': chosen['rmd_excess_to_taxable'],
-			'gross_sold_taxable_bonds': chosen['gross_sold_taxable_bonds'],
-			'gross_sold_taxable_stocks': chosen['gross_sold_taxable_stocks'],
+			'withdraw_from_taxable_net': out_taxable_cash,
+			'withdraw_from_tda': withdraw_from_tda,
+			'withdraw_from_roth': withdraw_from_roth,
+			'rmd_excess_to_taxable': rmd_excess_to_taxable,
+			'gross_sold_taxable_bonds': gross_sold_taxable_bonds,
+			'gross_sold_taxable_stocks': gross_sold_taxable_stocks,
 			'ss_income_total': ss_income,
-			'taxable_social_security': chosen['taxable_ss'],
+			'taxable_social_security': taxable_ss,
 			'pension_income_total': pension_income,
 			'other_income': other_income,
 			'roth_conversion': pending_roth_conversion,
-			'roth_conversion_tax': chosen['roth_conversion_tax_delta'],
+			'roth_conversion_tax': roth_conversion_tax_delta,
 			'roth_conversion_tax_source': roth_conversion_tax_source,
-			'ordinary_taxable_income': chosen['taxable_ordinary'],
-			'ordinary_tax_total': chosen['ordinary_tax_total'],
-			'capital_gains': chosen['cap_gains_total'],
-			'capital_gains_tax': chosen['cap_gains_tax'],
-			'niit_tax': chosen['niit_tax'],
-			'state_tax': chosen['state_tax'],
-			'marginal_ordinary_rate': chosen['marginal_ordinary_rate'],
-			'marginal_cap_gains_rate': chosen['marginal_cg_rate'],
+			'ordinary_taxable_income': taxable_ordinary,
+			'ordinary_tax_total': ordinary_tax_total,
+			'capital_gains': cap_gains_total,
+			'capital_gains_tax': cap_gains_tax,
+			'niit_tax': niit_tax,
+			'marginal_ordinary_rate': marginal_ordinary_rate,
+			'marginal_cap_gains_rate': marginal_cg_rate,
 			'deduction_applied': deduction,
-			'total_taxes': chosen['total_taxes'],
+			'total_taxes': total_taxes,
 			'end_stocks_mv': stocks_mv,
 			'end_bonds_mv': bonds_mv,
 			'end_taxable_total': stocks_mv + bonds_mv,
@@ -1099,9 +914,10 @@ def simulate_withdrawals(start_age_primary: int,
 			'end_tda_p2': tda2_stocks_mv + tda2_bonds_mv,
 			'end_tda_total': (tda1_stocks_mv + tda1_bonds_mv + tda2_stocks_mv + tda2_bonds_mv),
 			'end_roth': roth_stocks_mv + roth_bonds_mv,
-			'withdrawal_used': chosen['gross_target'],
-			'net_spending_target': net_target,
-			'after_tax_spending': chosen['net_spending'],
+			'withdrawal_used': wanted,
+			'after_tax_spending': (out_taxable_cash + withdraw_from_tda + withdraw_from_roth
+				- rmd_excess_to_taxable + ss_income + pension_income + other_income
+				- (total_taxes - roth_conversion_tax_delta - non_spending_tax)),
 		})
 
 	df = pd.DataFrame(rows)
@@ -1112,43 +928,12 @@ def main():
 
 	if st.button('Reset saved scenarios'):
 		for key in ['scenario_summaries', 'last_summary', 'mc_percentile_rows', 'mc_all_yearly',
-					'mc_pct_non_positive', 'sim_df', 'sim_mode', 'mc_summaries', 'mc_percentiles',
-					'multi_scenario_results', 'selected_scenario_idx', 'num_sims']:
+					'mc_pct_non_positive', 'sim_df', 'sim_mode', 'mc_summaries', 'mc_percentiles']:
 			st.session_state.pop(key, None)
 		st.success('Saved scenarios cleared.')
 
 	with st.sidebar:
 		st.header('Inputs')
-
-		with st.expander('Scenario Comparison'):
-			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=4, value=1, step=1)
-			if num_scenarios > 1:
-				st.caption('Scenario 1 = baseline (uses inputs below). Override specific values for scenarios 2-4.')
-				scenario_overrides_ui = {}
-				for i in range(2, num_scenarios + 1):
-					st.markdown(f'**Scenario {i}**')
-					spend_mode = st.radio(f'S{i} spending', ['Same as baseline', 'Scale by %', 'Set amount'],
-						key=f'sc_spend_mode_{i}', horizontal=True)
-					sc_overrides = {}
-					if spend_mode == 'Scale by %':
-						sc_overrides['spend_scale'] = st.number_input(f'S{i} spending scale %',
-							value=100.0, step=5.0, key=f'sc_spend_scale_{i}') / 100.0
-					elif spend_mode == 'Set amount':
-						sc_overrides['spend_flat'] = st.number_input(f'S{i} flat annual spending',
-							value=80000.0, step=5000.0, key=f'sc_spend_flat_{i}')
-					stock_chk = st.checkbox(f'S{i} override stock %', key=f'sc_stock_chk_{i}')
-					if stock_chk:
-						sc_overrides['target_stock_pct'] = st.slider(f'S{i} stock %',
-							0, 100, 60, 5, key=f'sc_stock_{i}') / 100.0
-					roth_chk = st.checkbox(f'S{i} override Roth conversions', key=f'sc_roth_chk_{i}')
-					if roth_chk:
-						sc_overrides['roth_conversion_amount'] = st.number_input(f'S{i} annual Roth conversion',
-							value=0.0, step=10000.0, key=f'sc_roth_amt_{i}')
-						sc_overrides['roth_conversion_years'] = int(st.number_input(f'S{i} conversion years',
-							value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}'))
-					scenario_overrides_ui[i] = sc_overrides
-			else:
-				scenario_overrides_ui = {}
 
 		with st.expander('Ages & Timeline', expanded=True):
 			start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65)
@@ -1160,15 +945,14 @@ def main():
 			taxable_start = st.number_input('Taxable account starting balance', value=300000.0, step=1000.0)
 			taxable_stock_basis_pct = st.number_input('Taxable stock basis % of market value', value=50.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
 			taxable_bond_basis_pct = st.number_input('Taxable bond basis % of market value', value=100.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
-			roth_start = st.number_input('Roth account starting balance', value=0.0, step=1000.0)
-			tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=700000.0, step=1000.0)
+			roth_start = st.number_input('Roth account starting balance', value=100000.0, step=1000.0)
+			tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=800000.0, step=1000.0)
 			tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=0.0, step=1000.0)
 
 		with st.expander('Allocation & Roth Conversions'):
 			target_stock_pct = st.slider('Household target % in stocks', min_value=0, max_value=100, value=60, step=10) / 100.0
 			roth_conversion_amount = st.number_input('Annual Roth conversion amount (from TDA)', value=0.0, step=1000.0)
 			roth_conversion_years = st.number_input('Years to perform conversions', value=0, min_value=0, max_value=100, step=1)
-			roth_conversion_source_tda = st.radio('Convert from', ['Person 1 TDA', 'Person 2 TDA'], horizontal=True)
 			roth_conversion_tax_source = st.radio('Pay conversion taxes from', ['Taxable', 'TDA (reduce net conversion)'], horizontal=False)
 
 		with st.expander('Withdrawal Schedule'):
@@ -1182,14 +966,14 @@ def main():
 				if is_last:
 					period_end = _horizon
 					st.markdown(f'**Period {i+1}:** years {period_start}–{period_end}')
-					period_amount = st.number_input(f'Period {i+1} annual After-Tax Spending Goal', value=80000.0, step=1000.0, key=f'wd_amount_{i}')
+					period_amount = st.number_input(f'Period {i+1} annual After-Tax Spending Goal', value=40000.0, step=1000.0, key=f'wd_amount_{i}')
 				else:
 					max_end = _horizon - (int(num_withdrawal_periods) - 1 - i)
 					default_end = min(period_start + 4, max_end)
 					period_end = st.number_input(
 						f'Period {i+1}: years {period_start} through',
 						value=default_end, min_value=period_start, max_value=max_end, step=1, key=f'wd_end_{i}')
-					period_amount = st.number_input(f'Period {i+1} Annual After-Tax Spend Goal', value=40000.0, step=1000.0, key=f'wd_amount_{i}')
+					period_amount = st.number_input(f'Period {i+1} annual withdrawal', value=40000.0, step=1000.0, key=f'wd_amount_{i}')
 				num_years = int(period_end) - period_start + 1
 				withdrawal_schedule_inputs.append((num_years, float(period_amount)))
 				period_start = int(period_end) + 1
@@ -1197,19 +981,15 @@ def main():
 			rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73)
 
 		with st.expander('Other Income'):
-			ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=25000.0, step=1000.0)
-			ss_start_age_p1 = st.number_input('SS start age - person 1', min_value=60, max_value=90, value=67, step=1)
-			ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=20000.0, step=1000.0)
-			ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=65, step=1)
+			ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=0.0, step=1000.0)
+			ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=0.0, step=1000.0)
 			ss_cola = st.number_input('Social Security COLA', value=0.02, format="%.4f")
-			st.caption('Survivor receives the higher of their own or deceased spouse\'s benefit')
 			pension_income_input = st.number_input('Annual pension income - person 1', value=0.0, step=1000.0)
 			pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=0.0, step=1000.0)
 			pension_cola = st.number_input('Pension COLA', value=0.00, format="%.4f")
 			other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0)
 
 		with st.expander('Tax Settings'):
-			taxes_enabled = st.checkbox('Enable taxation', value=True, help='Uncheck to disable all taxes (useful for testing withdrawal mechanics)')
 			filing_status_choice = st.radio('Filing status', ['Single', 'Married Filing Jointly'], horizontal=True, index=1)
 			filing_status_key = 'single' if filing_status_choice == 'Single' else 'mfj'
 			standard_deduction_display = 14600 if filing_status_key == 'single' else 29200
@@ -1218,13 +998,7 @@ def main():
 			st.caption(f'Standard deduction used if not itemizing: ${standard_deduction_display:,.0f}')
 			inheritor_marginal_rate = st.number_input(
 				'Inheritor marginal tax rate on TDAs',
-				value=0.35, min_value=0.0, max_value=0.50, format="%.4f")
-			state_tax_rate = st.number_input('State income tax rate (flat)',
-				value=0.05, min_value=0.0, max_value=0.15, format="%.4f", step=0.01)
-			state_exempt_retirement = st.checkbox('Exempt retirement income from state tax (IL-style)',
-				value=True)
-			if state_exempt_retirement:
-				st.caption('State tax applies only to investment income (interest, dividends, capital gains). SS, pensions, TDA withdrawals, and Roth conversions are exempt.')
+				value=0.22, min_value=0.0, max_value=0.37, format="%.4f")
 
 		with st.expander('Return Assumptions'):
 			return_mode = st.radio('Return mode', ['Simulated (lognormal)', 'Historical (master_global_factors)'], horizontal=False, index=1)
@@ -1239,7 +1013,17 @@ def main():
 				random_seed_input = st.number_input('Random seed for returns', value=42, step=1)
 				seed_mode = st.radio('Seed mode', ['Random each run', 'Fixed seed'], horizontal=True, index=0)
 			else:
-				st.caption('Returns from LBM 100E (stocks) and LBM 100 F (bonds). Runs all historical periods as a distribution.')
+				st.caption('Returns from LBM 100E (stocks) and LBM 100 F (bonds).')
+				historical_mode_type = st.radio('Historical mode',
+					['All periods (distribution)', 'Specific start year'],
+					horizontal=True, index=0)
+				if historical_mode_type == 'Specific start year':
+					mg_df = load_master_global()
+					min_year = mg_df['begin month'].dt.year.min() + 1
+					max_year = mg_df['begin month'].dt.year.max()
+					historical_start_year = st.number_input('Historical start year', min_value=int(min_year), max_value=int(max_year), value=1966, step=1)
+				else:
+					historical_start_year = None
 				taxable_log_drift = 0.0
 				taxable_log_volatility = 0.0
 				bond_log_drift = 0.0
@@ -1250,7 +1034,7 @@ def main():
 			stock_turnover = st.number_input('Stock turnover rate', value=0.10, format="%.4f")
 
 		with st.expander('Withdrawal Guardrails'):
-			guardrails_enabled = st.checkbox('Enable dynamic withdrawal guardrails', value=True)
+			guardrails_enabled = st.checkbox('Enable dynamic withdrawal guardrails', value=False)
 			if guardrails_enabled:
 				st.caption('At each year, checks forward MC survival rate. If outside the dead band, resets withdrawal to the target success rate.')
 				guardrail_lower = st.number_input('Lower guardrail (reduce spending if below)', value=0.75, min_value=0.50, max_value=0.95, format="%.2f", step=0.05)
@@ -1269,6 +1053,7 @@ def main():
 				guardrail_max_spending_pct = 0.0
 
 		with st.expander('Simulation Settings'):
+			gross_up = st.checkbox('Gross-up taxable sales to deliver requested net withdrawal (recommended)', value=True)
 			display_decimals = st.number_input('Decimal places for tables/charts', min_value=0, max_value=6, value=0, step=1)
 			monte_carlo_runs = st.number_input('Monte Carlo runs', min_value=50, max_value=5000, value=1000, step=50)
 
@@ -1298,7 +1083,7 @@ def main():
 		target_stock_pct=float(target_stock_pct),
 		taxable_stock_basis_pct=float(taxable_stock_basis_pct),
 		taxable_bond_basis_pct=float(taxable_bond_basis_pct),
-		withdrawal_schedule=withdrawal_schedule,
+		withdrawal_schedule=withdrawal_schedule, gross_up_withdrawals=bool(gross_up),
 		rmd_start_age=int(rmd_start_age), rmd_start_age_spouse=int(rmd_start_age_spouse),
 		ss_income_annual=float(ss_income_input), ss_income_spouse_annual=float(ss_income_spouse_input),
 		ss_cola=float(ss_cola),
@@ -1310,11 +1095,6 @@ def main():
 		roth_conversion_amount=float(roth_conversion_amount),
 		roth_conversion_years=int(roth_conversion_years),
 		roth_conversion_tax_source='taxable' if roth_conversion_tax_source == 'Taxable' else 'tda',
-		roth_conversion_source='person1' if roth_conversion_source_tda == 'Person 1 TDA' else 'person2',
-		ss_start_age_p1=int(ss_start_age_p1),
-		ss_start_age_p2=int(ss_start_age_p2),
-		state_tax_rate=float(state_tax_rate),
-		state_exempt_retirement=bool(state_exempt_retirement),
 		life_expectancy_primary=int(life_expectancy_primary),
 		life_expectancy_spouse=int(life_expectancy_spouse),
 		guardrails_enabled=bool(guardrails_enabled),
@@ -1323,25 +1103,25 @@ def main():
 		guardrail_target=float(guardrail_target),
 		guardrail_inner_sims=int(guardrail_inner_sims),
 		guardrail_max_spending_pct=float(guardrail_max_spending_pct),
-		taxes_enabled=bool(taxes_enabled),
 	)
 
-	# Compute stock/bond return parameters (needed for guardrails and scenario comparison)
-	if return_mode == 'Simulated (lognormal)':
-		stock_mu = float(taxable_log_drift)
-		stock_sigma = float(taxable_log_volatility)
-		bond_mu = float(bond_log_drift)
-		bond_sigma = float(bond_log_volatility)
-	else:
-		mg_df = load_master_global()
-		stock_factors = mg_df['LBM 100E'].dropna().values
-		stock_log_rets = np.log(stock_factors)
-		stock_mu = float(np.mean(stock_log_rets))
-		stock_sigma = float(np.std(stock_log_rets))
-		bond_log_returns = np.log(1.0 + load_bond_factors())
-		bond_mu = float(np.mean(bond_log_returns))
-		bond_sigma = float(np.std(bond_log_returns))
+	# Compute blended return parameters for guardrail inner MC
 	if guardrails_enabled:
+		if return_mode == 'Simulated (lognormal)':
+			stock_mu = float(taxable_log_drift)
+			stock_sigma = float(taxable_log_volatility)
+			bond_mu = float(bond_log_drift)
+			bond_sigma = float(bond_log_volatility)
+		else:
+			# Estimate params from historical data
+			mg_df = load_master_global()
+			stock_factors = mg_df['LBM 100E'].dropna().values
+			stock_log_rets = np.log(stock_factors)
+			stock_mu = float(np.mean(stock_log_rets))
+			stock_sigma = float(np.std(stock_log_rets))
+			bond_log_returns = np.log(1.0 + load_bond_factors())
+			bond_mu = float(np.mean(bond_log_returns))
+			bond_sigma = float(np.std(bond_log_returns))
 		blended_mu = target_stock_pct * stock_mu + (1 - target_stock_pct) * bond_mu
 		blended_sigma = target_stock_pct * stock_sigma + (1 - target_stock_pct) * bond_sigma
 		sim_params['blended_mu'] = blended_mu
@@ -1350,172 +1130,96 @@ def main():
 		sim_params['blended_mu'] = 0.0
 		sim_params['blended_sigma'] = 0.0
 
-	def _load_scenario_to_session(scenario_summary, sim_mode_label):
-		"""Load a scenario's data into standard session state keys for the detail display."""
-		ay = scenario_summary['all_yearly_df']
-		st.session_state['mc_percentile_rows'] = scenario_summary['percentile_rows']
-		st.session_state['mc_pct_non_positive'] = scenario_summary['pct_non_positive']
-		st.session_state['mc_all_yearly'] = ay
-		st.session_state['num_sims'] = scenario_summary['num_sims']
-		run_ends = ay.groupby('run')['total_portfolio'].last()
-		median_val = run_ends.median()
-		median_run_idx = int((run_ends - median_val).abs().idxmin())
-		median_df = ay[ay['run'] == median_run_idx].drop(columns=['run', 'total_portfolio']).reset_index(drop=True)
-		st.session_state['sim_df'] = median_df
-		st.session_state['sim_mode'] = sim_mode_label
-
-	# Build scenario list
-	all_scenarios = [({}, 'Baseline')]  # scenario 1 = baseline, no overrides
-	if num_scenarios > 1:
-		for s_idx in range(2, num_scenarios + 1):
-			ovr = scenario_overrides_ui.get(s_idx, {})
-			all_scenarios.append((ovr, auto_scenario_name(s_idx, ovr, sim_params)))
-
-	button_label = 'Run all scenarios' if num_scenarios > 1 else 'Run simulation'
-	if st.button(button_label):
+	if st.button('Run simulation'):
 		sim_years = int(years)
-		is_historical = return_mode == 'Historical (master_global_factors)'
-
-		# Pre-load historical windows once (shared across scenarios)
-		if is_historical:
+		if return_mode == 'Historical (master_global_factors)' and historical_mode_type == 'All periods (distribution)':
 			windows, window_start_dates = get_all_historical_windows(sim_years)
 			n_windows = len(windows)
-
-		def run_one_scenario(s_params, s_name, progress_placeholder):
-			"""Run a single scenario and return (results, all_yearly_df)."""
-			if is_historical:
+			hist_spinner = f'Running {n_windows} historical periods...'
+			if guardrails_enabled:
+				hist_spinner += ' (with guardrails — this may take longer)'
+			with st.spinner(hist_spinner):
 				results = []
 				all_yearly = []
 				for run_idx, (stock_rets, bond_rets) in enumerate(windows):
-					if run_idx % 50 == 0:
-						progress_placeholder.progress(run_idx / n_windows,
-							text=f'{s_name}: {run_idx}/{n_windows} periods')
 					df_run = simulate_withdrawals(
 						years=sim_years, stock_return_series=stock_rets,
-						bond_return_series=bond_rets, **s_params)
+						bond_return_series=bond_rets, **sim_params)
 					df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
 					metrics = compute_summary_metrics(df_run, float(inheritor_marginal_rate))
 					results.append(metrics)
 					df_run['run'] = run_idx
 					all_yearly.append(df_run)
-				progress_placeholder.progress(1.0, text=f'{s_name}: complete')
 				all_yearly_df = pd.concat(all_yearly, ignore_index=True)
-				return results, all_yearly_df
-			else:
+			store_distribution_results(results, all_yearly_df, 'historical_dist')
+			st.session_state['window_start_dates'] = {i: d.strftime('%Y-%m') for i, d in enumerate(window_start_dates)}
+		elif return_mode == 'Historical (master_global_factors)':
+			hist_stock, hist_bond, hist_count = get_historical_annual_returns(int(historical_start_year), sim_years)
+			if hist_count < sim_years:
+				st.warning(f'Only {hist_count} years of historical data available from {historical_start_year}. Simulation truncated.')
+				sim_years = hist_count
+			df = simulate_withdrawals(
+				years=sim_years, stock_return_series=hist_stock,
+				bond_return_series=hist_bond, **sim_params)
+			st.session_state['sim_mode'] = 'historical'
+			st.session_state['sim_df'] = df
+			st.session_state.pop('mc_all_yearly', None)
+			st.session_state.pop('mc_percentile_rows', None)
+		else:
+			spinner_msg = f'Running {int(monte_carlo_runs)} simulations...'
+			if guardrails_enabled:
+				spinner_msg += ' (with guardrails — this may take longer)'
+			with st.spinner(spinner_msg):
 				mc_results, all_yearly_df = run_monte_carlo(
 					num_runs=int(monte_carlo_runs),
-					years=sim_years,
-					inheritor_rate=float(inheritor_marginal_rate),
+					start_age=int(start_age),
+					start_age_spouse=int(start_age_spouse),
+					taxable_start=float(taxable_start),
+					stock_total_return=float(stock_total_return),
+					stock_dividend_yield=float(stock_dividend_yield),
+					stock_turnover=float(stock_turnover),
+					bond_return=float(bond_return),
+					roth_start=float(roth_start),
+					tda_start=float(tda_start),
+					tda_spouse_start=float(tda_spouse_start),
+					withdrawal_schedule=withdrawal_schedule,
+					target_stock_pct=float(target_stock_pct),
+					taxable_stock_basis_pct=float(taxable_stock_basis_pct),
+					taxable_bond_basis_pct=float(taxable_bond_basis_pct),
+					gross_up_withdrawals=bool(gross_up),
+					rmd_start_age=int(rmd_start_age),
+					rmd_start_age_spouse=int(rmd_start_age_spouse),
+					ss_income_annual=float(ss_income_input),
+					ss_income_spouse_annual=float(ss_income_spouse_input),
+					ss_cola=float(ss_cola),
+					pension_income_annual=float(pension_income_input),
+					pension_income_spouse_annual=float(pension_income_spouse_input),
+					pension_cola=float(pension_cola),
+					other_income_annual=float(other_income_input),
+					filing_status=filing_status_key,
+					use_itemized_deductions=bool(use_itemized),
+					itemized_deduction_amount=float(itemized_deduction_input),
+					roth_conversion_amount=float(roth_conversion_amount),
+					roth_conversion_years=int(roth_conversion_years),
+					roth_conversion_tax_source='taxable' if roth_conversion_tax_source == 'Taxable' else 'tda',
 					taxable_log_drift=float(taxable_log_drift),
 					taxable_log_volatility=float(taxable_log_volatility),
 					bond_log_drift=float(bond_log_drift),
 					bond_log_volatility=float(bond_log_volatility),
-					**s_params,
+					life_expectancy_primary=int(life_expectancy_primary),
+					life_expectancy_spouse=int(life_expectancy_spouse),
+					inheritor_rate=float(inheritor_marginal_rate),
+					years=int(years),
+					guardrails_enabled=bool(guardrails_enabled),
+					guardrail_lower=float(guardrail_lower),
+					guardrail_upper=float(guardrail_upper),
+					guardrail_target=float(guardrail_target),
+					guardrail_inner_sims=int(guardrail_inner_sims),
+					blended_mu=sim_params['blended_mu'],
+					blended_sigma=sim_params['blended_sigma'],
+					guardrail_max_spending_pct=float(guardrail_max_spending_pct),
 				)
-				progress_placeholder.progress(1.0, text=f'{s_name}: complete')
-				return mc_results, all_yearly_df
-
-		if num_scenarios > 1:
-			# Multi-scenario run
-			multi_results = []
-			scenario_bar = st.progress(0, text='Starting scenarios...')
-			run_bar = st.progress(0, text='')
-			for s_num, (ovr, s_name) in enumerate(all_scenarios):
-				scenario_bar.progress(s_num / len(all_scenarios),
-					text=f'Scenario {s_num + 1}/{len(all_scenarios)}: {s_name}')
-				s_params = build_scenario_params(sim_params, ovr,
-					stock_mu=stock_mu, stock_sigma=stock_sigma,
-					bond_mu=bond_mu, bond_sigma=bond_sigma)
-				results, all_yearly_df = run_one_scenario(s_params, s_name, run_bar)
-				summary = compute_scenario_summary(s_name, results, all_yearly_df, float(inheritor_marginal_rate))
-				multi_results.append(summary)
-			scenario_bar.progress(1.0, text='All scenarios complete!')
-			st.session_state['multi_scenario_results'] = multi_results
-			st.session_state['selected_scenario_idx'] = 0
-			# Load baseline into standard session state for detail display
-			_load_scenario_to_session(multi_results[0], 'historical_dist' if is_historical else 'simulated')
-			if is_historical:
-				st.session_state['window_start_dates'] = {i: d.strftime('%Y-%m') for i, d in enumerate(window_start_dates)}
-		else:
-			# Single scenario run (backward compatible)
-			run_bar = st.progress(0, text='Running...')
-			results, all_yearly_df = run_one_scenario(sim_params, 'Baseline', run_bar)
-			sim_mode_label = 'historical_dist' if is_historical else 'simulated'
-			store_distribution_results(results, all_yearly_df, sim_mode_label)
-			if is_historical:
-				st.session_state['window_start_dates'] = {i: d.strftime('%Y-%m') for i, d in enumerate(window_start_dates)}
-			st.session_state.pop('multi_scenario_results', None)
-
-	# ── Multi-scenario comparison ────────────────────────────────
-	if 'multi_scenario_results' in st.session_state:
-		multi_results = st.session_state['multi_scenario_results']
-		if len(multi_results) > 1:
-			st.subheader('Scenario Comparison')
-			compare_pct = st.selectbox('Compare at percentile', [0, 10, 25, 50, 75, 90], index=3)
-			baseline = multi_results[0]
-			baseline_row = next(r for r in baseline['percentile_rows'] if r['percentile'] == compare_pct)
-			baseline_spend = next(r for r in baseline['spending_percentiles'] if r['percentile'] == compare_pct)
-			comparison_rows = []
-			for sc in multi_results:
-				sc_row = next(r for r in sc['percentile_rows'] if r['percentile'] == compare_pct)
-				sc_spend = next(r for r in sc['spending_percentiles'] if r['percentile'] == compare_pct)
-				comparison_rows.append({
-					'Scenario': sc['name'],
-					'After-Tax Ending': sc_row['after_tax_end'],
-					'vs Baseline': sc_row['after_tax_end'] - baseline_row['after_tax_end'],
-					'Total Taxes': sc_row['total_taxes'],
-					'Tax Delta': sc_row['total_taxes'] - baseline_row['total_taxes'],
-					'Eff Tax Rate': sc_row['effective_tax_rate'],
-					'Avg Annual Spending': sc_spend['avg_annual_after_tax_spending'],
-					'Spend Delta': sc_spend['avg_annual_after_tax_spending'] - baseline_spend['avg_annual_after_tax_spending'],
-					'% Depleted': sc['pct_non_positive'] * 100,
-				})
-			comp_df = pd.DataFrame(comparison_rows).set_index('Scenario')
-			def _color_delta(val):
-				if isinstance(val, (int, float)):
-					if val > 0:
-						return 'color: green'
-					elif val < 0:
-						return 'color: red'
-				return ''
-			st.dataframe(comp_df.style.format({
-				'After-Tax Ending': currency_fmt,
-				'vs Baseline': currency_fmt,
-				'Total Taxes': currency_fmt,
-				'Tax Delta': currency_fmt,
-				'Eff Tax Rate': '{:.2%}'.format,
-				'Avg Annual Spending': currency_fmt,
-				'Spend Delta': currency_fmt,
-				'% Depleted': '{:.1f}%'.format,
-			}).map(_color_delta, subset=['vs Baseline', 'Tax Delta', 'Spend Delta']))
-
-			# Overlay charts
-			st.subheader('Portfolio Value Comparison (median)')
-			overlay_df = pd.DataFrame()
-			for sc in multi_results:
-				median_portfolio = sc['all_yearly_df'].groupby('year')['total_portfolio'].median()
-				overlay_df[sc['name']] = median_portfolio
-			interactive_line_chart(overlay_df, y_title='Portfolio Value (Median)')
-
-			st.subheader('After-Tax Spending Comparison (median)')
-			spend_overlay = pd.DataFrame()
-			for sc in multi_results:
-				median_spend = sc['all_yearly_df'].groupby('year')['after_tax_spending'].median()
-				spend_overlay[sc['name']] = median_spend
-			interactive_line_chart(spend_overlay, y_title='After-Tax Spending (Median)')
-
-			# Scenario selector for detail drill-down
-			st.markdown('---')
-			scenario_names = [sc['name'] for sc in multi_results]
-			current_idx = st.session_state.get('selected_scenario_idx', 0)
-			selected_name = st.selectbox('Select scenario for detailed view', scenario_names,
-				index=current_idx, key='scenario_detail_select')
-			new_idx = scenario_names.index(selected_name)
-			if new_idx != current_idx:
-				st.session_state['selected_scenario_idx'] = new_idx
-				sim_mode_label = st.session_state.get('sim_mode', 'historical_dist')
-				_load_scenario_to_session(multi_results[new_idx], sim_mode_label)
-				st.rerun()
+			store_distribution_results(mc_results, all_yearly_df, 'simulated')
 
 	# ── Display results ──────────────────────────────────────────
 	sim_mode = st.session_state.get('sim_mode')
@@ -1570,15 +1274,14 @@ def main():
 				'total_lifetime_after_tax_spending': np.percentile(run_spending['total_after_tax_spending'], p),
 			})
 		spending_pct_df = pd.DataFrame(spending_pct_rows)
-		st.session_state['mc_spending_pct_rows'] = spending_pct_rows
 		sched = sim_params.get('withdrawal_schedule', [])
 		base_avg_wd = np.mean(sched) if sched else 0
 		if base_avg_wd > 0:
-			median_avg_spending = np.percentile(run_spending['avg_annual_after_tax_spending'], 50)
-			pct_above = (median_avg_spending / base_avg_wd - 1) * 100
+			median_avg_wd = np.percentile(run_spending['avg_annual_withdrawal'], 50)
+			pct_above = (median_avg_wd / base_avg_wd - 1) * 100
 			direction = 'above' if pct_above >= 0 else 'below'
-			st.caption(f'After-tax spending target: {currency_fmt.format(base_avg_wd)} | '
-					   f'Median avg annual after-tax spending: {currency_fmt.format(median_avg_spending)} '
+			st.caption(f'Base avg withdrawal target: {currency_fmt.format(base_avg_wd)} | '
+					   f'Median avg annual withdrawal: {currency_fmt.format(median_avg_wd)} '
 					   f'({abs(pct_above):.1f}% {direction} target)')
 		st.dataframe(spending_pct_df.style.format({
 			'percentile': lambda x: f"{int(x)}th",
@@ -1617,47 +1320,44 @@ def main():
 		}))
 
 		st.subheader('Total portfolio value — percentile bands across all runs')
-		port_value_mode = st.radio('Portfolio value display', ['Pre-tax', 'After-tax', 'Both'], horizontal=True, index=0, key='port_value_mode')
 		port_band_options = {'0th (min)': 0.00, '5th': 0.05, '10th': 0.10, '25th': 0.25, '50th (median)': 0.50, '75th': 0.75, '90th': 0.90}
 		port_band_defaults = ['0th (min)', '10th', '25th', '50th (median)', '75th', '90th']
 		selected_port_bands = st.multiselect('Percentile bands to display', list(port_band_options.keys()), default=port_band_defaults, key='port_bands')
 		if selected_port_bands:
 			port_quantiles = [port_band_options[b] for b in selected_port_bands]
-			if port_value_mode in ('Pre-tax', 'Both'):
-				if port_value_mode == 'Both':
-					st.caption('Pre-tax portfolio value')
-				port_pcts = all_yearly.groupby('year')['total_portfolio'].quantile(port_quantiles).unstack()
-				port_pcts.columns = selected_port_bands
-				interactive_line_chart(port_pcts, y_title='Portfolio Value (Pre-tax)')
-			if port_value_mode in ('After-tax', 'Both'):
-				inh_rate = float(inheritor_marginal_rate)
-				all_yearly['after_tax_portfolio'] = (
-					all_yearly['end_taxable_total'] + all_yearly['end_roth'] +
-					all_yearly['end_tda_total'] * max(0.0, 1.0 - inh_rate))
-				if port_value_mode == 'Both':
-					st.caption(f'After-tax portfolio value (TDA taxed at {inh_rate:.0%} inheritor rate)')
-				port_pcts_at = all_yearly.groupby('year')['after_tax_portfolio'].quantile(port_quantiles).unstack()
-				port_pcts_at.columns = selected_port_bands
-				interactive_line_chart(port_pcts_at, y_title='Portfolio Value (After-tax)')
+			port_pcts = all_yearly.groupby('year')['total_portfolio'].quantile(port_quantiles).unstack()
+			port_pcts.columns = selected_port_bands
+			st.line_chart(port_pcts)
 
 		st.subheader('Account balances — median across all runs')
-		inh_rate_acct = float(inheritor_marginal_rate)
-		all_yearly['after_tax_total'] = (
-			all_yearly['end_taxable_total'] + all_yearly['end_roth'] +
-			all_yearly['end_tda_total'] * max(0.0, 1.0 - inh_rate_acct))
-		acct_median = all_yearly.groupby('year')[['total_portfolio', 'after_tax_total', 'end_taxable_total', 'end_tda_total', 'end_roth']].median()
-		acct_median.columns = ['Pre-tax Total', 'After-tax Total', 'Taxable', 'Tax-deferred', 'Roth']
-		interactive_line_chart(acct_median, y_title='Balance')
-		if inh_rate_acct > 0:
-			st.caption(f'After-tax total discounts TDA balances at {inh_rate_acct:.0%} inheritor rate')
+		acct_median = all_yearly.groupby('year')[['total_portfolio', 'end_taxable_total', 'end_tda_total', 'end_roth']].median()
+		acct_median.columns = ['Total Portfolio', 'Taxable', 'Tax-deferred', 'Roth']
+		st.line_chart(acct_median)
 
 		st.subheader('Annual taxes — percentile bands across all runs')
 		tax_pcts = all_yearly.groupby('year')['total_taxes'].quantile([0.00, 0.10, 0.25, 0.50, 0.75, 0.90]).unstack()
 		tax_pcts.columns = ['0th (min)', '10th', '25th', '50th (median)', '75th', '90th']
-		interactive_line_chart(tax_pcts, y_title='Taxes')
+		st.line_chart(tax_pcts)
 
-		# After-tax spending percentile bands
+		# Guardrail-specific charts: withdrawal target and after-tax spending
 		if 'withdrawal_used' in all_yearly.columns:
+			st.subheader('Withdrawal target — percentile bands across all runs')
+			wd_pcts = all_yearly.groupby('year')['withdrawal_used'].quantile([0.00, 0.10, 0.25, 0.50, 0.75, 0.90]).unstack()
+			wd_pcts.columns = ['0th (min)', '10th', '25th', '50th (median)', '75th', '90th']
+			import altair as alt
+			wd_data_min = float(wd_pcts.values.min())
+			wd_data_max = float(wd_pcts.values.max())
+			wd_pad = max(wd_data_max - wd_data_min, float(withdraw_amount) * 0.1) * 0.15
+			wd_y_min = wd_data_min - wd_pad
+			wd_y_max = wd_data_max + wd_pad
+			wd_long = wd_pcts.reset_index().melt('year', var_name='Percentile', value_name='Withdrawal')
+			wd_chart = alt.Chart(wd_long).mark_line().encode(
+				x=alt.X('year:Q', title='Year'),
+				y=alt.Y('Withdrawal:Q', scale=alt.Scale(domain=[wd_y_min, wd_y_max]), title='Withdrawal ($)'),
+				color=alt.Color('Percentile:N', sort=['0th (min)', '10th', '25th', '50th (median)', '75th', '90th'])
+			).properties(height=400)
+			st.altair_chart(wd_chart, use_container_width=True)
+
 			st.subheader('After-tax spending — percentile bands across all runs')
 			spend_pcts = all_yearly.groupby('year')['after_tax_spending'].quantile([0.00, 0.10, 0.25, 0.50, 0.75, 0.90]).unstack()
 			spend_pcts.columns = ['0th (min)', '10th', '25th', '50th (median)', '75th', '90th']
@@ -1743,7 +1443,7 @@ def main():
 			'ss_income_total', 'taxable_social_security', 'pension_income_total', 'other_income',
 			'roth_conversion', 'roth_conversion_tax', 'roth_conversion_tax_source',
 			'deduction_applied', 'ordinary_taxable_income', 'capital_gains',
-			'ordinary_tax_total', 'capital_gains_tax', 'niit_tax', 'state_tax', 'total_taxes',
+			'ordinary_tax_total', 'capital_gains_tax', 'niit_tax', 'total_taxes',
 			'marginal_ordinary_rate', 'marginal_cap_gains_rate',
 			'end_stocks_mv', 'end_bonds_mv', 'end_stocks_basis', 'end_bonds_basis',
 			'end_taxable_total', 'investment_return_dollars',
@@ -1764,7 +1464,7 @@ def main():
 			'end_stocks_mv': currency_fmt, 'end_bonds_mv': currency_fmt, 'end_stocks_basis': currency_fmt, 'end_bonds_basis': currency_fmt,
 			'end_taxable_total': currency_fmt, 'investment_return_dollars': currency_fmt,
 			'end_tda_p1': currency_fmt, 'end_tda_p2': currency_fmt, 'end_tda_total': currency_fmt, 'end_roth': currency_fmt,
-			'ordinary_tax_total': currency_fmt, 'capital_gains_tax': currency_fmt, 'niit_tax': currency_fmt, 'state_tax': currency_fmt, 'total_taxes': currency_fmt,
+			'ordinary_tax_total': currency_fmt, 'capital_gains_tax': currency_fmt, 'niit_tax': currency_fmt, 'total_taxes': currency_fmt,
 			'marginal_ordinary_rate': '{:.2%}'.format, 'marginal_cap_gains_rate': '{:.2%}'.format,
 			'withdrawal_used': currency_fmt, 'after_tax_spending': currency_fmt,
 			'portfolio_return': '{:.2%}'.format,
@@ -1780,63 +1480,32 @@ def main():
 		st.bar_chart(chart_df)
 
 		st.subheader('After-tax spending over time — single run')
-		spending_src = df[['year', 'after_tax_spending', 'total_taxes',
-						   'ss_income_total', 'pension_income_total', 'other_income']].copy()
-		spending_src['goal'] = [withdrawal_schedule[i] if i < len(withdrawal_schedule) else withdrawal_schedule[-1] for i in range(len(spending_src))]
-		# Net portfolio withdrawals = after_tax_spending minus income streams (so stacked bars add up exactly)
-		spending_src['Net Portfolio Withdrawals'] = (spending_src['after_tax_spending']
-			- spending_src['ss_income_total'] - spending_src['pension_income_total'] - spending_src['other_income']).clip(lower=0)
-		source_cols = ['Net Portfolio Withdrawals', 'Social Security', 'Pension', 'Other Income']
-		spending_src = spending_src.rename(columns={'ss_income_total': 'Social Security',
-			'pension_income_total': 'Pension', 'other_income': 'Other Income'})
-		# Drop sources that are zero everywhere
-		source_cols = [c for c in source_cols if spending_src[c].sum() > 0]
-		src_long = spending_src[['year'] + source_cols].melt('year', var_name='Source', value_name='Amount')
-		nearest = alt.selection_point(nearest=True, on='pointerover', fields=['year'], empty=False)
-		stacked_bars = alt.Chart(src_long).mark_bar().encode(
+		spending_chart_data = df[['year', 'after_tax_spending']].copy()
+		spending_chart_data['goal'] = [withdrawal_schedule[i] if i < len(withdrawal_schedule) else withdrawal_schedule[-1] for i in range(len(spending_chart_data))]
+		spending_chart_data['status'] = spending_chart_data.apply(
+			lambda r: 'Below goal' if r['after_tax_spending'] < r['goal'] else 'At or above goal', axis=1)
+		import altair as alt
+		spend_bar = alt.Chart(spending_chart_data).mark_bar().encode(
 			x=alt.X('year:O', title='Year'),
-			y=alt.Y('Amount:Q', title='After-Tax Spending ($)', stack='zero'),
-			color=alt.Color('Source:N', sort=source_cols, legend=alt.Legend(title='Source')),
-			order=alt.Order('source_order:Q'),
-			tooltip=[alt.Tooltip('year:O', title='Year'),
-					 alt.Tooltip('Source:N'),
-					 alt.Tooltip('Amount:Q', format='$,.0f')]
-		).transform_calculate(
-			source_order=' : '.join([f'datum.Source === "{s}" ? {i}' for i, s in enumerate(source_cols)]) + ' : 99'
+			y=alt.Y('after_tax_spending:Q', title='After-Tax Spending ($)'),
+			color=alt.Color('status:N',
+				scale=alt.Scale(domain=['Below goal', 'At or above goal'], range=['#d62728', '#1f77b4']),
+				legend=alt.Legend(title=''))
 		).properties(height=400)
-		# Goal line
-		goal_line = alt.Chart(spending_src).mark_line(color='black', strokeDash=[6, 3], strokeWidth=2).encode(
-			x=alt.X('year:O'),
-			y=alt.Y('goal:Q'),
-			tooltip=[alt.Tooltip('year:O', title='Year'),
-					 alt.Tooltip('goal:Q', title='Spending Goal', format='$,.0f')]
-		)
-		# Invisible points for total-level tooltip
-		total_tip = alt.Chart(spending_src).mark_point(size=80, filled=True, opacity=0).encode(
-			x=alt.X('year:O'),
-			y=alt.Y('after_tax_spending:Q'),
-			tooltip=[alt.Tooltip('year:O', title='Year'),
-					 alt.Tooltip('after_tax_spending:Q', title='Total Spending', format='$,.0f'),
-					 alt.Tooltip('goal:Q', title='Goal', format='$,.0f'),
-					 alt.Tooltip('total_taxes:Q', title='Taxes Paid', format='$,.0f')]
-		).add_params(nearest)
-		st.altair_chart((stacked_bars + goal_line + total_tip).interactive(), use_container_width=True)
-		st.caption('Stacked bars show income sources. Dashed line = spending goal. Hover for details.')
+		st.altair_chart(spend_bar, use_container_width=True)
 
 		st.subheader('Account balances over time — single run')
 		bal_df = currency_round[['year','end_taxable_total','end_tda_total','end_roth']].set_index('year')
-		bal_df.columns = ['Taxable', 'Tax-deferred', 'Roth']
-		interactive_line_chart(bal_df, y_title='Balance')
+		st.line_chart(bal_df)
 
 		st.subheader('Taxes paid per year — single run')
-		tax_df = currency_round[['year','ordinary_taxable_income','ordinary_tax_total','capital_gains','capital_gains_tax','niit_tax','state_tax','total_taxes','deduction_applied','roth_conversion','roth_conversion_tax']].set_index('year')
+		tax_df = currency_round[['year','ordinary_taxable_income','ordinary_tax_total','capital_gains','capital_gains_tax','niit_tax','total_taxes','deduction_applied','roth_conversion','roth_conversion_tax']].set_index('year')
 		st.dataframe(tax_df.style.format({
 			'ordinary_taxable_income': currency_fmt,
 			'ordinary_tax_total': currency_fmt,
 			'capital_gains': currency_fmt,
 			'capital_gains_tax': currency_fmt,
 			'niit_tax': currency_fmt,
-			'state_tax': currency_fmt,
 			'total_taxes': currency_fmt,
 			'deduction_applied': currency_fmt,
 			'roth_conversion': currency_fmt,
@@ -1852,7 +1521,6 @@ def main():
 			'marginal_ordinary_rate': df['marginal_ordinary_rate'],
 			'marginal_cap_gains_rate': df['marginal_cap_gains_rate'],
 			'niit_tax': df['niit_tax'],
-			'state_tax': df['state_tax'],
 		}).set_index('year')
 		st.subheader('Effective and marginal tax rates — single run')
 		st.dataframe(mtr_df.style.format({
@@ -1862,20 +1530,13 @@ def main():
 			'marginal_ordinary_rate': '{:.2%}'.format,
 			'marginal_cap_gains_rate': '{:.2%}'.format,
 			'niit_tax': currency_fmt,
-			'state_tax': currency_fmt,
 		}))
-		rate_df = mtr_df[['effective_tax_rate','marginal_ordinary_rate','marginal_cap_gains_rate']].copy()
-		rate_df.columns = ['Effective Rate', 'Marginal Ordinary', 'Marginal Cap Gains']
-		interactive_line_chart(rate_df, y_title='Tax Rate', fmt='.1%')
+		st.line_chart(mtr_df[['effective_tax_rate','marginal_ordinary_rate','marginal_cap_gains_rate']])
 		lifetime_taxes = df['total_taxes'].sum()
 		lifetime_ordinary_tax = df['ordinary_tax_total'].sum()
 		lifetime_cap_gains_tax = df['capital_gains_tax'].sum()
-		lifetime_state_tax = df['state_tax'].sum()
 		st.metric('Total lifetime taxes paid', currency_fmt.format(lifetime_taxes))
-		tax_breakdown = f'Ordinary: {currency_fmt.format(lifetime_ordinary_tax)} | Capital gains/QD: {currency_fmt.format(lifetime_cap_gains_tax)}'
-		if lifetime_state_tax > 0:
-			tax_breakdown += f' | State: {currency_fmt.format(lifetime_state_tax)}'
-		st.caption(tax_breakdown)
+		st.caption(f'Ordinary: {currency_fmt.format(lifetime_ordinary_tax)} | Capital gains/QD: {currency_fmt.format(lifetime_cap_gains_tax)}')
 
 		st.markdown('---')
 		st.write('Ending balances')
@@ -1884,38 +1545,20 @@ def main():
 		st.write({'taxable_end': taxable_total_end, 'stocks_end': last_row['end_stocks_mv'], 'stocks_end_basis': last_row['end_stocks_basis'], 'bonds_end': last_row['end_bonds_mv'], 'bonds_end_basis': last_row['end_bonds_basis'], 'tda_end': last_row['end_tda_total'], 'roth_end': last_row['end_roth']})
 
 		# Store latest summary in session for post-run saving
-		inh_rate_save = float(inheritor_marginal_rate)
-		if sim_mode in ('simulated', 'historical_dist') and 'mc_all_yearly' in st.session_state:
-			# Use median ending balances across all runs
-			ay = st.session_state['mc_all_yearly']
-			last_year_data = ay[ay['year'] == ay['year'].max()]
-			med_taxable = float(last_year_data['end_taxable_total'].median())
-			med_tda = float(last_year_data['end_tda_total'].median())
-			med_roth = float(last_year_data['end_roth'].median())
-			med_taxes = float(ay.groupby('run')['total_taxes'].sum().median())
-			# Compute per-run totals first, then take median (median of sum, not sum of medians)
-			run_pre_tax = last_year_data['end_taxable_total'] + last_year_data['end_tda_total'] + last_year_data['end_roth']
-			run_after_tax = (last_year_data['end_taxable_total'] + last_year_data['end_roth'] +
-				last_year_data['end_tda_total'] * max(0.0, 1.0 - inh_rate_save))
-			pre_tax_total = float(run_pre_tax.median())
-			after_tax_total = float(run_after_tax.median())
-		else:
-			last = df.iloc[-1]
-			med_taxable = float(last['end_stocks_mv'] + last['end_bonds_mv'])
-			med_tda = float(last['end_tda_total'])
-			med_roth = float(last['end_roth'])
-			med_taxes = float(lifetime_taxes)
-			pre_tax_total = med_taxable + med_tda + med_roth
-			after_tax_total = med_taxable + med_roth + med_tda * max(0.0, 1.0 - inh_rate_save)
+		last = df.iloc[-1]
+		total_accounts = last['end_stocks_mv'] + last['end_bonds_mv'] + last['end_tda_total'] + last['end_roth']
+		after_tax_end = float(last['end_stocks_mv'] + last['end_bonds_mv'])
+		after_tax_end += float(last['end_roth'])
+		after_tax_end += float(last['end_tda_total']) * max(0.0, 1.0 - inheritor_marginal_rate)
 		summary_data = {
 			'label': f"conversion ${roth_conversion_amount:,.0f} for {roth_conversion_years} yrs, taxes from {roth_conversion_tax_source}",
-			'total_taxes': med_taxes,
-			'total_accounts': pre_tax_total,
-			'taxable_end': med_taxable,
-			'tda_end': med_tda,
-			'roth_end': med_roth,
-			'inheritor_marginal_rate': inh_rate_save,
-			'after_tax_end': after_tax_total,
+			'total_taxes': float(lifetime_taxes),
+			'total_accounts': float(total_accounts),
+			'taxable_end': float(last['end_stocks_mv'] + last['end_bonds_mv']),
+			'tda_end': float(last['end_tda_total']),
+			'roth_end': float(last['end_roth']),
+			'inheritor_marginal_rate': float(inheritor_marginal_rate),
+			'after_tax_end': after_tax_end,
 			'portfolio_cagr': portfolio_cagr,
 			'roth_cagr': roth_cagr,
 			'sim_type': sim_mode,
@@ -1923,7 +1566,6 @@ def main():
 		if sim_mode in ('simulated', 'historical_dist'):
 			summary_data['percentiles'] = st.session_state.get('mc_percentile_rows', [])
 			summary_data['pct_non_positive_end'] = st.session_state.get('mc_pct_non_positive', 0.0)
-			summary_data['spending_percentiles'] = st.session_state.get('mc_spending_pct_rows', [])
 		st.session_state['last_summary'] = summary_data
 	elif sim_mode is None:
 		st.info('Set inputs and click "Run simulation" to see results.')
@@ -1949,12 +1591,31 @@ def main():
 
 	if st.session_state.get('scenario_summaries'):
 		st.markdown('### Saved scenarios')
+		compare_rows = []
 		for s in st.session_state['scenario_summaries']:
-			pcts = s.get('percentiles', [])
-			if pcts:
-				st.markdown(f"**{s['name']}**")
-				pct_df = pd.DataFrame(pcts)
-				pct_non_pos = s.get('pct_non_positive_end', 0.0)
+			compare_rows.append({
+				'name': s['name'],
+				'type': s.get('sim_type', 'historical'),
+				'after_tax_end': s['after_tax_end'],
+				'total_taxes': s['total_taxes'],
+				'portfolio_cagr': s['portfolio_cagr'],
+				'roth_cagr': s['roth_cagr'],
+				'pct_ran_out': s.get('pct_non_positive_end', None),
+			})
+		compare_df = pd.DataFrame(compare_rows).set_index('name')
+		st.dataframe(compare_df.style.format({
+			'after_tax_end': currency_fmt,
+			'total_taxes': currency_fmt,
+			'portfolio_cagr': '{:.2%}'.format,
+			'roth_cagr': '{:.2%}'.format,
+			'pct_ran_out': lambda x: f'{x*100:.1f}%' if x is not None else 'N/A',
+			'type': lambda x: x,
+		}))
+		# Show percentile detail for distribution scenarios
+		for s in st.session_state['scenario_summaries']:
+			if s.get('sim_type') == 'simulated' and s.get('percentiles'):
+				st.markdown(f"**{s['name']} — percentile detail**")
+				pct_df = pd.DataFrame(s['percentiles'])
 				st.dataframe(pct_df.style.format({
 					'percentile': lambda x: f"{int(x)}th",
 					'after_tax_end': currency_fmt,
@@ -1962,19 +1623,6 @@ def main():
 					'effective_tax_rate': '{:.2%}'.format,
 					'portfolio_cagr': '{:.2%}'.format,
 					'roth_cagr': '{:.2%}'.format,
-				}))
-				if pct_non_pos is not None:
-					st.caption(f"Percent of ending values ≤ 0: {pct_non_pos * 100:.1f}%")
-			spending_pcts = s.get('spending_percentiles', [])
-			if spending_pcts:
-				st.markdown(f"*{s['name']} — Lifetime spending distribution*")
-				sp_df = pd.DataFrame(spending_pcts)
-				st.dataframe(sp_df.style.format({
-					'percentile': lambda x: f"{int(x)}th",
-					'avg_annual_withdrawal': currency_fmt,
-					'avg_annual_after_tax_spending': currency_fmt,
-					'total_lifetime_withdrawal': currency_fmt,
-					'total_lifetime_after_tax_spending': currency_fmt,
 				}))
 
 
