@@ -1564,7 +1564,7 @@ def main():
 			for sc in multi_results:
 				median_spend = sc['all_yearly_df'].groupby('year')['after_tax_spending'].median()
 				spend_overlay[sc['name']] = median_spend
-			interactive_line_chart(spend_overlay, y_title='After-Tax Spending (Median)')
+			interactive_line_chart(spend_overlay, y_title='After-Tax Spending (Median)', zero_base=False)
 
 			# Scenario selector for detail drill-down
 			st.markdown('---')
