@@ -245,6 +245,20 @@ def build_scenario_params(base_params: dict, overrides: dict, stock_mu: float = 
 		params['roth_conversion_amount'] = overrides['roth_conversion_amount']
 	if 'roth_conversion_years' in overrides:
 		params['roth_conversion_years'] = overrides['roth_conversion_years']
+	if 'annuity_purchase' in overrides:
+		params['taxable_start'] = params['taxable_start'] - overrides['annuity_purchase']
+		income = overrides.get('annuity_annual_income', 0.0)
+		cola = overrides.get('annuity_cola', 0.0)
+		surv = overrides.get('annuity_survivor_pct', 0.0)
+		if overrides.get('annuity_person') == 'Person 1':
+			params['annuity_income_p1'] = income
+			params['annuity_cola_p1'] = cola
+			params['annuity_survivor_pct_p1'] = surv
+		else:
+			params['annuity_income_p2'] = income
+			params['annuity_cola_p2'] = cola
+			params['annuity_survivor_pct_p2'] = surv
+		params['annuity_start_year'] = overrides.get('annuity_start_year', 1)
 	return params
 
 def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) -> str:
@@ -265,6 +279,10 @@ def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) ->
 			parts.append("No Roth conv")
 		else:
 			parts.append(f"Roth ${amt / 1000:.0f}k x {yrs}yr")
+	if 'annuity_purchase' in overrides:
+		purchase = overrides['annuity_purchase']
+		income = overrides.get('annuity_annual_income', 0)
+		parts.append(f"Annuity ${purchase / 1000:.0f}k → ${income / 1000:.0f}k/yr")
 	return " | ".join(parts) if parts else f"Scenario {scenario_idx}"
 
 def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFrame, inheritor_rate: float) -> dict:
@@ -558,6 +576,13 @@ def simulate_withdrawals(start_age_primary: int,
 						 pension_survivor_pct_p2: float = 0.0,
 						 pp_factors: Optional[list] = None,
 						 pp_factors_run: Optional[list] = None,
+						 annuity_income_p1: float = 0.0,
+						 annuity_income_p2: float = 0.0,
+						 annuity_cola_p1: float = 0.0,
+						 annuity_cola_p2: float = 0.0,
+						 annuity_survivor_pct_p1: float = 0.0,
+						 annuity_survivor_pct_p2: float = 0.0,
+						 annuity_start_year: int = 1,
 						 other_income_annual: float = 0.0,
 						 filing_status: str = 'single',
 						 use_itemized_deductions: bool = False,
@@ -644,7 +669,23 @@ def simulate_withdrawals(start_age_primary: int,
 			yr_pen_nom = 0.0
 		pp = pp_factors[y - 1] if pp_factors and y <= len(pp_factors) else 1.0
 		yr_pen_real = yr_pen_nom * pp
-		income_schedule.append(yr_ss + yr_pen_real + other_income_annual)
+		# Annuity income (same logic as pension: COLA, survivor, PP-adjusted)
+		if y >= annuity_start_year:
+			ann_yrs = y - annuity_start_year
+			ann_p1_nom = annuity_income_p1 * ((1 + annuity_cola_p1) ** ann_yrs)
+			ann_p2_nom = annuity_income_p2 * ((1 + annuity_cola_p2) ** ann_yrs)
+			if p1_alive and p2_alive:
+				yr_ann_nom = ann_p1_nom + ann_p2_nom
+			elif p1_alive:
+				yr_ann_nom = ann_p1_nom + ann_p2_nom * annuity_survivor_pct_p2
+			elif p2_alive:
+				yr_ann_nom = ann_p2_nom + ann_p1_nom * annuity_survivor_pct_p1
+			else:
+				yr_ann_nom = 0.0
+			yr_ann_real = yr_ann_nom * pp
+		else:
+			yr_ann_real = 0.0
+		income_schedule.append(yr_ss + yr_pen_real + yr_ann_real + other_income_annual)
 
 	# Guardrail: compute initial scaling factor via binary search
 	if guardrails_enabled:
@@ -826,6 +867,22 @@ def simulate_withdrawals(start_age_primary: int,
 		run_pp = pp_factors_run if pp_factors_run is not None else pp_factors
 		pp_yr = run_pp[y - 1] if run_pp and y <= len(run_pp) else 1.0
 		pension_income_real = pension_income * pp_yr
+		# Annuity income (same structure as pension)
+		if y >= annuity_start_year:
+			ann_yrs = y - annuity_start_year
+			ann_nom_p1 = annuity_income_p1 * ((1 + annuity_cola_p1) ** ann_yrs)
+			ann_nom_p2 = annuity_income_p2 * ((1 + annuity_cola_p2) ** ann_yrs)
+			if primary_alive and spouse_alive:
+				annuity_income = ann_nom_p1 + ann_nom_p2
+			elif primary_alive and not spouse_alive:
+				annuity_income = ann_nom_p1 + ann_nom_p2 * annuity_survivor_pct_p2
+			elif spouse_alive and not primary_alive:
+				annuity_income = ann_nom_p2 + ann_nom_p1 * annuity_survivor_pct_p1
+			else:
+				annuity_income = 0.0
+		else:
+			annuity_income = 0.0
+		annuity_income_real = annuity_income * pp_yr
 		other_income = other_income_annual
 		deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(filing_status_this_year)
 
@@ -930,7 +987,7 @@ def simulate_withdrawals(start_age_primary: int,
 				remaining -= take
 
 			# Full tax computation
-			ordinary_pre_ss_base = interest + w_tda + pension_income + other_income
+			ordinary_pre_ss_base = interest + w_tda + pension_income + annuity_income + other_income
 			ordinary_pre_ss_with_conv = ordinary_pre_ss_base + pending_roth_conversion
 			cg_total = div + turnover_realized_gain + realized_gains
 
@@ -1030,7 +1087,7 @@ def simulate_withdrawals(start_age_primary: int,
 			nst = max(0.0, min(nst, total_tax - conv_tax_delta))
 
 			net_spending = (out_taxable_cash + w_tda + w_roth
-				- rmd_excess + ss_income + pension_income_real + other_income
+				- rmd_excess + ss_income + pension_income_real + annuity_income_real + other_income
 				- (total_tax - conv_tax_delta - nst))
 
 			return net_spending, {
@@ -1127,6 +1184,8 @@ def simulate_withdrawals(start_age_primary: int,
 			'pension_income_total': pension_income,
 			'pension_income_real': pension_income_real,
 			'pension_erosion': pension_income - pension_income_real,
+			'annuity_income_total': annuity_income,
+			'annuity_income_real': annuity_income_real,
 			'other_income': other_income,
 			'roth_conversion': pending_roth_conversion,
 			'roth_conversion_tax': chosen['roth_conversion_tax_delta'],
@@ -1198,6 +1257,21 @@ def main():
 							value=0.0, step=10000.0, key=f'sc_roth_amt_{i}')
 						sc_overrides['roth_conversion_years'] = int(st.number_input(f'S{i} conversion years',
 							value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}'))
+					annuity_chk = st.checkbox(f'S{i} buy annuity', key=f'sc_annuity_chk_{i}')
+					if annuity_chk:
+						sc_overrides['annuity_purchase'] = st.number_input(f'S{i} annuity purchase price (from taxable)',
+							value=200000.0, step=10000.0, key=f'sc_ann_purchase_{i}')
+						sc_overrides['annuity_annual_income'] = st.number_input(f'S{i} annuity annual income',
+							value=12000.0, step=1000.0, key=f'sc_ann_income_{i}')
+						sc_overrides['annuity_cola'] = st.number_input(f'S{i} annuity COLA',
+							value=0.0, format="%.4f", key=f'sc_ann_cola_{i}')
+						sc_overrides['annuity_person'] = st.radio(f'S{i} annuity owner',
+							['Person 1', 'Person 2'], horizontal=True, key=f'sc_ann_person_{i}')
+						sc_overrides['annuity_survivor_pct'] = st.number_input(f'S{i} annuity survivor %',
+							value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_ann_surv_{i}',
+							help='Fraction of annuity paid to survivor after owner dies')
+						sc_overrides['annuity_start_year'] = int(st.number_input(f'S{i} annuity income starts (year)',
+							value=1, min_value=1, max_value=40, key=f'sc_ann_start_{i}'))
 					scenario_overrides_ui[i] = sc_overrides
 			else:
 				scenario_overrides_ui = {}
@@ -1805,7 +1879,8 @@ def main():
 			'rmd_divisor_p1', 'rmd_divisor_p2', 'rmd_p1', 'rmd_p2', 'rmd_total',
 			'withdraw_from_taxable_net', 'withdraw_from_tda', 'withdraw_from_roth',
 			'rmd_excess_to_taxable', 'gross_sold_taxable_bonds', 'gross_sold_taxable_stocks',
-			'ss_income_total', 'taxable_social_security', 'pension_income_total', 'pension_income_real', 'pension_erosion', 'other_income',
+			'ss_income_total', 'taxable_social_security', 'pension_income_total', 'pension_income_real', 'pension_erosion',
+			'annuity_income_total', 'annuity_income_real', 'other_income',
 			'roth_conversion', 'roth_conversion_tax', 'roth_conversion_tax_source',
 			'deduction_applied', 'ordinary_taxable_income', 'capital_gains',
 			'ordinary_tax_total', 'capital_gains_tax', 'niit_tax', 'state_tax', 'total_taxes',
@@ -1822,7 +1897,8 @@ def main():
 			'rmd_p1': currency_fmt, 'rmd_p2': currency_fmt, 'rmd_total': currency_fmt, 'withdraw_from_taxable_net': currency_fmt, 'withdraw_from_tda': currency_fmt, 'withdraw_from_roth': currency_fmt,
 			'rmd_excess_to_taxable': currency_fmt,
 			'gross_sold_taxable_bonds': currency_fmt, 'gross_sold_taxable_stocks': currency_fmt,
-			'ss_income_total': currency_fmt, 'taxable_social_security': currency_fmt, 'pension_income_total': currency_fmt, 'pension_income_real': currency_fmt, 'pension_erosion': currency_fmt, 'other_income': currency_fmt,
+			'ss_income_total': currency_fmt, 'taxable_social_security': currency_fmt, 'pension_income_total': currency_fmt, 'pension_income_real': currency_fmt, 'pension_erosion': currency_fmt,
+			'annuity_income_total': currency_fmt, 'annuity_income_real': currency_fmt, 'other_income': currency_fmt,
 			'roth_conversion': currency_fmt, 'roth_conversion_tax': currency_fmt,
 			'deduction_applied': currency_fmt, 'ordinary_taxable_income': currency_fmt,
 			'capital_gains': currency_fmt,
@@ -1846,14 +1922,15 @@ def main():
 
 		st.subheader('After-tax spending over time — single run')
 		spending_src = df[['year', 'after_tax_spending', 'total_taxes',
-						   'ss_income_total', 'pension_income_real', 'other_income']].copy()
+						   'ss_income_total', 'pension_income_real', 'annuity_income_real', 'other_income']].copy()
 		spending_src['goal'] = [withdrawal_schedule[i] if i < len(withdrawal_schedule) else withdrawal_schedule[-1] for i in range(len(spending_src))]
 		# Net portfolio withdrawals = after_tax_spending minus income streams (so stacked bars add up exactly)
 		spending_src['Net Portfolio Withdrawals'] = (spending_src['after_tax_spending']
-			- spending_src['ss_income_total'] - spending_src['pension_income_real'] - spending_src['other_income']).clip(lower=0)
-		source_cols = ['Net Portfolio Withdrawals', 'Social Security', 'Pension (Real)', 'Other Income']
+			- spending_src['ss_income_total'] - spending_src['pension_income_real']
+			- spending_src['annuity_income_real'] - spending_src['other_income']).clip(lower=0)
+		source_cols = ['Net Portfolio Withdrawals', 'Social Security', 'Pension (Real)', 'Annuity (Real)', 'Other Income']
 		spending_src = spending_src.rename(columns={'ss_income_total': 'Social Security',
-			'pension_income_real': 'Pension (Real)', 'other_income': 'Other Income'})
+			'pension_income_real': 'Pension (Real)', 'annuity_income_real': 'Annuity (Real)', 'other_income': 'Other Income'})
 		# Drop sources that are zero everywhere
 		source_cols = [c for c in source_cols if spending_src[c].sum() > 0]
 		src_long = spending_src[['year'] + source_cols].melt('year', var_name='Source', value_name='Amount')
