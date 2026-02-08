@@ -1403,7 +1403,13 @@ def main():
 			pension_buyout_enabled = st.checkbox('Enable pension buyout comparison', value=False,
 				help='Compare taking a lump sum (rolled into TDA) vs taking an annuity/pension income stream')
 			if pension_buyout_enabled:
-				st.caption('Baseline = take lump sum (added to TDA). Scenario 2 = take annuity income.')
+				pension_buyout_baseline = st.radio('Baseline (your choice)',
+					['Take lump sum', 'Take annuity'],
+					horizontal=True, key='pension_buyout_baseline')
+				if pension_buyout_baseline == 'Take lump sum':
+					st.caption('Baseline = lump sum added to TDA. Scenario 2 = annuity income instead.')
+				else:
+					st.caption('Baseline = annuity income. Scenario 2 = lump sum to TDA instead.')
 				pension_buyout_person = st.radio('Buyout for', ['Person 1', 'Person 2'],
 					horizontal=True, key='pension_buyout_person')
 				pension_buyout_lump = st.number_input('Lump sum amount (rolled into TDA)',
@@ -1417,6 +1423,7 @@ def main():
 					key='pension_buyout_survivor',
 					help='Fraction of annuity paid to survivor after owner dies')
 			else:
+				pension_buyout_baseline = 'Take lump sum'
 				pension_buyout_person = 'Person 1'
 				pension_buyout_lump = 0.0
 				pension_buyout_income = 0.0
@@ -1490,7 +1497,11 @@ def main():
 	years = max(1, max(life_expectancy_primary - start_age, life_expectancy_spouse - start_age_spouse) + 1)
 	_beginning_portfolio = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
 	if pension_buyout_enabled:
-		st.markdown(f"**Beginning portfolio (annuity baseline): ${_beginning_portfolio:,.0f}** | **With lump sum: ${_beginning_portfolio + float(pension_buyout_lump):,.0f}**")
+		_lump_portfolio = _beginning_portfolio + float(pension_buyout_lump)
+		if pension_buyout_baseline == 'Take lump sum':
+			st.markdown(f"**Beginning portfolio (lump sum baseline): ${_lump_portfolio:,.0f}** | **Annuity alternative: ${_beginning_portfolio:,.0f} + ${pension_buyout_income:,.0f}/yr**")
+		else:
+			st.markdown(f"**Beginning portfolio (annuity baseline): ${_beginning_portfolio:,.0f} + ${pension_buyout_income:,.0f}/yr** | **Lump sum alternative: ${_lump_portfolio:,.0f}**")
 	else:
 		st.markdown(f"**Beginning portfolio: ${_beginning_portfolio:,.0f}**")
 
@@ -1587,35 +1598,59 @@ def main():
 		st.session_state['sim_df'] = median_df
 		st.session_state['sim_mode'] = sim_mode_label
 
-	# Pension buyout: baseline = take annuity (income stream), scenario 2 = take lump sum (TDA)
+	# Pension buyout: set up baseline according to user's choice
 	if pension_buyout_enabled:
-		if pension_buyout_person == 'Person 1':
-			sim_params['annuity_income_p1'] = float(pension_buyout_income)
-			sim_params['annuity_cola_p1'] = float(pension_buyout_cola)
-			sim_params['annuity_survivor_pct_p1'] = float(pension_buyout_survivor)
+		if pension_buyout_baseline == 'Take lump sum':
+			# Baseline = lump sum added to TDA
+			if pension_buyout_person == 'Person 1':
+				sim_params['tda_start'] += float(pension_buyout_lump)
+			else:
+				sim_params['tda_spouse_start'] += float(pension_buyout_lump)
 		else:
-			sim_params['annuity_income_p2'] = float(pension_buyout_income)
-			sim_params['annuity_cola_p2'] = float(pension_buyout_cola)
-			sim_params['annuity_survivor_pct_p2'] = float(pension_buyout_survivor)
+			# Baseline = annuity income stream
+			if pension_buyout_person == 'Person 1':
+				sim_params['annuity_income_p1'] = float(pension_buyout_income)
+				sim_params['annuity_cola_p1'] = float(pension_buyout_cola)
+				sim_params['annuity_survivor_pct_p1'] = float(pension_buyout_survivor)
+			else:
+				sim_params['annuity_income_p2'] = float(pension_buyout_income)
+				sim_params['annuity_cola_p2'] = float(pension_buyout_cola)
+				sim_params['annuity_survivor_pct_p2'] = float(pension_buyout_survivor)
 
 	# Build scenario list
 	if pension_buyout_enabled:
-		baseline_name = f"Take Annuity (${pension_buyout_income / 1000:.0f}k/yr)"
-		all_scenarios = [({}, baseline_name)]
-		# Build lump sum scenario: add to TDA + zero out annuity income
-		lump_ovr = {}
-		if pension_buyout_person == 'Person 1':
-			lump_ovr['tda_delta_p1'] = float(pension_buyout_lump)
-			lump_ovr['annuity_income_p1'] = 0.0
-			lump_ovr['annuity_cola_p1'] = 0.0
-			lump_ovr['annuity_survivor_pct_p1'] = 0.0
+		if pension_buyout_baseline == 'Take lump sum':
+			baseline_name = f"Take Lump Sum (${pension_buyout_lump / 1000:.0f}k)"
+			# Scenario 2: reverse TDA addition + add annuity income
+			alt_ovr = {}
+			if pension_buyout_person == 'Person 1':
+				alt_ovr['tda_delta_p1'] = -float(pension_buyout_lump)
+				alt_ovr['annuity_income_p1'] = float(pension_buyout_income)
+				alt_ovr['annuity_cola_p1'] = float(pension_buyout_cola)
+				alt_ovr['annuity_survivor_pct_p1'] = float(pension_buyout_survivor)
+			else:
+				alt_ovr['tda_delta_p2'] = -float(pension_buyout_lump)
+				alt_ovr['annuity_income_p2'] = float(pension_buyout_income)
+				alt_ovr['annuity_cola_p2'] = float(pension_buyout_cola)
+				alt_ovr['annuity_survivor_pct_p2'] = float(pension_buyout_survivor)
+			alt_name = f"Take Annuity (${pension_buyout_income / 1000:.0f}k/yr)"
 		else:
-			lump_ovr['tda_delta_p2'] = float(pension_buyout_lump)
-			lump_ovr['annuity_income_p2'] = 0.0
-			lump_ovr['annuity_cola_p2'] = 0.0
-			lump_ovr['annuity_survivor_pct_p2'] = 0.0
-		lump_name = f"Take Lump Sum (${pension_buyout_lump / 1000:.0f}k)"
-		all_scenarios.append((lump_ovr, lump_name))
+			baseline_name = f"Take Annuity (${pension_buyout_income / 1000:.0f}k/yr)"
+			# Scenario 2: add lump sum to TDA + zero out annuity income
+			alt_ovr = {}
+			if pension_buyout_person == 'Person 1':
+				alt_ovr['tda_delta_p1'] = float(pension_buyout_lump)
+				alt_ovr['annuity_income_p1'] = 0.0
+				alt_ovr['annuity_cola_p1'] = 0.0
+				alt_ovr['annuity_survivor_pct_p1'] = 0.0
+			else:
+				alt_ovr['tda_delta_p2'] = float(pension_buyout_lump)
+				alt_ovr['annuity_income_p2'] = 0.0
+				alt_ovr['annuity_cola_p2'] = 0.0
+				alt_ovr['annuity_survivor_pct_p2'] = 0.0
+			alt_name = f"Take Lump Sum (${pension_buyout_lump / 1000:.0f}k)"
+		all_scenarios = [({}, baseline_name)]
+		all_scenarios.append((alt_ovr, alt_name))
 		# Append any additional manual scenario overrides
 		if num_scenarios > 1:
 			for s_idx in range(2, num_scenarios + 1):
