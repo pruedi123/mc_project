@@ -29,14 +29,15 @@ def compute_run_pp_factors(start_idx: int, years: int) -> list:
 		pp.append(cum)
 	return pp
 
-def interactive_line_chart(data_df, y_title='Value', fmt='$,.0f', height=400):
+def interactive_line_chart(data_df, y_title='Value', fmt='$,.0f', height=400, zero_base=True):
 	"""Convert a DataFrame (index=x, columns=series) to an interactive Altair line chart with tooltips."""
 	long = data_df.reset_index().melt(data_df.index.name or 'index', var_name='Series', value_name='value')
 	x_col = data_df.index.name or 'index'
 	nearest = alt.selection_point(nearest=True, on='pointerover', fields=[x_col], empty=False)
+	y_scale = alt.Scale(zero=True) if zero_base else alt.Scale(zero=False)
 	base = alt.Chart(long).encode(
 		x=alt.X(f'{x_col}:Q', title=x_col.replace('_', ' ').title()),
-		y=alt.Y('value:Q', title=y_title, axis=alt.Axis(format=fmt)),
+		y=alt.Y('value:Q', title=y_title, axis=alt.Axis(format=fmt), scale=y_scale),
 		color=alt.Color('Series:N', legend=alt.Legend(title='')),
 	)
 	lines = base.mark_line()
@@ -1556,7 +1557,7 @@ def main():
 			for sc in multi_results:
 				median_portfolio = sc['all_yearly_df'].groupby('year')['total_portfolio'].median()
 				overlay_df[sc['name']] = median_portfolio
-			interactive_line_chart(overlay_df, y_title='Portfolio Value (Median)')
+			interactive_line_chart(overlay_df, y_title='Portfolio Value (Median)', zero_base=False)
 
 			st.subheader('After-Tax Spending Comparison (median)')
 			spend_overlay = pd.DataFrame()
