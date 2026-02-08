@@ -6,6 +6,29 @@ from typing import Dict, Optional, Sequence
 
 st.set_page_config(page_title='Withdrawal + RMD Simulator', layout='wide')
 
+# Load median purchasing power factors for pension real-value adjustment (years 1-40)
+_pp_df = pd.read_excel('median_cpi_purchasing_power.xlsx')
+PP_FACTORS = _pp_df['Median_Purchasing_Power'].tolist()
+
+# Load monthly CPI factors for per-run historical purchasing power
+_cpi_mo_df = pd.read_excel('cpi_mo_factors.xlsx')
+CPI_MO_FACTORS = _cpi_mo_df['cpi_factors'].values
+
+def compute_run_pp_factors(start_idx: int, years: int) -> list:
+	"""Compute cumulative purchasing power factors for a historical run
+	starting at CPI monthly index start_idx, for each year 1..years.
+	Compounds 12 monthly CPI factors per year."""
+	pp = []
+	cum = 1.0
+	for y in range(years):
+		mo_start = start_idx + y * 12
+		mo_end = mo_start + 12
+		if mo_end <= len(CPI_MO_FACTORS):
+			for m in range(mo_start, mo_end):
+				cum *= CPI_MO_FACTORS[m]
+		pp.append(cum)
+	return pp
+
 def interactive_line_chart(data_df, y_title='Value', fmt='$,.0f', height=400):
 	"""Convert a DataFrame (index=x, columns=series) to an interactive Altair line chart with tooltips."""
 	long = data_df.reset_index().melt(data_df.index.name or 'index', var_name='Series', value_name='value')
@@ -528,7 +551,12 @@ def simulate_withdrawals(start_age_primary: int,
 						 ss_cola: float = 0.0,
 						 pension_income_annual: float = 0.0,
 						 pension_income_spouse_annual: float = 0.0,
-						 pension_cola: float = 0.0,
+						 pension_cola_p1: float = 0.0,
+						 pension_cola_p2: float = 0.0,
+						 pension_survivor_pct_p1: float = 0.0,
+						 pension_survivor_pct_p2: float = 0.0,
+						 pp_factors: Optional[list] = None,
+						 pp_factors_run: Optional[list] = None,
 						 other_income_annual: float = 0.0,
 						 filing_status: str = 'single',
 						 use_itemized_deductions: bool = False,
@@ -603,9 +631,19 @@ def simulate_withdrawals(start_age_primary: int,
 			yr_ss = max(ss_b1, ss_b2) if age_p2 >= ss_start_age_p2 else 0.0
 		else:
 			yr_ss = 0.0
-		yr_pen = ((pension_income_annual * ((1 + pension_cola) ** (y - 1))) if p1_alive else 0.0) + \
-				 ((pension_income_spouse_annual * ((1 + pension_cola) ** (y - 1))) if p2_alive else 0.0)
-		income_schedule.append(yr_ss + yr_pen + other_income_annual)
+		pen_p1_nom = pension_income_annual * ((1 + pension_cola_p1) ** (y - 1))
+		pen_p2_nom = pension_income_spouse_annual * ((1 + pension_cola_p2) ** (y - 1))
+		if p1_alive and p2_alive:
+			yr_pen_nom = pen_p1_nom + pen_p2_nom
+		elif p1_alive:
+			yr_pen_nom = pen_p1_nom + pen_p2_nom * pension_survivor_pct_p2
+		elif p2_alive:
+			yr_pen_nom = pen_p2_nom + pen_p1_nom * pension_survivor_pct_p1
+		else:
+			yr_pen_nom = 0.0
+		pp = pp_factors[y - 1] if pp_factors and y <= len(pp_factors) else 1.0
+		yr_pen_real = yr_pen_nom * pp
+		income_schedule.append(yr_ss + yr_pen_real + other_income_annual)
 
 	# Guardrail: compute initial scaling factor via binary search
 	if guardrails_enabled:
@@ -773,9 +811,20 @@ def simulate_withdrawals(start_age_primary: int,
 			ss_income = max(ss_benefit_p1, ss_benefit_p2) if age_p2 >= ss_start_age_p2 else 0.0
 		else:
 			ss_income = 0.0
-		pension_income_p1 = pension_income_annual * ((1 + pension_cola) ** (y - 1)) if primary_alive else 0.0
-		pension_income_p2 = pension_income_spouse_annual * ((1 + pension_cola) ** (y - 1)) if spouse_alive else 0.0
-		pension_income = pension_income_p1 + pension_income_p2
+		pen_nom_p1 = pension_income_annual * ((1 + pension_cola_p1) ** (y - 1))
+		pen_nom_p2 = pension_income_spouse_annual * ((1 + pension_cola_p2) ** (y - 1))
+		if primary_alive and spouse_alive:
+			pension_income = pen_nom_p1 + pen_nom_p2
+		elif primary_alive and not spouse_alive:
+			pension_income = pen_nom_p1 + pen_nom_p2 * pension_survivor_pct_p2
+		elif spouse_alive and not primary_alive:
+			pension_income = pen_nom_p2 + pen_nom_p1 * pension_survivor_pct_p1
+		else:
+			pension_income = 0.0
+		# Use per-run CPI factors if available (historical), otherwise median PP factors
+		run_pp = pp_factors_run if pp_factors_run is not None else pp_factors
+		pp_yr = run_pp[y - 1] if run_pp and y <= len(run_pp) else 1.0
+		pension_income_real = pension_income * pp_yr
 		other_income = other_income_annual
 		deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(filing_status_this_year)
 
@@ -980,7 +1029,7 @@ def simulate_withdrawals(start_age_primary: int,
 			nst = max(0.0, min(nst, total_tax - conv_tax_delta))
 
 			net_spending = (out_taxable_cash + w_tda + w_roth
-				- rmd_excess + ss_income + pension_income + other_income
+				- rmd_excess + ss_income + pension_income_real + other_income
 				- (total_tax - conv_tax_delta - nst))
 
 			return net_spending, {
@@ -1075,6 +1124,8 @@ def simulate_withdrawals(start_age_primary: int,
 			'ss_income_total': ss_income,
 			'taxable_social_security': chosen['taxable_ss'],
 			'pension_income_total': pension_income,
+			'pension_income_real': pension_income_real,
+			'pension_erosion': pension_income - pension_income_real,
 			'other_income': other_income,
 			'roth_conversion': pending_roth_conversion,
 			'roth_conversion_tax': chosen['roth_conversion_tax_delta'],
@@ -1204,8 +1255,13 @@ def main():
 			ss_cola = st.number_input('Social Security COLA', value=0.02, format="%.4f")
 			st.caption('Survivor receives the higher of their own or deceased spouse\'s benefit')
 			pension_income_input = st.number_input('Annual pension income - person 1', value=0.0, step=1000.0)
-			pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=0.0, step=1000.0)
-			pension_cola = st.number_input('Pension COLA', value=0.00, format="%.4f")
+			pension_cola_p1 = st.number_input('Pension COLA - person 1', value=0.00, format="%.4f")
+			pension_survivor_pct_p1 = st.number_input('Pension survivor % - person 1', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
+				help='Fraction of person 1 pension paid to survivor after person 1 dies')
+			pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=20000.0, step=1000.0)
+			pension_cola_p2 = st.number_input('Pension COLA - person 2', value=0.00, format="%.4f")
+			pension_survivor_pct_p2 = st.number_input('Pension survivor % - person 2', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
+				help='Fraction of person 2 pension paid to survivor after person 2 dies')
 			other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0)
 
 		with st.expander('Tax Settings'):
@@ -1304,7 +1360,11 @@ def main():
 		ss_cola=float(ss_cola),
 		pension_income_annual=float(pension_income_input),
 		pension_income_spouse_annual=float(pension_income_spouse_input),
-		pension_cola=float(pension_cola), other_income_annual=float(other_income_input),
+		pension_cola_p1=float(pension_cola_p1), pension_cola_p2=float(pension_cola_p2),
+		pension_survivor_pct_p1=float(pension_survivor_pct_p1),
+		pension_survivor_pct_p2=float(pension_survivor_pct_p2),
+		pp_factors=PP_FACTORS,
+		other_income_annual=float(other_income_input),
 		filing_status=filing_status_key, use_itemized_deductions=bool(use_itemized),
 		itemized_deduction_amount=float(itemized_deduction_input),
 		roth_conversion_amount=float(roth_conversion_amount),
@@ -1390,9 +1450,10 @@ def main():
 					if run_idx % 50 == 0:
 						progress_placeholder.progress(run_idx / n_windows,
 							text=f'{s_name}: {run_idx}/{n_windows} periods')
+					run_pp = compute_run_pp_factors(run_idx, sim_years)
 					df_run = simulate_withdrawals(
 						years=sim_years, stock_return_series=stock_rets,
-						bond_return_series=bond_rets, **s_params)
+						bond_return_series=bond_rets, pp_factors_run=run_pp, **s_params)
 					df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
 					metrics = compute_summary_metrics(df_run, float(inheritor_marginal_rate))
 					results.append(metrics)
@@ -1594,7 +1655,8 @@ def main():
 		median_cols = ['age_p1', 'withdrawal_used', 'after_tax_spending', 'total_portfolio',
 					   'end_taxable_total', 'end_tda_total', 'end_roth',
 					   'total_taxes', 'rmd_total', 'withdraw_from_tda', 'withdraw_from_roth',
-					   'withdraw_from_taxable_net', 'ss_income_total', 'ordinary_taxable_income',
+					   'withdraw_from_taxable_net', 'ss_income_total', 'pension_income_total',
+					   'pension_income_real', 'pension_erosion', 'ordinary_taxable_income',
 					   'capital_gains', 'effective_tax_rate_calc']
 		all_yearly['effective_tax_rate_calc'] = (
 			all_yearly['total_taxes'] /
@@ -1604,14 +1666,16 @@ def main():
 		yearly_median.columns = ['Age', 'Withdrawal Target', 'After-Tax Spending', 'Total Portfolio',
 								 'Taxable', 'TDA', 'Roth',
 								 'Total Taxes', 'RMDs', 'Withdraw TDA', 'Withdraw Roth',
-								 'Withdraw Taxable', 'SS Income', 'Ordinary Income',
+								 'Withdraw Taxable', 'SS Income', 'Pension (Nominal)',
+								 'Pension (Real)', 'Pension Erosion', 'Ordinary Income',
 								 'Cap Gains', 'Eff Tax Rate']
 		st.dataframe(yearly_median.style.format({
 			'Age': '{:.0f}',
 			'Total Portfolio': currency_fmt, 'Taxable': currency_fmt, 'TDA': currency_fmt, 'Roth': currency_fmt,
 			'Total Taxes': currency_fmt, 'RMDs': currency_fmt,
 			'Withdraw TDA': currency_fmt, 'Withdraw Roth': currency_fmt, 'Withdraw Taxable': currency_fmt,
-			'SS Income': currency_fmt, 'Ordinary Income': currency_fmt, 'Cap Gains': currency_fmt,
+			'SS Income': currency_fmt, 'Pension (Nominal)': currency_fmt, 'Pension (Real)': currency_fmt, 'Pension Erosion': currency_fmt,
+			'Ordinary Income': currency_fmt, 'Cap Gains': currency_fmt,
 			'Eff Tax Rate': '{:.2%}'.format,
 			'Withdrawal Target': currency_fmt, 'After-Tax Spending': currency_fmt,
 		}))
@@ -1740,7 +1804,7 @@ def main():
 			'rmd_divisor_p1', 'rmd_divisor_p2', 'rmd_p1', 'rmd_p2', 'rmd_total',
 			'withdraw_from_taxable_net', 'withdraw_from_tda', 'withdraw_from_roth',
 			'rmd_excess_to_taxable', 'gross_sold_taxable_bonds', 'gross_sold_taxable_stocks',
-			'ss_income_total', 'taxable_social_security', 'pension_income_total', 'other_income',
+			'ss_income_total', 'taxable_social_security', 'pension_income_total', 'pension_income_real', 'pension_erosion', 'other_income',
 			'roth_conversion', 'roth_conversion_tax', 'roth_conversion_tax_source',
 			'deduction_applied', 'ordinary_taxable_income', 'capital_gains',
 			'ordinary_tax_total', 'capital_gains_tax', 'niit_tax', 'state_tax', 'total_taxes',
@@ -1757,7 +1821,7 @@ def main():
 			'rmd_p1': currency_fmt, 'rmd_p2': currency_fmt, 'rmd_total': currency_fmt, 'withdraw_from_taxable_net': currency_fmt, 'withdraw_from_tda': currency_fmt, 'withdraw_from_roth': currency_fmt,
 			'rmd_excess_to_taxable': currency_fmt,
 			'gross_sold_taxable_bonds': currency_fmt, 'gross_sold_taxable_stocks': currency_fmt,
-			'ss_income_total': currency_fmt, 'taxable_social_security': currency_fmt, 'pension_income_total': currency_fmt, 'other_income': currency_fmt,
+			'ss_income_total': currency_fmt, 'taxable_social_security': currency_fmt, 'pension_income_total': currency_fmt, 'pension_income_real': currency_fmt, 'pension_erosion': currency_fmt, 'other_income': currency_fmt,
 			'roth_conversion': currency_fmt, 'roth_conversion_tax': currency_fmt,
 			'deduction_applied': currency_fmt, 'ordinary_taxable_income': currency_fmt,
 			'capital_gains': currency_fmt,
@@ -1781,14 +1845,14 @@ def main():
 
 		st.subheader('After-tax spending over time — single run')
 		spending_src = df[['year', 'after_tax_spending', 'total_taxes',
-						   'ss_income_total', 'pension_income_total', 'other_income']].copy()
+						   'ss_income_total', 'pension_income_real', 'other_income']].copy()
 		spending_src['goal'] = [withdrawal_schedule[i] if i < len(withdrawal_schedule) else withdrawal_schedule[-1] for i in range(len(spending_src))]
 		# Net portfolio withdrawals = after_tax_spending minus income streams (so stacked bars add up exactly)
 		spending_src['Net Portfolio Withdrawals'] = (spending_src['after_tax_spending']
-			- spending_src['ss_income_total'] - spending_src['pension_income_total'] - spending_src['other_income']).clip(lower=0)
-		source_cols = ['Net Portfolio Withdrawals', 'Social Security', 'Pension', 'Other Income']
+			- spending_src['ss_income_total'] - spending_src['pension_income_real'] - spending_src['other_income']).clip(lower=0)
+		source_cols = ['Net Portfolio Withdrawals', 'Social Security', 'Pension (Real)', 'Other Income']
 		spending_src = spending_src.rename(columns={'ss_income_total': 'Social Security',
-			'pension_income_total': 'Pension', 'other_income': 'Other Income'})
+			'pension_income_real': 'Pension (Real)', 'other_income': 'Other Income'})
 		# Drop sources that are zero everywhere
 		source_cols = [c for c in source_cols if spending_src[c].sum() > 0]
 		src_long = spending_src[['year'] + source_cols].melt('year', var_name='Source', value_name='Amount')
@@ -1811,14 +1875,17 @@ def main():
 			tooltip=[alt.Tooltip('year:O', title='Year'),
 					 alt.Tooltip('goal:Q', title='Spending Goal', format='$,.0f')]
 		)
-		# Invisible points for total-level tooltip
+		# Invisible points for total-level tooltip with full breakdown
+		tip_fields = [alt.Tooltip('year:O', title='Year'),
+					  alt.Tooltip('after_tax_spending:Q', title='Total Spending', format='$,.0f'),
+					  alt.Tooltip('goal:Q', title='Goal', format='$,.0f')]
+		for sc in source_cols:
+			tip_fields.append(alt.Tooltip(f'{sc}:Q', title=sc, format='$,.0f'))
+		tip_fields.append(alt.Tooltip('total_taxes:Q', title='Taxes Paid', format='$,.0f'))
 		total_tip = alt.Chart(spending_src).mark_point(size=80, filled=True, opacity=0).encode(
 			x=alt.X('year:O'),
 			y=alt.Y('after_tax_spending:Q'),
-			tooltip=[alt.Tooltip('year:O', title='Year'),
-					 alt.Tooltip('after_tax_spending:Q', title='Total Spending', format='$,.0f'),
-					 alt.Tooltip('goal:Q', title='Goal', format='$,.0f'),
-					 alt.Tooltip('total_taxes:Q', title='Taxes Paid', format='$,.0f')]
+			tooltip=tip_fields,
 		).add_params(nearest)
 		st.altair_chart((stacked_bars + goal_line + total_tip).interactive(), use_container_width=True)
 		st.caption('Stacked bars show income sources. Dashed line = spending goal. Hover for details.')
