@@ -259,6 +259,28 @@ def build_scenario_params(base_params: dict, overrides: dict, stock_mu: float = 
 			params['annuity_cola_p2'] = cola
 			params['annuity_survivor_pct_p2'] = surv
 		params['annuity_start_year'] = overrides.get('annuity_start_year', 1)
+	if 'buyout_choice' in overrides:
+		person = overrides.get('buyout_person', 'Person 1')
+		if overrides['buyout_choice'] == 'Take lump sum':
+			# Add lump sum to the appropriate TDA
+			lump = overrides.get('buyout_lump_sum', 0.0)
+			if person == 'Person 1':
+				params['tda_start'] = params.get('tda_start', 0.0) + lump
+			else:
+				params['tda_spouse_start'] = params.get('tda_spouse_start', 0.0) + lump
+		else:
+			# Take annuity: add income stream
+			income = overrides.get('buyout_annuity_income', 0.0)
+			cola = overrides.get('buyout_annuity_cola', 0.0)
+			surv = overrides.get('buyout_annuity_survivor_pct', 0.0)
+			if person == 'Person 1':
+				params['annuity_income_p1'] = params.get('annuity_income_p1', 0.0) + income
+				params['annuity_cola_p1'] = cola
+				params['annuity_survivor_pct_p1'] = surv
+			else:
+				params['annuity_income_p2'] = params.get('annuity_income_p2', 0.0) + income
+				params['annuity_cola_p2'] = cola
+				params['annuity_survivor_pct_p2'] = surv
 	return params
 
 def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) -> str:
@@ -283,6 +305,16 @@ def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) ->
 		purchase = overrides['annuity_purchase']
 		income = overrides.get('annuity_annual_income', 0)
 		parts.append(f"Annuity ${purchase / 1000:.0f}k → ${income / 1000:.0f}k/yr")
+	if 'buyout_choice' in overrides:
+		choice = overrides['buyout_choice']
+		person = overrides.get('buyout_person', 'Person 1')
+		tag = "P1" if person == "Person 1" else "P2"
+		if choice == 'Take lump sum':
+			lump = overrides.get('buyout_lump_sum', 0)
+			parts.append(f"Buyout {tag}: Lump ${lump / 1000:.0f}k")
+		else:
+			income = overrides.get('buyout_annuity_income', 0)
+			parts.append(f"Buyout {tag}: Annuity ${income / 1000:.0f}k/yr")
 	return " | ".join(parts) if parts else f"Scenario {scenario_idx}"
 
 def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFrame, inheritor_rate: float) -> dict:
@@ -1257,7 +1289,7 @@ def main():
 							value=0.0, step=10000.0, key=f'sc_roth_amt_{i}')
 						sc_overrides['roth_conversion_years'] = int(st.number_input(f'S{i} conversion years',
 							value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}'))
-					annuity_chk = st.checkbox(f'S{i} buy annuity', key=f'sc_annuity_chk_{i}')
+					annuity_chk = st.checkbox(f'S{i} buy annuity (from taxable)', key=f'sc_annuity_chk_{i}')
 					if annuity_chk:
 						sc_overrides['annuity_purchase'] = st.number_input(f'S{i} annuity purchase price (from taxable)',
 							value=200000.0, step=10000.0, key=f'sc_ann_purchase_{i}')
@@ -1272,6 +1304,21 @@ def main():
 							help='Fraction of annuity paid to survivor after owner dies')
 						sc_overrides['annuity_start_year'] = int(st.number_input(f'S{i} annuity income starts (year)',
 							value=1, min_value=1, max_value=40, key=f'sc_ann_start_{i}'))
+					buyout_chk = st.checkbox(f'S{i} pension buyout (lump sum vs annuity)', key=f'sc_buyout_chk_{i}')
+					if buyout_chk:
+						buyout_choice = st.radio(f'S{i} pension buyout choice',
+							['Take lump sum', 'Take annuity'], horizontal=True, key=f'sc_buyout_choice_{i}')
+						sc_overrides['buyout_person'] = st.radio(f'S{i} buyout for',
+							['Person 1', 'Person 2'], horizontal=True, key=f'sc_buyout_person_{i}')
+						sc_overrides['buyout_lump_sum'] = st.number_input(f'S{i} lump sum amount (to TDA)',
+							value=400000.0, step=10000.0, key=f'sc_buyout_lump_{i}')
+						sc_overrides['buyout_annuity_income'] = st.number_input(f'S{i} annuity income alternative',
+							value=24000.0, step=1000.0, key=f'sc_buyout_income_{i}')
+						sc_overrides['buyout_annuity_cola'] = st.number_input(f'S{i} buyout annuity COLA',
+							value=0.0, format="%.4f", key=f'sc_buyout_cola_{i}')
+						sc_overrides['buyout_annuity_survivor_pct'] = st.number_input(f'S{i} buyout annuity survivor %',
+							value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_buyout_surv_{i}')
+						sc_overrides['buyout_choice'] = buyout_choice
 					scenario_overrides_ui[i] = sc_overrides
 			else:
 				scenario_overrides_ui = {}
