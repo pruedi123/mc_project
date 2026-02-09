@@ -1290,13 +1290,13 @@ def main():
 					st.markdown(f'**Scenario {i}**')
 					spend_mode = st.radio(f'S{i} spending', ['Same as baseline', 'Scale by %', 'Set amount'],
 						key=f'sc_spend_mode_{i}', horizontal=True,
-						help='Same as baseline: no change. Scale by %%: multiply all withdrawal amounts by a percentage '
-						'(e.g. 80%% = spend 20%% less). Set amount: replace with a fixed annual amount.')
+						help='Same as baseline: no change. Scale by %: multiply all withdrawal amounts by a percentage '
+						'(e.g. 80% = spend 20% less). Set amount: replace with a fixed annual amount.')
 					sc_overrides = {}
 					if spend_mode == 'Scale by %':
 						sc_overrides['spend_scale'] = st.number_input(f'S{i} spending scale %',
 							value=100.0, step=5.0, key=f'sc_spend_scale_{i}',
-							help='100%% = same as baseline. 80%% = 20%% less spending. 120%% = 20%% more spending. '
+							help='100% = same as baseline. 80% = 20% less spending. 120% = 20% more spending. '
 							'Applied to every year in the withdrawal schedule.') / 100.0
 					elif spend_mode == 'Set amount':
 						sc_overrides['spend_flat'] = st.number_input(f'S{i} flat annual spending',
