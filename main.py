@@ -1277,7 +1277,8 @@ def main():
 		st.header('Inputs')
 
 		with st.expander('Scenario Comparison'):
-			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=4, value=1, step=1)
+			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=4, value=1, step=1,
+				help='Set to 1 if using Pension Buyout (it creates its own scenarios). Set to 2+ only to add extra overrides like Roth conversions or allocation changes.')
 			if num_scenarios > 1:
 				st.caption('Scenario 1 = baseline (uses inputs below). Override specific values for scenarios 2-4.')
 				scenario_overrides_ui = {}
@@ -1671,6 +1672,10 @@ def main():
 			for s_idx in range(2, num_scenarios + 1):
 				ovr = scenario_overrides_ui.get(s_idx, {})
 				all_scenarios.append((ovr, auto_scenario_name(s_idx, ovr, sim_params)))
+
+	# Show scenario count so user knows what will run
+	if pension_buyout_enabled:
+		st.caption(f'Pension buyout will run **{len(all_scenarios)} scenarios**: {", ".join(name for _, name in all_scenarios)}')
 
 	# Let user pick which scenario is the baseline for comparison
 	if num_scenarios > 1:
