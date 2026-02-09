@@ -281,16 +281,11 @@ def build_scenario_params(base_params: dict, overrides: dict, stock_mu: float = 
 				params['annuity_income_p2'] = params.get('annuity_income_p2', 0.0) + income
 				params['annuity_cola_p2'] = cola
 				params['annuity_survivor_pct_p2'] = surv
-	# Direct TDA adjustments (additive delta for pension buyout reversal)
+	# Direct TDA adjustments (for pension buyout reversal)
 	if 'tda_delta_p1' in overrides:
 		params['tda_start'] = params.get('tda_start', 0.0) + overrides['tda_delta_p1']
 	if 'tda_delta_p2' in overrides:
 		params['tda_spouse_start'] = params.get('tda_spouse_start', 0.0) + overrides['tda_delta_p2']
-	# Direct TDA absolute overrides (from per-scenario configs)
-	if 'tda_start' in overrides:
-		params['tda_start'] = overrides['tda_start']
-	if 'tda_spouse_start' in overrides:
-		params['tda_spouse_start'] = overrides['tda_spouse_start']
 	# Direct annuity income param overrides
 	for key in ['annuity_income_p1', 'annuity_income_p2', 'annuity_cola_p1', 'annuity_cola_p2',
 				'annuity_survivor_pct_p1', 'annuity_survivor_pct_p2', 'annuity_start_year']:
@@ -1282,64 +1277,92 @@ def main():
 		st.header('Inputs')
 
 		with st.expander('Scenario Comparison'):
-			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=6, value=1, step=1,
-				help='Set to 1 for a single simulation. Set to 2+ to compare different strategies side by side. '
-				'Each scenario has its own inputs for the things that typically vary (TDA balances, Roth conversions, '
-				'allocation, spending, annuity income). Everything else is shared from the main sidebar inputs.')
-			scenario_configs = []
+			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=4, value=1, step=1,
+				help='How many scenarios to compare. Scenario 1 is always the baseline (uses all inputs below). '
+				'Scenarios 2-4 let you override specific values to see how changes affect outcomes. '
+				'If using Pension Buyout, set to 1 for just lump vs annuity; set to 2+ to also test other changes '
+				'(each override is crossed with both lump sum and annuity sides).')
 			if num_scenarios > 1:
-				st.caption('Each scenario is independently configured. Shared settings (ages, SS, pensions, taxes, returns) '
-					'come from the main sidebar. Use the baseline selector below to choose which scenario deltas are measured against.')
-				for i in range(1, num_scenarios + 1):
-					st.markdown(f'---')
-					sc_name = st.text_input(f'Scenario {i} name', value=f'Scenario {i}', key=f'sc_name_{i}')
-					col_a, col_b = st.columns(2)
-					with col_a:
-						sc_tda_p1 = st.number_input(f'S{i} TDA person 1', value=700000.0, step=10000.0, key=f'sc_tda1_{i}',
-							help='Tax-deferred account balance for person 1. Change this to model a lump sum (add it) or no lump sum (leave as-is).')
-						sc_tda_p2 = st.number_input(f'S{i} TDA person 2', value=0.0, step=10000.0, key=f'sc_tda2_{i}',
-							help='Tax-deferred account balance for person 2.')
-						sc_stock_pct = st.slider(f'S{i} stock %', 0, 100, 60, 5, key=f'sc_stock_{i}',
-							help='Household target percentage in stocks for this scenario.') / 100.0
-					with col_b:
-						sc_roth_amt = st.number_input(f'S{i} Roth conversion $/yr', value=0.0, step=10000.0, key=f'sc_roth_amt_{i}',
-							help='Annual amount converted from TDA to Roth. 0 = no conversions.')
-						sc_roth_yrs = int(st.number_input(f'S{i} Roth conversion years', value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}',
-							help='Number of years to perform Roth conversions starting from year 1.'))
-						sc_spend_mode = st.radio(f'S{i} spending', ['Use withdrawal schedule', 'Set flat amount'],
-							key=f'sc_spend_mode_{i}', horizontal=True,
-							help='Use withdrawal schedule: uses the periods defined in the Withdrawal Schedule section. '
-							'Set flat amount: override with a fixed annual spending target.')
-					sc_spend_flat = None
-					if sc_spend_mode == 'Set flat amount':
-						sc_spend_flat = st.number_input(f'S{i} annual spending', value=80000.0, step=5000.0, key=f'sc_spend_flat_{i}',
-							help='Fixed annual after-tax spending goal for every year.')
-					annuity_chk = st.checkbox(f'S{i} additional annuity/pension income', key=f'sc_annuity_chk_{i}',
-						help='Add an income stream for this scenario (e.g. from taking an annuity option instead of a lump sum).')
-					sc_annuity = {}
+				st.caption('Scenario 1 = baseline (uses all inputs below). For each additional scenario, '
+					'check the boxes below to override specific values. Anything not overridden stays the same as baseline.')
+				scenario_overrides_ui = {}
+				for i in range(2, num_scenarios + 1):
+					st.markdown(f'**Scenario {i}**')
+					spend_mode = st.radio(f'S{i} spending', ['Same as baseline', 'Scale by %', 'Set amount'],
+						key=f'sc_spend_mode_{i}', horizontal=True,
+						help='Same as baseline: no change. Scale by %: multiply all withdrawal amounts by a percentage '
+						'(e.g. 80% = spend 20% less). Set amount: replace with a fixed annual amount.')
+					sc_overrides = {}
+					if spend_mode == 'Scale by %':
+						sc_overrides['spend_scale'] = st.number_input(f'S{i} spending scale %',
+							value=100.0, step=5.0, key=f'sc_spend_scale_{i}',
+							help='100% = same as baseline. 80% = 20% less spending. 120% = 20% more spending. '
+							'Applied to every year in the withdrawal schedule.') / 100.0
+					elif spend_mode == 'Set amount':
+						sc_overrides['spend_flat'] = st.number_input(f'S{i} flat annual spending',
+							value=80000.0, step=5000.0, key=f'sc_spend_flat_{i}',
+							help='Replaces the entire withdrawal schedule with this fixed amount every year.')
+					stock_chk = st.checkbox(f'S{i} override stock %', key=f'sc_stock_chk_{i}',
+						help='Test a different stock/bond allocation for this scenario.')
+					if stock_chk:
+						sc_overrides['target_stock_pct'] = st.slider(f'S{i} stock %',
+							0, 100, 60, 5, key=f'sc_stock_{i}') / 100.0
+					roth_chk = st.checkbox(f'S{i} override Roth conversions', key=f'sc_roth_chk_{i}',
+						help='Test a different Roth conversion strategy for this scenario. '
+						'Set amount to 0 and years to 0 for no conversions.')
+					if roth_chk:
+						sc_overrides['roth_conversion_amount'] = st.number_input(f'S{i} annual Roth conversion',
+							value=0.0, step=10000.0, key=f'sc_roth_amt_{i}',
+							help='Amount converted from TDA to Roth each year. Taxed as ordinary income in the year of conversion.')
+						sc_overrides['roth_conversion_years'] = int(st.number_input(f'S{i} conversion years',
+							value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}',
+							help='Number of years to perform conversions, starting from year 1 of the simulation.'))
+					annuity_chk = st.checkbox(f'S{i} buy annuity (from taxable)', key=f'sc_annuity_chk_{i}',
+						help='Purchase an annuity using money from the taxable account. '
+						'Reduces taxable balance and adds an income stream.')
 					if annuity_chk:
-						ac1, ac2 = st.columns(2)
-						with ac1:
-							sc_annuity['income'] = st.number_input(f'S{i} annuity annual income', value=12000.0, step=1000.0, key=f'sc_ann_inc_{i}',
-								help='Annual income from the annuity/pension.')
-							sc_annuity['cola'] = st.number_input(f'S{i} annuity COLA', value=0.0, format="%.4f", key=f'sc_ann_cola_{i}',
-								help='Annual cost-of-living adjustment. 0 = fixed payments.')
-						with ac2:
-							sc_annuity['survivor_pct'] = st.number_input(f'S{i} annuity survivor %', value=0.0,
-								min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_ann_surv_{i}',
-								help='Fraction paid to survivor after owner dies. 1.0 = full benefit continues.')
-							sc_annuity['person'] = st.radio(f'S{i} annuity for', ['Person 1', 'Person 2'],
-								horizontal=True, key=f'sc_ann_person_{i}')
-					scenario_configs.append({
-						'name': sc_name,
-						'tda_p1': sc_tda_p1,
-						'tda_p2': sc_tda_p2,
-						'stock_pct': sc_stock_pct,
-						'roth_amt': sc_roth_amt,
-						'roth_yrs': sc_roth_yrs,
-						'spend_flat': sc_spend_flat,
-						'annuity': sc_annuity,
-					})
+						sc_overrides['annuity_purchase'] = st.number_input(f'S{i} annuity purchase price (from taxable)',
+							value=200000.0, step=10000.0, key=f'sc_ann_purchase_{i}',
+							help='Amount taken from taxable account to buy the annuity.')
+						sc_overrides['annuity_annual_income'] = st.number_input(f'S{i} annuity annual income',
+							value=12000.0, step=1000.0, key=f'sc_ann_income_{i}',
+							help='Annual income received from the annuity.')
+						sc_overrides['annuity_cola'] = st.number_input(f'S{i} annuity COLA',
+							value=0.0, format="%.4f", key=f'sc_ann_cola_{i}',
+							help='Annual cost-of-living adjustment on the annuity income. 0 = fixed payments.')
+						sc_overrides['annuity_person'] = st.radio(f'S{i} annuity owner',
+							['Person 1', 'Person 2'], horizontal=True, key=f'sc_ann_person_{i}')
+						sc_overrides['annuity_survivor_pct'] = st.number_input(f'S{i} annuity survivor %',
+							value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_ann_surv_{i}',
+							help='Fraction of annuity paid to survivor after owner dies. 1.0 = full benefit continues. 0 = payments stop at death.')
+						sc_overrides['annuity_start_year'] = int(st.number_input(f'S{i} annuity income starts (year)',
+							value=1, min_value=1, max_value=40, key=f'sc_ann_start_{i}',
+							help='Simulation year when annuity payments begin. Year 1 = immediately.'))
+					buyout_chk = st.checkbox(f'S{i} pension buyout (lump sum vs annuity)', key=f'sc_buyout_chk_{i}',
+						help='Compare taking a one-time lump sum (rolled into TDA) vs receiving an annual pension/annuity. '
+						'For a dedicated comparison, use the Pension Buyout section instead.')
+					if buyout_chk:
+						buyout_choice = st.radio(f'S{i} pension buyout choice',
+							['Take lump sum', 'Take annuity'], horizontal=True, key=f'sc_buyout_choice_{i}',
+							help='Take lump sum: amount is added to TDA. Take annuity: receive annual income instead.')
+						sc_overrides['buyout_person'] = st.radio(f'S{i} buyout for',
+							['Person 1', 'Person 2'], horizontal=True, key=f'sc_buyout_person_{i}')
+						sc_overrides['buyout_lump_sum'] = st.number_input(f'S{i} lump sum amount (to TDA)',
+							value=200000.0, step=10000.0, key=f'sc_buyout_lump_{i}',
+							help='One-time amount rolled into the TDA (IRA/401k).')
+						sc_overrides['buyout_annuity_income'] = st.number_input(f'S{i} annuity income alternative',
+							value=12000.0, step=1000.0, key=f'sc_buyout_income_{i}',
+							help='Annual income if you choose the annuity/pension option instead.')
+						sc_overrides['buyout_annuity_cola'] = st.number_input(f'S{i} buyout annuity COLA',
+							value=0.0, format="%.4f", key=f'sc_buyout_cola_{i}',
+							help='Annual cost-of-living adjustment. 0 = fixed payments (purchasing power erodes with inflation).')
+						sc_overrides['buyout_annuity_survivor_pct'] = st.number_input(f'S{i} buyout annuity survivor %',
+							value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_buyout_surv_{i}',
+							help='Fraction of annuity paid to survivor. 1.0 = full benefit continues. 0 = stops at death.')
+						sc_overrides['buyout_choice'] = buyout_choice
+					scenario_overrides_ui[i] = sc_overrides
+			else:
+				scenario_overrides_ui = {}
 
 		with st.expander('Ages & Timeline', expanded=True):
 			start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65)
@@ -1403,6 +1426,37 @@ def main():
 			pension_survivor_pct_p2 = st.number_input('Pension survivor % - person 2', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
 				help='Fraction of person 2 pension paid to survivor after person 2 dies')
 			other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0)
+
+		with st.expander('Pension Buyout (Lump Sum vs Annuity)'):
+			pension_buyout_enabled = st.checkbox('Enable pension buyout comparison', value=False,
+				help='Compare taking a lump sum (rolled into TDA) vs taking an annuity/pension income stream')
+			if pension_buyout_enabled:
+				pension_buyout_baseline = st.radio('Baseline (your choice)',
+					['Take lump sum', 'Take annuity'],
+					horizontal=True, key='pension_buyout_baseline')
+				if pension_buyout_baseline == 'Take lump sum':
+					st.caption('Baseline = lump sum added to TDA. Scenario 2 = annuity income instead.')
+				else:
+					st.caption('Baseline = annuity income. Scenario 2 = lump sum to TDA instead.')
+				pension_buyout_person = st.radio('Buyout for', ['Person 1', 'Person 2'],
+					horizontal=True, key='pension_buyout_person')
+				pension_buyout_lump = st.number_input('Lump sum amount (rolled into TDA)',
+					value=200000.0, step=10000.0, key='pension_buyout_lump')
+				pension_buyout_income = st.number_input('Annuity income alternative (annual)',
+					value=12000.0, step=1000.0, key='pension_buyout_income')
+				pension_buyout_cola = st.number_input('Annuity COLA',
+					value=0.0, format="%.4f", key='pension_buyout_cola')
+				pension_buyout_survivor = st.number_input('Annuity survivor %',
+					value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
+					key='pension_buyout_survivor',
+					help='Fraction of annuity paid to survivor after owner dies')
+			else:
+				pension_buyout_baseline = 'Take lump sum'
+				pension_buyout_person = 'Person 1'
+				pension_buyout_lump = 0.0
+				pension_buyout_income = 0.0
+				pension_buyout_cola = 0.0
+				pension_buyout_survivor = 0.0
 
 		with st.expander('Tax Settings'):
 			taxes_enabled = st.checkbox('Enable taxation', value=True, help='Uncheck to disable all taxes (useful for testing withdrawal mechanics)')
@@ -1470,7 +1524,14 @@ def main():
 
 	years = max(1, max(life_expectancy_primary - start_age, life_expectancy_spouse - start_age_spouse) + 1)
 	_beginning_portfolio = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
-	st.markdown(f"**Beginning portfolio: ${_beginning_portfolio:,.0f}**")
+	if pension_buyout_enabled:
+		_lump_portfolio = _beginning_portfolio + float(pension_buyout_lump)
+		if pension_buyout_baseline == 'Take lump sum':
+			st.markdown(f"**Beginning portfolio (lump sum baseline): ${_lump_portfolio:,.0f}** | **Annuity alternative: ${_beginning_portfolio:,.0f} + ${pension_buyout_income:,.0f}/yr**")
+		else:
+			st.markdown(f"**Beginning portfolio (annuity baseline): ${_beginning_portfolio:,.0f} + ${pension_buyout_income:,.0f}/yr** | **Lump sum alternative: ${_lump_portfolio:,.0f}**")
+	else:
+		st.markdown(f"**Beginning portfolio: ${_beginning_portfolio:,.0f}**")
 
 	# Build year-by-year withdrawal schedule from period inputs
 	withdrawal_schedule = []
@@ -1565,41 +1626,93 @@ def main():
 		st.session_state['sim_df'] = median_df
 		st.session_state['sim_mode'] = sim_mode_label
 
-	# Build scenario list — each scenario gets its own complete params
-	if scenario_configs:
-		all_scenarios = []
-		for sc in scenario_configs:
-			s_params = dict(sim_params)
-			s_params['tda_start'] = sc['tda_p1']
-			s_params['tda_spouse_start'] = sc['tda_p2']
-			s_params['target_stock_pct'] = sc['stock_pct']
-			if s_params.get('guardrails_enabled'):
-				pct = sc['stock_pct']
-				s_params['blended_mu'] = pct * stock_mu + (1 - pct) * bond_mu
-				s_params['blended_sigma'] = pct * stock_sigma + (1 - pct) * bond_sigma
-			s_params['roth_conversion_amount'] = sc['roth_amt']
-			s_params['roth_conversion_years'] = sc['roth_yrs']
-			if sc['spend_flat'] is not None:
-				s_params['withdrawal_schedule'] = [sc['spend_flat']] * len(s_params['withdrawal_schedule'])
-			ann = sc.get('annuity', {})
-			if ann:
-				pk = 'p1' if ann.get('person') == 'Person 1' else 'p2'
-				s_params[f'annuity_income_{pk}'] = ann.get('income', 0.0)
-				s_params[f'annuity_cola_{pk}'] = ann.get('cola', 0.0)
-				s_params[f'annuity_survivor_pct_{pk}'] = ann.get('survivor_pct', 0.0)
-			all_scenarios.append((s_params, sc['name']))
-		num_scenarios = len(all_scenarios)
+	# Pension buyout: set up baseline according to user's choice
+	if pension_buyout_enabled:
+		if pension_buyout_baseline == 'Take lump sum':
+			# Baseline = lump sum added to TDA
+			if pension_buyout_person == 'Person 1':
+				sim_params['tda_start'] += float(pension_buyout_lump)
+			else:
+				sim_params['tda_spouse_start'] += float(pension_buyout_lump)
+		else:
+			# Baseline = annuity income stream
+			if pension_buyout_person == 'Person 1':
+				sim_params['annuity_income_p1'] = float(pension_buyout_income)
+				sim_params['annuity_cola_p1'] = float(pension_buyout_cola)
+				sim_params['annuity_survivor_pct_p1'] = float(pension_buyout_survivor)
+			else:
+				sim_params['annuity_income_p2'] = float(pension_buyout_income)
+				sim_params['annuity_cola_p2'] = float(pension_buyout_cola)
+				sim_params['annuity_survivor_pct_p2'] = float(pension_buyout_survivor)
 
-		# Let user pick which scenario is the baseline for comparison
+	# Build scenario list
+	if pension_buyout_enabled:
+		if pension_buyout_baseline == 'Take lump sum':
+			baseline_name = f"Take Lump Sum (${pension_buyout_lump / 1000:.0f}k)"
+			# Scenario 2: reverse TDA addition + add annuity income
+			alt_ovr = {}
+			if pension_buyout_person == 'Person 1':
+				alt_ovr['tda_delta_p1'] = -float(pension_buyout_lump)
+				alt_ovr['annuity_income_p1'] = float(pension_buyout_income)
+				alt_ovr['annuity_cola_p1'] = float(pension_buyout_cola)
+				alt_ovr['annuity_survivor_pct_p1'] = float(pension_buyout_survivor)
+			else:
+				alt_ovr['tda_delta_p2'] = -float(pension_buyout_lump)
+				alt_ovr['annuity_income_p2'] = float(pension_buyout_income)
+				alt_ovr['annuity_cola_p2'] = float(pension_buyout_cola)
+				alt_ovr['annuity_survivor_pct_p2'] = float(pension_buyout_survivor)
+			alt_name = f"Take Annuity (${pension_buyout_income / 1000:.0f}k/yr)"
+		else:
+			baseline_name = f"Take Annuity (${pension_buyout_income / 1000:.0f}k/yr)"
+			# Scenario 2: add lump sum to TDA + zero out annuity income
+			alt_ovr = {}
+			if pension_buyout_person == 'Person 1':
+				alt_ovr['tda_delta_p1'] = float(pension_buyout_lump)
+				alt_ovr['annuity_income_p1'] = 0.0
+				alt_ovr['annuity_cola_p1'] = 0.0
+				alt_ovr['annuity_survivor_pct_p1'] = 0.0
+			else:
+				alt_ovr['tda_delta_p2'] = float(pension_buyout_lump)
+				alt_ovr['annuity_income_p2'] = 0.0
+				alt_ovr['annuity_cola_p2'] = 0.0
+				alt_ovr['annuity_survivor_pct_p2'] = 0.0
+			alt_name = f"Take Lump Sum (${pension_buyout_lump / 1000:.0f}k)"
+		all_scenarios = [({}, baseline_name)]
+		all_scenarios.append((alt_ovr, alt_name))
+		# Cross-product: each non-empty manual override generates two variants (baseline side + alt side)
+		if num_scenarios > 1:
+			for s_idx in range(2, num_scenarios + 1):
+				ovr = scenario_overrides_ui.get(s_idx, {})
+				if not ovr:
+					continue  # skip empty overrides
+				ovr_label = auto_scenario_name(s_idx, ovr, sim_params)
+				# Variant on baseline side (override applied directly)
+				all_scenarios.append((dict(ovr), f"{baseline_name} | {ovr_label}"))
+				# Variant on alt side (merge alt_ovr + override)
+				merged = dict(alt_ovr)
+				merged.update(ovr)
+				all_scenarios.append((merged, f"{alt_name} | {ovr_label}"))
+		num_scenarios = len(all_scenarios)
+	else:
+		all_scenarios = [({}, 'Baseline')]  # scenario 1 = baseline, no overrides
+		if num_scenarios > 1:
+			for s_idx in range(2, num_scenarios + 1):
+				ovr = scenario_overrides_ui.get(s_idx, {})
+				all_scenarios.append((ovr, auto_scenario_name(s_idx, ovr, sim_params)))
+
+	# Show scenario count so user knows what will run
+	if pension_buyout_enabled:
+		st.caption(f'Pension buyout will run **{len(all_scenarios)} scenarios**: {", ".join(name for _, name in all_scenarios)}')
+
+	# Let user pick which scenario is the baseline for comparison
+	if num_scenarios > 1:
 		scenario_names = [name for _, name in all_scenarios]
 		baseline_idx = st.selectbox('Baseline scenario (deltas compared against this)',
 			range(len(scenario_names)), format_func=lambda i: scenario_names[i], index=0,
-			key='baseline_scenario_idx',
-			help='All delta columns in the comparison table are relative to this scenario.')
+			key='baseline_scenario_idx')
 		if baseline_idx != 0:
+			# Move selected baseline to front
 			all_scenarios.insert(0, all_scenarios.pop(baseline_idx))
-	else:
-		all_scenarios = [(sim_params, 'Baseline')]
 
 	button_label = 'Run all scenarios' if num_scenarios > 1 else 'Run simulation'
 	if st.button(button_label):
@@ -1651,9 +1764,12 @@ def main():
 			multi_results = []
 			scenario_bar = st.progress(0, text='Starting scenarios...')
 			run_bar = st.progress(0, text='')
-			for s_num, (s_params, s_name) in enumerate(all_scenarios):
+			for s_num, (ovr, s_name) in enumerate(all_scenarios):
 				scenario_bar.progress(s_num / len(all_scenarios),
 					text=f'Scenario {s_num + 1}/{len(all_scenarios)}: {s_name}')
+				s_params = build_scenario_params(sim_params, ovr,
+					stock_mu=stock_mu, stock_sigma=stock_sigma,
+					bond_mu=bond_mu, bond_sigma=bond_sigma)
 				results, all_yearly_df = run_one_scenario(s_params, s_name, run_bar)
 				summary = compute_scenario_summary(s_name, results, all_yearly_df, float(inheritor_marginal_rate))
 				multi_results.append(summary)
