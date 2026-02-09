@@ -1278,60 +1278,87 @@ def main():
 
 		with st.expander('Scenario Comparison'):
 			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=4, value=1, step=1,
-				help='Set to 1 if using Pension Buyout (it creates its own scenarios). Set to 2+ only to add extra overrides like Roth conversions or allocation changes.')
+				help='How many scenarios to compare. Scenario 1 is always the baseline (uses all inputs below). '
+				'Scenarios 2-4 let you override specific values to see how changes affect outcomes. '
+				'If using Pension Buyout, set to 1 for just lump vs annuity; set to 2+ to also test other changes '
+				'(each override is crossed with both lump sum and annuity sides).')
 			if num_scenarios > 1:
-				st.caption('Scenario 1 = baseline (uses inputs below). Override specific values for scenarios 2-4.')
+				st.caption('Scenario 1 = baseline (uses all inputs below). For each additional scenario, '
+					'check the boxes below to override specific values. Anything not overridden stays the same as baseline.')
 				scenario_overrides_ui = {}
 				for i in range(2, num_scenarios + 1):
 					st.markdown(f'**Scenario {i}**')
 					spend_mode = st.radio(f'S{i} spending', ['Same as baseline', 'Scale by %', 'Set amount'],
-						key=f'sc_spend_mode_{i}', horizontal=True)
+						key=f'sc_spend_mode_{i}', horizontal=True,
+						help='Same as baseline: no change. Scale by %%: multiply all withdrawal amounts by a percentage '
+						'(e.g. 80%% = spend 20%% less). Set amount: replace with a fixed annual amount.')
 					sc_overrides = {}
 					if spend_mode == 'Scale by %':
 						sc_overrides['spend_scale'] = st.number_input(f'S{i} spending scale %',
-							value=100.0, step=5.0, key=f'sc_spend_scale_{i}') / 100.0
+							value=100.0, step=5.0, key=f'sc_spend_scale_{i}',
+							help='100%% = same as baseline. 80%% = 20%% less spending. 120%% = 20%% more spending. '
+							'Applied to every year in the withdrawal schedule.') / 100.0
 					elif spend_mode == 'Set amount':
 						sc_overrides['spend_flat'] = st.number_input(f'S{i} flat annual spending',
-							value=80000.0, step=5000.0, key=f'sc_spend_flat_{i}')
-					stock_chk = st.checkbox(f'S{i} override stock %', key=f'sc_stock_chk_{i}')
+							value=80000.0, step=5000.0, key=f'sc_spend_flat_{i}',
+							help='Replaces the entire withdrawal schedule with this fixed amount every year.')
+					stock_chk = st.checkbox(f'S{i} override stock %', key=f'sc_stock_chk_{i}',
+						help='Test a different stock/bond allocation for this scenario.')
 					if stock_chk:
 						sc_overrides['target_stock_pct'] = st.slider(f'S{i} stock %',
 							0, 100, 60, 5, key=f'sc_stock_{i}') / 100.0
-					roth_chk = st.checkbox(f'S{i} override Roth conversions', key=f'sc_roth_chk_{i}')
+					roth_chk = st.checkbox(f'S{i} override Roth conversions', key=f'sc_roth_chk_{i}',
+						help='Test a different Roth conversion strategy for this scenario. '
+						'Set amount to 0 and years to 0 for no conversions.')
 					if roth_chk:
 						sc_overrides['roth_conversion_amount'] = st.number_input(f'S{i} annual Roth conversion',
-							value=0.0, step=10000.0, key=f'sc_roth_amt_{i}')
+							value=0.0, step=10000.0, key=f'sc_roth_amt_{i}',
+							help='Amount converted from TDA to Roth each year. Taxed as ordinary income in the year of conversion.')
 						sc_overrides['roth_conversion_years'] = int(st.number_input(f'S{i} conversion years',
-							value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}'))
-					annuity_chk = st.checkbox(f'S{i} buy annuity (from taxable)', key=f'sc_annuity_chk_{i}')
+							value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}',
+							help='Number of years to perform conversions, starting from year 1 of the simulation.'))
+					annuity_chk = st.checkbox(f'S{i} buy annuity (from taxable)', key=f'sc_annuity_chk_{i}',
+						help='Purchase an annuity using money from the taxable account. '
+						'Reduces taxable balance and adds an income stream.')
 					if annuity_chk:
 						sc_overrides['annuity_purchase'] = st.number_input(f'S{i} annuity purchase price (from taxable)',
-							value=200000.0, step=10000.0, key=f'sc_ann_purchase_{i}')
+							value=200000.0, step=10000.0, key=f'sc_ann_purchase_{i}',
+							help='Amount taken from taxable account to buy the annuity.')
 						sc_overrides['annuity_annual_income'] = st.number_input(f'S{i} annuity annual income',
-							value=12000.0, step=1000.0, key=f'sc_ann_income_{i}')
+							value=12000.0, step=1000.0, key=f'sc_ann_income_{i}',
+							help='Annual income received from the annuity.')
 						sc_overrides['annuity_cola'] = st.number_input(f'S{i} annuity COLA',
-							value=0.0, format="%.4f", key=f'sc_ann_cola_{i}')
+							value=0.0, format="%.4f", key=f'sc_ann_cola_{i}',
+							help='Annual cost-of-living adjustment on the annuity income. 0 = fixed payments.')
 						sc_overrides['annuity_person'] = st.radio(f'S{i} annuity owner',
 							['Person 1', 'Person 2'], horizontal=True, key=f'sc_ann_person_{i}')
 						sc_overrides['annuity_survivor_pct'] = st.number_input(f'S{i} annuity survivor %',
 							value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_ann_surv_{i}',
-							help='Fraction of annuity paid to survivor after owner dies')
+							help='Fraction of annuity paid to survivor after owner dies. 1.0 = full benefit continues. 0 = payments stop at death.')
 						sc_overrides['annuity_start_year'] = int(st.number_input(f'S{i} annuity income starts (year)',
-							value=1, min_value=1, max_value=40, key=f'sc_ann_start_{i}'))
-					buyout_chk = st.checkbox(f'S{i} pension buyout (lump sum vs annuity)', key=f'sc_buyout_chk_{i}')
+							value=1, min_value=1, max_value=40, key=f'sc_ann_start_{i}',
+							help='Simulation year when annuity payments begin. Year 1 = immediately.'))
+					buyout_chk = st.checkbox(f'S{i} pension buyout (lump sum vs annuity)', key=f'sc_buyout_chk_{i}',
+						help='Compare taking a one-time lump sum (rolled into TDA) vs receiving an annual pension/annuity. '
+						'For a dedicated comparison, use the Pension Buyout section instead.')
 					if buyout_chk:
 						buyout_choice = st.radio(f'S{i} pension buyout choice',
-							['Take lump sum', 'Take annuity'], horizontal=True, key=f'sc_buyout_choice_{i}')
+							['Take lump sum', 'Take annuity'], horizontal=True, key=f'sc_buyout_choice_{i}',
+							help='Take lump sum: amount is added to TDA. Take annuity: receive annual income instead.')
 						sc_overrides['buyout_person'] = st.radio(f'S{i} buyout for',
 							['Person 1', 'Person 2'], horizontal=True, key=f'sc_buyout_person_{i}')
 						sc_overrides['buyout_lump_sum'] = st.number_input(f'S{i} lump sum amount (to TDA)',
-							value=200000.0, step=10000.0, key=f'sc_buyout_lump_{i}')
+							value=200000.0, step=10000.0, key=f'sc_buyout_lump_{i}',
+							help='One-time amount rolled into the TDA (IRA/401k).')
 						sc_overrides['buyout_annuity_income'] = st.number_input(f'S{i} annuity income alternative',
-							value=12000.0, step=1000.0, key=f'sc_buyout_income_{i}')
+							value=12000.0, step=1000.0, key=f'sc_buyout_income_{i}',
+							help='Annual income if you choose the annuity/pension option instead.')
 						sc_overrides['buyout_annuity_cola'] = st.number_input(f'S{i} buyout annuity COLA',
-							value=0.0, format="%.4f", key=f'sc_buyout_cola_{i}')
+							value=0.0, format="%.4f", key=f'sc_buyout_cola_{i}',
+							help='Annual cost-of-living adjustment. 0 = fixed payments (purchasing power erodes with inflation).')
 						sc_overrides['buyout_annuity_survivor_pct'] = st.number_input(f'S{i} buyout annuity survivor %',
-							value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_buyout_surv_{i}')
+							value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_buyout_surv_{i}',
+							help='Fraction of annuity paid to survivor. 1.0 = full benefit continues. 0 = stops at death.')
 						sc_overrides['buyout_choice'] = buyout_choice
 					scenario_overrides_ui[i] = sc_overrides
 			else:
