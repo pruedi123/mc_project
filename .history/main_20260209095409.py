@@ -1416,7 +1416,7 @@ def main():
 				pension_buyout_lump = st.number_input('Lump sum amount (rolled into TDA)',
 					value=200000.0, step=10000.0, key='pension_buyout_lump')
 				pension_buyout_income = st.number_input('Annuity income alternative (annual)',
-					value=12000.0, step=1000.0, key='pension_buyout_income')
+					value=24000.0, step=1000.0, key='pension_buyout_income')
 				pension_buyout_cola = st.number_input('Annuity COLA',
 					value=0.0, format="%.4f", key='pension_buyout_cola')
 				pension_buyout_survivor = st.number_input('Annuity survivor %',
