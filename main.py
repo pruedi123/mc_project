@@ -1651,11 +1651,17 @@ def main():
 			alt_name = f"Take Lump Sum (${pension_buyout_lump / 1000:.0f}k)"
 		all_scenarios = [({}, baseline_name)]
 		all_scenarios.append((alt_ovr, alt_name))
-		# Append any additional manual scenario overrides
+		# Cross-product: each manual override generates two variants (baseline side + alt side)
 		if num_scenarios > 1:
 			for s_idx in range(2, num_scenarios + 1):
 				ovr = scenario_overrides_ui.get(s_idx, {})
-				all_scenarios.append((ovr, auto_scenario_name(s_idx, ovr, sim_params)))
+				ovr_label = auto_scenario_name(s_idx, ovr, sim_params)
+				# Variant on baseline side (override applied directly)
+				all_scenarios.append((dict(ovr), f"{baseline_name} | {ovr_label}"))
+				# Variant on alt side (merge alt_ovr + override)
+				merged = dict(alt_ovr)
+				merged.update(ovr)
+				all_scenarios.append((merged, f"{alt_name} | {ovr_label}"))
 		num_scenarios = len(all_scenarios)
 	else:
 		all_scenarios = [({}, 'Baseline')]  # scenario 1 = baseline, no overrides
