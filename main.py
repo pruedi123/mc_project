@@ -1278,10 +1278,10 @@ def main():
 
 		with st.expander('Scenario Comparison'):
 			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=4, value=1, step=1,
-				help='How many scenarios to compare. Scenario 1 is always the baseline (uses all inputs below). '
-				'Scenarios 2-4 let you override specific values to see how changes affect outcomes. '
-				'If using Pension Buyout, set to 1 for just lump vs annuity; set to 2+ to also test other changes '
-				'(each override is crossed with both lump sum and annuity sides).')
+				help='Set up your baseline inputs in the sidebar sections below first (account balances, allocation, spending, etc.). '
+				'Then add scenarios here to test variations. Each scenario overrides only what differs — everything else '
+				'comes from the main sidebar. If using Pension Buyout, set to 1 for just lump vs annuity; set to 2+ to '
+				'also test other changes (each override is crossed with both lump sum and annuity sides).')
 			if num_scenarios > 1:
 				st.caption('Scenario 1 = baseline (uses all inputs below). For each additional scenario, '
 					'check the boxes below to override specific values. Anything not overridden stays the same as baseline.')
