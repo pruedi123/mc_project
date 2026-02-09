@@ -1765,13 +1765,15 @@ def main():
 					'% Depleted': sc['pct_non_positive'] * 100,
 				})
 			comp_df = pd.DataFrame(comparison_rows).set_index('Scenario')
-			def _color_delta(val):
-				if isinstance(val, (int, float)):
-					if val > 0:
-						return 'color: green'
-					elif val < 0:
-						return 'color: red'
-				return ''
+			def _color_deltas(df):
+				delta_cols = {'vs Baseline', 'Tax Delta', 'Spend Delta'}
+				styles = pd.DataFrame('', index=df.index, columns=df.columns)
+				for col in df.columns:
+					if col in delta_cols:
+						styles[col] = df[col].apply(
+							lambda v: 'color: green' if isinstance(v, (int, float)) and v > 0
+							else ('color: red' if isinstance(v, (int, float)) and v < 0 else ''))
+				return styles
 			st.dataframe(comp_df.style.format({
 				'After-Tax Ending': currency_fmt,
 				'vs Baseline': currency_fmt,
@@ -1781,7 +1783,7 @@ def main():
 				'Avg Annual Spending': currency_fmt,
 				'Spend Delta': currency_fmt,
 				'% Depleted': '{:.1f}%'.format,
-			}).map(_color_delta, subset=['vs Baseline', 'Tax Delta', 'Spend Delta']))
+			}).apply(_color_deltas, axis=None))
 
 			# Overlay charts
 			st.subheader('Portfolio Value Comparison (median)')
