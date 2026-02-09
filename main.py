@@ -1670,6 +1670,16 @@ def main():
 				ovr = scenario_overrides_ui.get(s_idx, {})
 				all_scenarios.append((ovr, auto_scenario_name(s_idx, ovr, sim_params)))
 
+	# Let user pick which scenario is the baseline for comparison
+	if num_scenarios > 1:
+		scenario_names = [name for _, name in all_scenarios]
+		baseline_idx = st.selectbox('Baseline scenario (deltas compared against this)',
+			range(len(scenario_names)), format_func=lambda i: scenario_names[i], index=0,
+			key='baseline_scenario_idx')
+		if baseline_idx != 0:
+			# Move selected baseline to front
+			all_scenarios.insert(0, all_scenarios.pop(baseline_idx))
+
 	button_label = 'Run all scenarios' if num_scenarios > 1 else 'Run simulation'
 	if st.button(button_label):
 		sim_years = int(years)
