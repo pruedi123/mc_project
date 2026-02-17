@@ -836,7 +836,6 @@ def simulate_withdrawals(start_age_primary: int,
 		roth_bonds_mv *= (1 + bond_return_year)
 
 		# Stocks: split total return into price appreciation and dividend yield
-		# Stocks: split total return into price appreciation and dividend yield
 		price_return = (1 + stock_return_year) / (1 + stock_dividend_yield) - 1
 		# apply price appreciation
 		stocks_mv *= (1 + price_return)
@@ -1067,7 +1066,7 @@ def simulate_withdrawals(start_age_primary: int,
 				niit_threshold = 200000 if filing_status_this_year == 'single' else 250000
 				agi = ordinary_pre_ss_with_conv + t_ss + cg_total
 				niit_base_val = max(0.0, agi - niit_threshold)
-				net_inv = max(0.0, cg_total + interest + div)
+				net_inv = max(0.0, cg_total + interest)
 				niit = 0.038 * min(niit_base_val, net_inv)
 				total_tax += niit
 
