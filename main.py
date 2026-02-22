@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+import json
+import os
+import glob as globmod
 from typing import Dict, Optional, Sequence
 
 st.set_page_config(page_title='Withdrawal + RMD Simulator', layout='wide')
@@ -1262,6 +1265,98 @@ def simulate_withdrawals(start_age_primary: int,
 	df = pd.DataFrame(rows)
 	return df
 
+SAVES_DIR = os.path.join(os.path.dirname(__file__), 'saves')
+
+# Keys that map directly to session_state widget keys for save/load
+_SAVEABLE_KEYS = [
+	'start_age', 'start_age_spouse', 'life_expectancy_primary', 'life_expectancy_spouse',
+	'taxable_start', 'taxable_stock_basis_pct', 'taxable_bond_basis_pct',
+	'roth_start', 'tda_start', 'tda_spouse_start',
+	'target_stock_pct', 'roth_conversion_amount', 'roth_conversion_years',
+	'roth_conversion_source_tda', 'roth_conversion_tax_source',
+	'num_withdrawal_periods',
+	'rmd_start_age', 'rmd_start_age_spouse',
+	'ss_income', 'ss_start_age_p1', 'ss_income_spouse', 'ss_start_age_p2', 'ss_cola',
+	'pension_income', 'pension_cola_p1', 'pension_survivor_pct_p1',
+	'pension_income_spouse', 'pension_cola_p2', 'pension_survivor_pct_p2',
+	'other_income',
+	'pension_buyout_enabled', 'pension_buyout_baseline', 'pension_buyout_person',
+	'pension_buyout_lump', 'pension_buyout_income', 'pension_buyout_cola', 'pension_buyout_survivor',
+	'taxes_enabled', 'filing_status', 'use_itemized', 'itemized_deduction',
+	'inheritor_marginal_rate', 'state_tax_rate', 'state_exempt_retirement',
+	'return_mode', 'taxable_log_drift', 'taxable_log_volatility',
+	'bond_log_drift', 'bond_log_volatility', 'random_seed', 'seed_mode',
+	'stock_dividend_yield', 'stock_turnover',
+	'guardrails_enabled', 'guardrail_lower', 'guardrail_upper', 'guardrail_target',
+	'guardrail_inner_sims', 'guardrail_max_spending_pct',
+	'display_decimals', 'monte_carlo_runs',
+	'num_scenarios',
+]
+
+def _get_saved_files():
+	"""Return sorted list of .json filenames (without extension) in saves/."""
+	os.makedirs(SAVES_DIR, exist_ok=True)
+	files = globmod.glob(os.path.join(SAVES_DIR, '*.json'))
+	return sorted([os.path.splitext(os.path.basename(f))[0] for f in files])
+
+def _save_inputs_to_json(name: str):
+	"""Collect current widget values from session_state and write to saves/{name}.json."""
+	data = {}
+	for k in _SAVEABLE_KEYS:
+		if k in st.session_state:
+			data[k] = st.session_state[k]
+	# Save withdrawal period details (dynamic keys)
+	n_periods = int(st.session_state.get('num_withdrawal_periods', 1))
+	periods = []
+	for i in range(n_periods):
+		p = {'amount': st.session_state.get(f'wd_amount_{i}')}
+		if f'wd_end_{i}' in st.session_state:
+			p['end_year'] = st.session_state[f'wd_end_{i}']
+		periods.append(p)
+	data['periods'] = periods
+	# Save scenario override UI keys (dynamic)
+	n_sc = int(st.session_state.get('num_scenarios', 1))
+	if n_sc > 1:
+		sc_overrides = {}
+		for s_idx in range(2, n_sc + 1):
+			sc_data = {}
+			for suffix in ['spend_mode', 'spend_scale', 'spend_flat', 'stock_chk', 'stock',
+							'roth_chk', 'roth_amt', 'roth_yrs', 'annuity_chk', 'ann_purchase',
+							'ann_income', 'ann_cola', 'ann_person', 'ann_surv', 'ann_start',
+							'buyout_chk', 'buyout_choice', 'buyout_person', 'buyout_lump',
+							'buyout_income', 'buyout_cola', 'buyout_surv']:
+				key = f'sc_{suffix}_{s_idx}'
+				if key in st.session_state:
+					sc_data[key] = st.session_state[key]
+			sc_overrides[str(s_idx)] = sc_data
+		data['scenario_overrides'] = sc_overrides
+	os.makedirs(SAVES_DIR, exist_ok=True)
+	path = os.path.join(SAVES_DIR, f'{name}.json')
+	with open(path, 'w') as f:
+		json.dump(data, f, indent=2, default=str)
+	return path
+
+def _load_inputs_from_json(name: str):
+	"""Read saves/{name}.json and set values into session_state."""
+	path = os.path.join(SAVES_DIR, f'{name}.json')
+	with open(path) as f:
+		data = json.load(f)
+	for k in _SAVEABLE_KEYS:
+		if k in data:
+			st.session_state[k] = data[k]
+	# Restore withdrawal periods
+	if 'periods' in data:
+		for i, p in enumerate(data['periods']):
+			if 'amount' in p and p['amount'] is not None:
+				st.session_state[f'wd_amount_{i}'] = p['amount']
+			if 'end_year' in p:
+				st.session_state[f'wd_end_{i}'] = p['end_year']
+	# Restore scenario overrides
+	if 'scenario_overrides' in data:
+		for s_idx_str, sc_data in data['scenario_overrides'].items():
+			for key, val in sc_data.items():
+				st.session_state[key] = val
+
 def main():
 	st.title('Withdrawal + RMD Simulator (30-year)')
 
@@ -1275,8 +1370,36 @@ def main():
 	with st.sidebar:
 		st.header('Inputs')
 
+		with st.expander('Save / Load Inputs'):
+			saved_files = _get_saved_files()
+			# Handle pending load (set before widgets render)
+			if st.session_state.get('_pending_load'):
+				load_name = st.session_state.pop('_pending_load')
+				_load_inputs_from_json(load_name)
+				st.session_state['save_file_name'] = load_name
+			save_name = st.text_input('File name', value='my_plan', key='save_file_name')
+			if st.button('Save Inputs'):
+				if save_name.strip():
+					path = _save_inputs_to_json(save_name.strip())
+					st.success(f'Saved to {os.path.basename(path)}')
+				else:
+					st.warning('Enter a file name.')
+			if saved_files:
+				load_choice = st.selectbox('Load saved inputs', saved_files, key='load_file_choice')
+				col_load, col_del = st.columns(2)
+				with col_load:
+					if st.button('Load'):
+						st.session_state['_pending_load'] = load_choice
+						st.rerun()
+				with col_del:
+					if st.button('Delete'):
+						os.remove(os.path.join(SAVES_DIR, f'{load_choice}.json'))
+						st.rerun()
+			else:
+				st.caption('No saved files yet.')
+
 		with st.expander('Scenario Comparison'):
-			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=4, value=1, step=1,
+			num_scenarios = st.number_input('Number of scenarios', min_value=1, max_value=4, value=1, step=1, key='num_scenarios',
 				help='Set up your baseline inputs in the sidebar sections below first (account balances, allocation, spending, etc.). '
 				'Then add scenarios here to test variations. Each scenario overrides only what differs — everything else '
 				'comes from the main sidebar. If using Pension Buyout, set to 1 for just lump vs annuity; set to 2+ to '
@@ -1364,30 +1487,30 @@ def main():
 				scenario_overrides_ui = {}
 
 		with st.expander('Ages & Timeline', expanded=True):
-			start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65)
-			start_age_spouse = st.number_input('Starting age (person 2)', min_value=18, max_value=120, value=60)
-			life_expectancy_primary = st.number_input('Primary life expectancy (last age lived through)', min_value=int(start_age), max_value=120, value=84, step=1)
-			life_expectancy_spouse = st.number_input('Spouse life expectancy (last age lived through)', min_value=int(start_age_spouse), max_value=120, value=89, step=1)
+			start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65, key='start_age')
+			start_age_spouse = st.number_input('Starting age (person 2)', min_value=18, max_value=120, value=60, key='start_age_spouse')
+			life_expectancy_primary = st.number_input('Primary life expectancy (last age lived through)', min_value=int(start_age), max_value=120, value=84, step=1, key='life_expectancy_primary')
+			life_expectancy_spouse = st.number_input('Spouse life expectancy (last age lived through)', min_value=int(start_age_spouse), max_value=120, value=89, step=1, key='life_expectancy_spouse')
 
 		with st.expander('Account Balances'):
-			taxable_start = st.number_input('Taxable account starting balance', value=300000.0, step=1000.0)
-			taxable_stock_basis_pct = st.number_input('Taxable stock basis % of market value', value=50.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
-			taxable_bond_basis_pct = st.number_input('Taxable bond basis % of market value', value=100.0, min_value=0.0, max_value=100.0, step=1.0) / 100.0
-			roth_start = st.number_input('Roth account starting balance', value=0.0, step=1000.0)
-			tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=700000.0, step=1000.0)
-			tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=0.0, step=1000.0)
+			taxable_start = st.number_input('Taxable account starting balance', value=300000.0, step=1000.0, key='taxable_start')
+			taxable_stock_basis_pct = st.number_input('Taxable stock basis % of market value', value=50.0, min_value=0.0, max_value=100.0, step=1.0, key='taxable_stock_basis_pct') / 100.0
+			taxable_bond_basis_pct = st.number_input('Taxable bond basis % of market value', value=100.0, min_value=0.0, max_value=100.0, step=1.0, key='taxable_bond_basis_pct') / 100.0
+			roth_start = st.number_input('Roth account starting balance', value=0.0, step=1000.0, key='roth_start')
+			tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=700000.0, step=1000.0, key='tda_start')
+			tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=0.0, step=1000.0, key='tda_spouse_start')
 
 		with st.expander('Allocation & Roth Conversions'):
-			target_stock_pct = st.slider('Household target % in stocks', min_value=0, max_value=100, value=60, step=10) / 100.0
-			roth_conversion_amount = st.number_input('Annual Roth conversion amount (from TDA)', value=0.0, step=1000.0)
-			roth_conversion_years = st.number_input('Years to perform conversions', value=0, min_value=0, max_value=100, step=1)
-			roth_conversion_source_tda = st.radio('Convert from', ['Person 1 TDA', 'Person 2 TDA'], horizontal=True)
-			roth_conversion_tax_source = st.radio('Pay conversion taxes from', ['Taxable', 'TDA (reduce net conversion)'], horizontal=False)
+			target_stock_pct = st.slider('Household target % in stocks', min_value=0, max_value=100, value=60, step=10, key='target_stock_pct') / 100.0
+			roth_conversion_amount = st.number_input('Annual Roth conversion amount (from TDA)', value=0.0, step=1000.0, key='roth_conversion_amount')
+			roth_conversion_years = st.number_input('Years to perform conversions', value=0, min_value=0, max_value=100, step=1, key='roth_conversion_years')
+			roth_conversion_source_tda = st.radio('Convert from', ['Person 1 TDA', 'Person 2 TDA'], horizontal=True, key='roth_conversion_source_tda')
+			roth_conversion_tax_source = st.radio('Pay conversion taxes from', ['Taxable', 'TDA (reduce net conversion)'], horizontal=False, key='roth_conversion_tax_source')
 
 		with st.expander('Withdrawal Schedule'):
 			_horizon = max(1, max(int(life_expectancy_primary) - int(start_age),
 								  int(life_expectancy_spouse) - int(start_age_spouse)) + 1)
-			num_withdrawal_periods = st.number_input('Number of withdrawal periods', value=1, min_value=1, max_value=10, step=1)
+			num_withdrawal_periods = st.number_input('Number of withdrawal periods', value=1, min_value=1, max_value=10, step=1, key='num_withdrawal_periods')
 			withdrawal_schedule_inputs = []
 			period_start = 1
 			for i in range(int(num_withdrawal_periods)):
@@ -1406,29 +1529,29 @@ def main():
 				num_years = int(period_end) - period_start + 1
 				withdrawal_schedule_inputs.append((num_years, float(period_amount)))
 				period_start = int(period_end) + 1
-			rmd_start_age = st.number_input('RMD start age (person 1)', min_value=65, max_value=89, value=73)
-			rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73)
+			rmd_start_age = st.number_input('RMD start age (person 1)', min_value=65, max_value=89, value=73, key='rmd_start_age')
+			rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73, key='rmd_start_age_spouse')
 
 		with st.expander('Other Income'):
-			ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=25000.0, step=1000.0)
-			ss_start_age_p1 = st.number_input('SS start age - person 1', min_value=60, max_value=90, value=67, step=1)
-			ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=20000.0, step=1000.0)
-			ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=65, step=1)
-			ss_cola = st.number_input('Social Security COLA', value=0.02, format="%.4f")
+			ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=25000.0, step=1000.0, key='ss_income')
+			ss_start_age_p1 = st.number_input('SS start age - person 1', min_value=60, max_value=90, value=67, step=1, key='ss_start_age_p1')
+			ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=20000.0, step=1000.0, key='ss_income_spouse')
+			ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=65, step=1, key='ss_start_age_p2')
+			ss_cola = st.number_input('Social Security COLA', value=0.02, format="%.4f", key='ss_cola')
 			st.caption('Survivor receives the higher of their own or deceased spouse\'s benefit')
-			pension_income_input = st.number_input('Annual pension income - person 1', value=0.0, step=1000.0)
-			pension_cola_p1 = st.number_input('Pension COLA - person 1', value=0.00, format="%.4f")
+			pension_income_input = st.number_input('Annual pension income - person 1', value=0.0, step=1000.0, key='pension_income')
+			pension_cola_p1 = st.number_input('Pension COLA - person 1', value=0.00, format="%.4f", key='pension_cola_p1')
 			pension_survivor_pct_p1 = st.number_input('Pension survivor % - person 1', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
-				help='Fraction of person 1 pension paid to survivor after person 1 dies')
-			pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=20000.0, step=1000.0)
-			pension_cola_p2 = st.number_input('Pension COLA - person 2', value=0.00, format="%.4f")
+				help='Fraction of person 1 pension paid to survivor after person 1 dies', key='pension_survivor_pct_p1')
+			pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=20000.0, step=1000.0, key='pension_income_spouse')
+			pension_cola_p2 = st.number_input('Pension COLA - person 2', value=0.00, format="%.4f", key='pension_cola_p2')
 			pension_survivor_pct_p2 = st.number_input('Pension survivor % - person 2', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
-				help='Fraction of person 2 pension paid to survivor after person 2 dies')
-			other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0)
+				help='Fraction of person 2 pension paid to survivor after person 2 dies', key='pension_survivor_pct_p2')
+			other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0, key='other_income')
 
 		with st.expander('Pension Buyout (Lump Sum vs Annuity)'):
 			pension_buyout_enabled = st.checkbox('Enable pension buyout comparison', value=False,
-				help='Compare taking a lump sum (rolled into TDA) vs taking an annuity/pension income stream')
+				help='Compare taking a lump sum (rolled into TDA) vs taking an annuity/pension income stream', key='pension_buyout_enabled')
 			if pension_buyout_enabled:
 				pension_buyout_baseline = st.radio('Baseline (your choice)',
 					['Take lump sum', 'Take annuity'],
@@ -1458,35 +1581,35 @@ def main():
 				pension_buyout_survivor = 0.0
 
 		with st.expander('Tax Settings'):
-			taxes_enabled = st.checkbox('Enable taxation', value=True, help='Uncheck to disable all taxes (useful for testing withdrawal mechanics)')
-			filing_status_choice = st.radio('Filing status', ['Single', 'Married Filing Jointly'], horizontal=True, index=1)
+			taxes_enabled = st.checkbox('Enable taxation', value=True, help='Uncheck to disable all taxes (useful for testing withdrawal mechanics)', key='taxes_enabled')
+			filing_status_choice = st.radio('Filing status', ['Single', 'Married Filing Jointly'], horizontal=True, index=1, key='filing_status')
 			filing_status_key = 'single' if filing_status_choice == 'Single' else 'mfj'
 			standard_deduction_display = 14600 if filing_status_key == 'single' else 29200
-			use_itemized = st.checkbox('Use itemized deductions instead of standard', value=False)
-			itemized_deduction_input = st.number_input('Itemized deduction amount', value=0.0, step=500.0)
+			use_itemized = st.checkbox('Use itemized deductions instead of standard', value=False, key='use_itemized')
+			itemized_deduction_input = st.number_input('Itemized deduction amount', value=0.0, step=500.0, key='itemized_deduction')
 			st.caption(f'Standard deduction used if not itemizing: ${standard_deduction_display:,.0f}')
 			inheritor_marginal_rate = st.number_input(
 				'Inheritor marginal tax rate on TDAs',
-				value=0.35, min_value=0.0, max_value=0.50, format="%.4f")
+				value=0.35, min_value=0.0, max_value=0.50, format="%.4f", key='inheritor_marginal_rate')
 			state_tax_rate = st.number_input('State income tax rate (flat)',
-				value=0.05, min_value=0.0, max_value=0.15, format="%.4f", step=0.01)
+				value=0.05, min_value=0.0, max_value=0.15, format="%.4f", step=0.01, key='state_tax_rate')
 			state_exempt_retirement = st.checkbox('Exempt retirement income from state tax (IL-style)',
-				value=True)
+				value=True, key='state_exempt_retirement')
 			if state_exempt_retirement:
 				st.caption('State tax applies only to investment income (interest, dividends, capital gains). SS, pensions, TDA withdrawals, and Roth conversions are exempt.')
 
 		with st.expander('Return Assumptions'):
-			return_mode = st.radio('Return mode', ['Simulated (lognormal)', 'Historical (master_global_factors)'], horizontal=False, index=1)
+			return_mode = st.radio('Return mode', ['Simulated (lognormal)', 'Historical (master_global_factors)'], horizontal=False, index=1, key='return_mode')
 			stock_total_return = 0.0
 			bond_return = 0.0
 			if return_mode == 'Simulated (lognormal)':
 				st.caption('Both stocks and bonds use lognormal draws.')
-				taxable_log_drift = st.number_input('Stock log drift (µ)', value=0.09038261, format="%.8f")
-				taxable_log_volatility = st.number_input('Stock log volatility (σ)', value=0.20485277, format="%.8f")
-				bond_log_drift = st.number_input('Bond log drift (µ)', value=0.0172918, format="%.8f")
-				bond_log_volatility = st.number_input('Bond log volatility (σ)', value=0.04796435, format="%.8f")
-				random_seed_input = st.number_input('Random seed for returns', value=42, step=1)
-				seed_mode = st.radio('Seed mode', ['Random each run', 'Fixed seed'], horizontal=True, index=0)
+				taxable_log_drift = st.number_input('Stock log drift (µ)', value=0.09038261, format="%.8f", key='taxable_log_drift')
+				taxable_log_volatility = st.number_input('Stock log volatility (σ)', value=0.20485277, format="%.8f", key='taxable_log_volatility')
+				bond_log_drift = st.number_input('Bond log drift (µ)', value=0.0172918, format="%.8f", key='bond_log_drift')
+				bond_log_volatility = st.number_input('Bond log volatility (σ)', value=0.04796435, format="%.8f", key='bond_log_volatility')
+				random_seed_input = st.number_input('Random seed for returns', value=42, step=1, key='random_seed')
+				seed_mode = st.radio('Seed mode', ['Random each run', 'Fixed seed'], horizontal=True, index=0, key='seed_mode')
 			else:
 				st.caption('Returns from LBM 100E (stocks) and LBM 100 F (bonds). Runs all historical periods as a distribution.')
 				taxable_log_drift = 0.0
@@ -1495,21 +1618,21 @@ def main():
 				bond_log_volatility = 0.0
 				random_seed_input = 42
 				seed_mode = 'Fixed seed'
-			stock_dividend_yield = st.number_input('Stock dividend (qualified) yield', value=0.02, format="%.4f")
-			stock_turnover = st.number_input('Stock turnover rate', value=0.10, format="%.4f")
+			stock_dividend_yield = st.number_input('Stock dividend (qualified) yield', value=0.02, format="%.4f", key='stock_dividend_yield')
+			stock_turnover = st.number_input('Stock turnover rate', value=0.10, format="%.4f", key='stock_turnover')
 
 		with st.expander('Withdrawal Guardrails'):
-			guardrails_enabled = st.checkbox('Enable dynamic withdrawal guardrails', value=True)
+			guardrails_enabled = st.checkbox('Enable dynamic withdrawal guardrails', value=True, key='guardrails_enabled')
 			if guardrails_enabled:
 				st.caption('At each year, checks forward MC survival rate. If outside the dead band, resets withdrawal to the target success rate.')
-				guardrail_lower = st.number_input('Lower guardrail (reduce spending if below)', value=0.75, min_value=0.50, max_value=0.95, format="%.2f", step=0.05)
-				guardrail_upper = st.number_input('Upper guardrail (increase spending if above)', value=0.90, min_value=0.50, max_value=0.99, format="%.2f", step=0.05)
-				guardrail_target = st.number_input('Target success rate (reset to)', value=0.85, min_value=0.50, max_value=0.99, format="%.2f", step=0.05)
-				guardrail_inner_sims = st.number_input('Inner MC simulations per check', value=200, min_value=50, max_value=1000, step=50)
+				guardrail_lower = st.number_input('Lower guardrail (reduce spending if below)', value=0.75, min_value=0.50, max_value=0.95, format="%.2f", step=0.05, key='guardrail_lower')
+				guardrail_upper = st.number_input('Upper guardrail (increase spending if above)', value=0.90, min_value=0.50, max_value=0.99, format="%.2f", step=0.05, key='guardrail_upper')
+				guardrail_target = st.number_input('Target success rate (reset to)', value=0.85, min_value=0.50, max_value=0.99, format="%.2f", step=0.05, key='guardrail_target')
+				guardrail_inner_sims = st.number_input('Inner MC simulations per check', value=200, min_value=50, max_value=1000, step=50, key='guardrail_inner_sims')
 				guardrail_max_spending_pct = st.number_input(
 					'Max spending cap (% above base withdrawal, 0=no cap)',
 					value=50.0, min_value=0.0, max_value=200.0, format="%.0f", step=10.0,
-					help='E.g. 50 means spending can never exceed 150% of the base withdrawal amount')
+					help='E.g. 50 means spending can never exceed 150% of the base withdrawal amount', key='guardrail_max_spending_pct')
 			else:
 				guardrail_lower = 0.75
 				guardrail_upper = 0.90
@@ -1518,8 +1641,8 @@ def main():
 				guardrail_max_spending_pct = 0.0
 
 		with st.expander('Simulation Settings'):
-			display_decimals = st.number_input('Decimal places for tables/charts', min_value=0, max_value=6, value=0, step=1)
-			monte_carlo_runs = st.number_input('Monte Carlo runs', min_value=50, max_value=5000, value=1000, step=50)
+			display_decimals = st.number_input('Decimal places for tables/charts', min_value=0, max_value=6, value=0, step=1, key='display_decimals')
+			monte_carlo_runs = st.number_input('Monte Carlo runs', min_value=50, max_value=5000, value=1000, step=50, key='monte_carlo_runs')
 
 	years = max(1, max(life_expectancy_primary - start_age, life_expectancy_spouse - start_age_spouse) + 1)
 	_beginning_portfolio = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
