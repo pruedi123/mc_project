@@ -794,6 +794,19 @@ def main():
 		tax_pcts.columns = ['0th (min)', '10th', '25th', '50th (median)', '75th', '90th']
 		interactive_line_chart(tax_pcts, y_title='Taxes')
 
+		st.subheader('Tax rates at selected percentile — all runs')
+		rate_pctile = st.selectbox('Percentile', [10, 25, 50, 75, 90], index=2, key='tax_rate_pctile')
+		q = rate_pctile / 100.0
+		rate_cols = ['effective_tax_rate_calc', 'marginal_ordinary_rate', 'marginal_cap_gains_rate']
+		rate_at_pctile = all_yearly.groupby('year')[rate_cols].quantile(q)
+		rate_at_pctile.columns = ['Effective Rate', 'Marginal Ordinary', 'Marginal Cap Gains']
+		st.dataframe(rate_at_pctile.style.format({
+			'Effective Rate': '{:.2%}'.format,
+			'Marginal Ordinary': '{:.2%}'.format,
+			'Marginal Cap Gains': '{:.2%}'.format,
+		}))
+		interactive_line_chart(rate_at_pctile, y_title='Tax Rate', fmt='.1%')
+
 		# After-tax spending percentile bands
 		if 'withdrawal_used' in all_yearly.columns:
 			st.subheader('After-tax spending — percentile bands across all runs')
