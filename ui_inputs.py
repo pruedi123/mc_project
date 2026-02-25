@@ -34,7 +34,7 @@ _SAVEABLE_KEYS = [
 	'stock_dividend_yield', 'stock_turnover', 'investment_fee_bps',
 	'guardrails_enabled', 'guardrail_lower', 'guardrail_upper', 'guardrail_target',
 	'guardrail_inner_sims', 'guardrail_max_spending_pct',
-	'flex_goal_min_pct', 'base_is_essential',
+	'flex_goal_min_pct',
 	'display_decimals', 'monte_carlo_runs',
 	'num_scenarios',
 ]
@@ -658,9 +658,7 @@ def _render_guardrail_section():
 				format="%.0f", step=10.0,
 				help='Floor for flexible goal cuts. 50% = flexible goals can be cut by at most half before base spending is reduced.',
 				key='flex_goal_min_pct') / 100.0
-			base_is_essential = st.checkbox(
-				'Protect base spending', value=False, key='base_is_essential',
-				help='If checked, only flexible goals absorb spending cuts — base spending is never reduced by guardrails.')
+			base_is_essential = False
 		else:
 			guardrail_lower = 0.75
 			guardrail_upper = 0.90
