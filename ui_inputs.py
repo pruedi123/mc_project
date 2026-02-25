@@ -650,7 +650,7 @@ def _render_guardrail_section():
 			guardrail_inner_sims = st.number_input('Inner MC simulations per check', value=200, min_value=50, max_value=1000, step=50, key='guardrail_inner_sims')
 			guardrail_max_spending_pct = st.number_input(
 				'Max spending cap (% above base withdrawal, -1=no cap, 0=no increase)',
-				value=50.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
+				value=10.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
 				help='0 = spending can never exceed base target. 50 = up to 150% of base. -1 = unlimited.',
 				key='guardrail_max_spending_pct')
 			flex_goal_min_pct = st.number_input(
