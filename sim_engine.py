@@ -190,8 +190,38 @@ def rebalance_accounts(target_stock_pct: float,
 	return (taxable_stock, taxable_bond, taxable_stock_basis, taxable_bond_basis,
 			tda1_stock, tda1_bond, tda2_stock, tda2_bond, roth_stock, roth_bond)
 
-def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu, blended_sigma, n_sims=200, income_schedule=None):
-	"""Fast vectorized MC to estimate probability portfolio survives the remaining schedule."""
+def compute_prioritized_target(scale_factor, base, flex_goals, essential_goals,
+							   flex_min_pct=0.5, base_is_essential=False):
+	"""Map a single scale_factor to spending with prioritized cuts.
+	When scale < 1.0: cut flexible goals first (down to floor), then base.
+	When scale >= 1.0: scale base + flex equally (unchanged behavior).
+	Essential goals are never scaled.
+	Monotonically non-decreasing in scale_factor (required for binary search)."""
+	if scale_factor >= 1.0:
+		return base * scale_factor + flex_goals * scale_factor + essential_goals
+	# Cuts needed
+	scalable = base + flex_goals
+	if scalable <= 0:
+		return essential_goals
+	deficit = scalable * (1.0 - scale_factor)
+	# Cut flex first
+	flex_floor = flex_goals * flex_min_pct
+	max_flex_cut = max(0.0, flex_goals - flex_floor)
+	flex_cut = min(deficit, max_flex_cut)
+	remaining_deficit = deficit - flex_cut
+	# Cut base (unless protected)
+	if base_is_essential:
+		base_cut = 0.0
+	else:
+		base_cut = min(remaining_deficit, base)
+	return (base - base_cut) + (flex_goals - flex_cut) + essential_goals
+
+
+def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu, blended_sigma, n_sims=200, income_schedule=None, goal_schedule=None,
+						 flex_goal_schedule=None, flex_goal_min_pct=0.5, base_is_essential=False):
+	"""Fast vectorized MC to estimate probability portfolio survives the remaining schedule.
+	If goal_schedule is provided, only the base portion (schedule - goals) is scaled;
+	goals are added unscaled on top."""
 	years_remaining = len(remaining_schedule)
 	if years_remaining <= 0:
 		return 1.0
@@ -203,15 +233,21 @@ def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu
 	balances = np.full(n_sims, portfolio, dtype=np.float64)
 	for y in range(years_remaining):
 		inc = income_schedule[y] if income_schedule is not None and y < len(income_schedule) else 0.0
-		net_draw = max(0.0, remaining_schedule[y] * scale_factor - inc)
+		essential = goal_schedule[y] if goal_schedule is not None and y < len(goal_schedule) else 0.0
+		flex = flex_goal_schedule[y] if flex_goal_schedule is not None and y < len(flex_goal_schedule) else 0.0
+		base = remaining_schedule[y] - essential - flex
+		target = compute_prioritized_target(scale_factor, base, flex, essential, flex_goal_min_pct, base_is_essential)
+		net_draw = max(0.0, target - inc)
 		balances *= growth_factors[:, y]
 		balances -= net_draw
 		balances = np.maximum(balances, 0.0)
 	return float(np.mean(balances > 0))
 
-def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, blended_sigma, target_success=0.85, n_sims=200, tol=0.005, income_schedule=None):
+def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, blended_sigma, target_success=0.85, n_sims=200, tol=0.005, income_schedule=None, goal_schedule=None,
+								 flex_goal_schedule=None, flex_goal_min_pct=0.5, base_is_essential=False):
 	"""Binary search for the scaling factor on the remaining withdrawal schedule
-	that gives target_success survival rate."""
+	that gives target_success survival rate.
+	If goal_schedule is provided, only the base portion is scaled; goals are unscaled."""
 	years_remaining = len(remaining_schedule)
 	if portfolio <= 0 or years_remaining <= 0:
 		return 0.0
@@ -223,7 +259,11 @@ def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, ble
 		balances = np.full(n_sims, portfolio, dtype=np.float64)
 		for y in range(years_remaining):
 			inc = income_schedule[y] if income_schedule is not None and y < len(income_schedule) else 0.0
-			net_draw = max(0.0, remaining_schedule[y] * scale - inc)
+			essential = goal_schedule[y] if goal_schedule is not None and y < len(goal_schedule) else 0.0
+			flex = flex_goal_schedule[y] if flex_goal_schedule is not None and y < len(flex_goal_schedule) else 0.0
+			base = remaining_schedule[y] - essential - flex
+			target = compute_prioritized_target(scale, base, flex, essential, flex_goal_min_pct, base_is_essential)
+			net_draw = max(0.0, target - inc)
 			balances *= growth_factors[:, y]
 			balances -= net_draw
 			balances = np.maximum(balances, 0.0)
@@ -298,8 +338,14 @@ def build_scenario_params(base_params: dict, overrides: dict, stock_mu: float = 
 	params = dict(base_params)
 	if 'spend_scale' in overrides:
 		params['withdrawal_schedule'] = [v * overrides['spend_scale'] for v in params['withdrawal_schedule']]
+		if params.get('goal_schedule'):
+			params['goal_schedule'] = [v * overrides['spend_scale'] for v in params['goal_schedule']]
+		if params.get('flex_goal_schedule'):
+			params['flex_goal_schedule'] = [v * overrides['spend_scale'] for v in params['flex_goal_schedule']]
 	elif 'spend_flat' in overrides:
 		params['withdrawal_schedule'] = [overrides['spend_flat']] * len(params['withdrawal_schedule'])
+		params['goal_schedule'] = None  # flat override replaces everything, no goal distinction
+		params['flex_goal_schedule'] = None
 	if 'target_stock_pct' in overrides:
 		params['target_stock_pct'] = overrides['target_stock_pct']
 		if params.get('guardrails_enabled'):
@@ -760,7 +806,11 @@ def simulate_withdrawals(start_age_primary: int,
 						 blended_sigma: float = 0.0,
 						 guardrail_max_spending_pct: float = -1.0,
 						 taxes_enabled: bool = True,
-						 investment_fee_bps: float = 0.0):
+						 investment_fee_bps: float = 0.0,
+						 goal_schedule: Optional[Sequence[float]] = None,
+						 flex_goal_schedule: Optional[Sequence[float]] = None,
+						 flex_goal_min_pct: float = 0.5,
+						 base_is_essential: bool = False):
 	table = get_uniform_lifetime_table()
 
 	# assume taxable holds 50% stocks / 50% bonds
@@ -845,7 +895,10 @@ def simulate_withdrawals(start_age_primary: int,
 		total_portfolio_init = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
 		current_scale_factor = find_sustainable_scale_factor(
 			total_portfolio_init, list(withdrawal_schedule), blended_mu, blended_sigma,
-			guardrail_target, guardrail_inner_sims, income_schedule=income_schedule)
+			guardrail_target, guardrail_inner_sims, income_schedule=income_schedule,
+			goal_schedule=list(goal_schedule) if goal_schedule else None,
+			flex_goal_schedule=list(flex_goal_schedule) if flex_goal_schedule else None,
+			flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential)
 		# Apply max spending cap to scale factor
 		if guardrail_max_spending_pct >= 0:
 			max_scale = 1.0 + guardrail_max_spending_pct / 100.0
@@ -896,14 +949,21 @@ def simulate_withdrawals(start_age_primary: int,
 				roth_stocks_mv + roth_bonds_mv)
 			remaining_schedule = list(withdrawal_schedule[y-1:])
 			remaining_income = income_schedule[y-1:]
+			remaining_goals = list(goal_schedule[y-1:]) if goal_schedule else None
+			remaining_flex_goals = list(flex_goal_schedule[y-1:]) if flex_goal_schedule else None
 			if len(remaining_schedule) > 1 and total_portfolio_now > 0:
 				sr = forward_success_rate(total_portfolio_now, remaining_schedule,
 					current_scale_factor, blended_mu, blended_sigma, guardrail_inner_sims,
-					income_schedule=remaining_income)
+					income_schedule=remaining_income, goal_schedule=remaining_goals,
+					flex_goal_schedule=remaining_flex_goals,
+					flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential)
 				if sr < guardrail_lower or sr > guardrail_upper:
 					current_scale_factor = find_sustainable_scale_factor(
 						total_portfolio_now, remaining_schedule, blended_mu, blended_sigma,
-						guardrail_target, guardrail_inner_sims, income_schedule=remaining_income)
+						guardrail_target, guardrail_inner_sims, income_schedule=remaining_income,
+						goal_schedule=remaining_goals,
+						flex_goal_schedule=remaining_flex_goals,
+						flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential)
 					# Apply max spending cap to scale factor
 					if guardrail_max_spending_pct >= 0:
 						max_scale = 1.0 + guardrail_max_spending_pct / 100.0
@@ -1073,8 +1133,13 @@ def simulate_withdrawals(start_age_primary: int,
 		}
 
 		# Binary search: find gross withdrawal that delivers the net spending target
-		base_withdrawal_this_year = withdrawal_schedule[y-1]
-		net_target = base_withdrawal_this_year * current_scale_factor
+		# Guardrails scale only the base portion; additional goals are unscaled
+		combined_this_year = withdrawal_schedule[y-1]
+		essential_this_year = goal_schedule[y-1] if goal_schedule and y-1 < len(goal_schedule) else 0.0
+		flex_this_year = flex_goal_schedule[y-1] if flex_goal_schedule and y-1 < len(flex_goal_schedule) else 0.0
+		base_this_year = combined_this_year - essential_this_year - flex_this_year
+		net_target = compute_prioritized_target(current_scale_factor, base_this_year, flex_this_year,
+			essential_this_year, flex_goal_min_pct, base_is_essential)
 
 		base_net, base_result = try_gross_withdrawal(0.0, snap_balances, year_income, tax_cfg)
 

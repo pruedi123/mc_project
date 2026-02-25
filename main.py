@@ -113,6 +113,8 @@ def main():
 	guardrail_target = inputs['guardrail_target']
 	guardrail_inner_sims = inputs['guardrail_inner_sims']
 	guardrail_max_spending_pct = inputs['guardrail_max_spending_pct']
+	flex_goal_min_pct = inputs['flex_goal_min_pct']
+	base_is_essential = inputs['base_is_essential']
 	display_decimals = inputs['display_decimals']
 	monte_carlo_runs = inputs['monte_carlo_runs']
 	num_scenarios = inputs['num_scenarios']
@@ -138,13 +140,23 @@ def main():
 		last_val = withdrawal_schedule[-1] if withdrawal_schedule else 0.0
 		withdrawal_schedule.extend([last_val] * (years - len(withdrawal_schedule)))
 	withdrawal_schedule = withdrawal_schedule[:years]
-	# Layer additional spending goals on top of base withdrawals
-	for g_label, g_amount, g_begin, g_end in add_goal_inputs:
+	base_withdrawal_schedule = list(withdrawal_schedule)  # save before goals
+	# Build per-year goal schedule and layer goals on top of base withdrawals
+	# "Need" goals go into goal_schedule (unscaled by guardrails)
+	# "Want" goals are added to base (scaled by guardrails)
+	goal_schedule = [0.0] * years
+	flex_goal_schedule = [0.0] * years
+	for g_label, g_amount, g_begin, g_end, g_priority in add_goal_inputs:
 		if g_amount > 0:
 			for y_idx in range(g_begin - 1, min(g_end, years)):
 				withdrawal_schedule[y_idx] += g_amount
+				if g_priority in ('Essential', 'Need'):
+					goal_schedule[y_idx] += g_amount
+				elif g_priority == 'Flexible':
+					flex_goal_schedule[y_idx] += g_amount
 	withdraw_amount = withdrawal_schedule[0]  # for backward-compat references
 	st.session_state['_add_goal_inputs'] = add_goal_inputs
+	st.session_state['_base_withdrawal_schedule'] = base_withdrawal_schedule
 	st.session_state['_withdrawal_schedule'] = list(withdrawal_schedule)
 
 	currency_fmt = f'${{:,.{int(display_decimals)}f}}'
@@ -190,6 +202,10 @@ def main():
 		guardrail_inner_sims=int(guardrail_inner_sims),
 		guardrail_max_spending_pct=float(guardrail_max_spending_pct),
 		taxes_enabled=bool(taxes_enabled),
+		goal_schedule=goal_schedule if any(g > 0 for g in goal_schedule) else None,
+		flex_goal_schedule=flex_goal_schedule if any(g > 0 for g in flex_goal_schedule) else None,
+		flex_goal_min_pct=float(flex_goal_min_pct),
+		base_is_essential=bool(base_is_essential),
 	)
 
 	# Compute stock/bond return parameters (needed for guardrails and scenario comparison)
@@ -499,37 +515,65 @@ def main():
 
 		all_yearly = st.session_state['mc_all_yearly']
 
-		# Additional spending goal funding analysis
+		# ── Decompose spending into base + per-goal using proportional allocation ──
 		_goals = st.session_state.get('_add_goal_inputs', [])
-		_active_goals = [(lbl, amt, bg, ed) for lbl, amt, bg, ed in _goals if amt > 0]
-		_orig_schedule = st.session_state.get('_withdrawal_schedule', [])
-		if _active_goals and _orig_schedule:
-			st.subheader('Additional Goal Funding')
-			goal_rows = []
-			for g_label, g_amount, g_begin, g_end in _active_goals:
-				goal_year_mask = all_yearly['year'].between(g_begin, g_end)
-				goal_data = all_yearly[goal_year_mask].copy()
-				if goal_data.empty:
-					continue
-				# Map each year to its original (unscaled) withdrawal target
-				goal_data['orig_target'] = goal_data['year'].map(
-					lambda yr: _orig_schedule[yr - 1] if yr - 1 < len(_orig_schedule) else 0.0)
-				# Funded if actual spending met the original schedule (within 0.5% tolerance for rounding)
-				goal_data['funded'] = goal_data['after_tax_spending'] >= goal_data['orig_target'] * 0.995
-				runs_fully_funded = goal_data.groupby('run')['funded'].all()
-				pct_fully_funded = min(runs_fully_funded.mean() * 100, 100.0)
+		_active_goals = [g for g in _goals if len(g) >= 4 and g[1] > 0]
+		_base_schedule = st.session_state.get('_base_withdrawal_schedule', [])
+		_combined_schedule = st.session_state.get('_withdrawal_schedule', [])
+		if _base_schedule and _combined_schedule:
+			# Compute base proportion of combined target for each year
+			def _base_pct(yr):
+				if yr < 1 or yr > len(_combined_schedule):
+					return 1.0
+				total = _combined_schedule[yr - 1]
+				return _base_schedule[yr - 1] / total if total > 0 else 1.0
+			all_yearly['base_after_tax_spending'] = (
+				all_yearly['after_tax_spending'] * all_yearly['year'].map(_base_pct))
+			all_yearly['base_withdrawal_used'] = (
+				all_yearly['withdrawal_used'] * all_yearly['year'].map(_base_pct))
+
+			for gi, (g_label, g_amount, g_begin, g_end, *_gx) in enumerate(_active_goals):
+				def _goal_pct(yr, _amt=g_amount, _bg=g_begin, _ed=g_end):
+					if yr < 1 or yr > len(_combined_schedule):
+						return 0.0
+					if _bg <= yr <= _ed and _combined_schedule[yr - 1] > 0:
+						return _amt / _combined_schedule[yr - 1]
+					return 0.0
+				all_yearly[f'goal_{gi}_after_tax_spending'] = (
+					all_yearly['after_tax_spending'] * all_yearly['year'].map(_goal_pct))
+				all_yearly[f'goal_{gi}_withdrawal_used'] = (
+					all_yearly['withdrawal_used'] * all_yearly['year'].map(_goal_pct))
+
+		# ── Additional spending goal analysis ──
+		if _active_goals and _combined_schedule:
+			st.subheader('Spending Goal Breakdown')
+			goal_summary_rows = []
+			for gi, (g_label, g_amount, g_begin, g_end, *_gx) in enumerate(_active_goals):
 				num_years = g_end - g_begin + 1
 				total_goal_cost = g_amount * num_years
-				goal_rows.append({
-					'Goal': g_label or 'Goal',
-					'Amount/Year': currency_fmt.format(g_amount),
+				col_name = f'goal_{gi}_after_tax_spending'
+				if col_name in all_yearly.columns:
+					# Per-run total spending on this goal
+					goal_year_data = all_yearly[all_yearly['year'].between(g_begin, g_end)]
+					run_goal_totals = goal_year_data.groupby('run')[col_name].sum()
+					# Fully funded = run's total goal spending >= target cost (within 0.5% tolerance)
+					pct_fully_funded = min(float((run_goal_totals >= total_goal_cost * 0.995).mean()) * 100, 100.0)
+					median_annual = float(goal_year_data[col_name].median()) if not goal_year_data.empty else 0.0
+				else:
+					pct_fully_funded = 0.0
+					median_annual = 0.0
+				g_priority = _gx[0] if _gx else 'Need'
+				goal_summary_rows.append({
+					'Goal': g_label or f'Goal {gi + 1}',
+					'Priority': g_priority,
+					'Target/Year': currency_fmt.format(g_amount),
 					'Years': f'{g_begin}–{g_end} ({num_years} yrs)',
-					'Total Cost': currency_fmt.format(total_goal_cost),
+					'Total Target': currency_fmt.format(total_goal_cost),
+					'Median Actual/Year': currency_fmt.format(median_annual),
 					'% Fully Funded': f'{pct_fully_funded:.0f}%',
 				})
-			if goal_rows:
-				goal_df = pd.DataFrame(goal_rows)
-				st.dataframe(goal_df, hide_index=True)
+			if goal_summary_rows:
+				st.dataframe(pd.DataFrame(goal_summary_rows), hide_index=True)
 
 		run_ending_portfolios = all_yearly.groupby('run')['total_portfolio'].last()
 		target_ending_value = st.number_input('Explore: chance of ending above...', value=ending_goal, step=50000.0, key='target_ending_val')
@@ -542,6 +586,8 @@ def main():
 
 		# Per-run spending summary: total and average annual spending across the retirement period
 		st.subheader('Lifetime spending distribution (per run)')
+
+		# Combined (total) spending distribution
 		run_spending = all_yearly.groupby('run').agg(
 			total_withdrawal_used=('withdrawal_used', 'sum'),
 			total_after_tax_spending=('after_tax_spending', 'sum'),
@@ -561,6 +607,11 @@ def main():
 			})
 		spending_pct_df = pd.DataFrame(spending_pct_rows)
 		st.session_state['mc_spending_pct_rows'] = spending_pct_rows
+
+		has_goal_breakdown = 'base_after_tax_spending' in all_yearly.columns and _active_goals
+
+		if has_goal_breakdown:
+			st.caption('**Combined (base + all goals)**')
 		sched = sim_params.get('withdrawal_schedule', [])
 		base_avg_wd = np.mean(sched) if sched else 0
 		if base_avg_wd > 0:
@@ -578,36 +629,130 @@ def main():
 			'total_lifetime_after_tax_spending': currency_fmt,
 		}))
 
+		# Base withdrawal spending (excludes additional goals)
+		if has_goal_breakdown:
+			st.caption('**Base withdrawals only** (excluding additional goals)')
+			run_base = all_yearly.groupby('run').agg(
+				total_base_wd=('base_withdrawal_used', 'sum'),
+				total_base_spending=('base_after_tax_spending', 'sum'),
+				years_in_run=('year', 'count'),
+			)
+			run_base['avg_annual_base_wd'] = run_base['total_base_wd'] / run_base['years_in_run']
+			run_base['avg_annual_base_spending'] = run_base['total_base_spending'] / run_base['years_in_run']
+			base_pct_rows = []
+			for p in spending_pctiles:
+				base_pct_rows.append({
+					'percentile': p,
+					'avg_annual_withdrawal': np.percentile(run_base['avg_annual_base_wd'], p),
+					'avg_annual_after_tax_spending': np.percentile(run_base['avg_annual_base_spending'], p),
+					'total_lifetime_withdrawal': np.percentile(run_base['total_base_wd'], p),
+					'total_lifetime_after_tax_spending': np.percentile(run_base['total_base_spending'], p),
+				})
+			base_sched_avg = np.mean(_base_schedule) if _base_schedule else 0
+			if base_sched_avg > 0:
+				median_base_spending = np.percentile(run_base['avg_annual_base_spending'], 50)
+				pct_above_base = (median_base_spending / base_sched_avg - 1) * 100
+				direction_base = 'above' if pct_above_base >= 0 else 'below'
+				st.caption(f'Base target: {currency_fmt.format(base_sched_avg)} | '
+						   f'Median avg annual: {currency_fmt.format(median_base_spending)} '
+						   f'({abs(pct_above_base):.1f}% {direction_base} target)')
+			st.dataframe(pd.DataFrame(base_pct_rows).style.format({
+				'percentile': lambda x: f"{int(x)}th",
+				'avg_annual_withdrawal': currency_fmt,
+				'avg_annual_after_tax_spending': currency_fmt,
+				'total_lifetime_withdrawal': currency_fmt,
+				'total_lifetime_after_tax_spending': currency_fmt,
+			}))
+
+			# Per-goal spending distribution
+			for gi, (g_label, g_amount, g_begin, g_end, *_gx) in enumerate(_active_goals):
+				col_spending = f'goal_{gi}_after_tax_spending'
+				col_wd = f'goal_{gi}_withdrawal_used'
+				if col_spending not in all_yearly.columns:
+					continue
+				num_years = g_end - g_begin + 1
+				goal_name = g_label or f'Goal {gi + 1}'
+				st.caption(f'**{goal_name}** — {currency_fmt.format(g_amount)}/yr, years {g_begin}–{g_end} ({num_years} yrs)')
+				# Only look at the goal's active years for per-year stats
+				goal_years = all_yearly[all_yearly['year'].between(g_begin, g_end)]
+				if goal_years.empty:
+					continue
+				run_goal = goal_years.groupby('run').agg(
+					total_goal_wd=(col_wd, 'sum'),
+					total_goal_spending=(col_spending, 'sum'),
+					years_in_goal=('year', 'count'),
+				)
+				run_goal['avg_annual_goal_wd'] = run_goal['total_goal_wd'] / run_goal['years_in_goal']
+				run_goal['avg_annual_goal_spending'] = run_goal['total_goal_spending'] / run_goal['years_in_goal']
+				goal_pct_rows = []
+				for p in spending_pctiles:
+					goal_pct_rows.append({
+						'percentile': p,
+						'avg_annual_gross': np.percentile(run_goal['avg_annual_goal_wd'], p),
+						'avg_annual_after_tax': np.percentile(run_goal['avg_annual_goal_spending'], p),
+						f'total_gross ({num_years} yrs)': np.percentile(run_goal['total_goal_wd'], p),
+						f'total_after_tax ({num_years} yrs)': np.percentile(run_goal['total_goal_spending'], p),
+					})
+				st.dataframe(pd.DataFrame(goal_pct_rows).style.format({
+					'percentile': lambda x: f"{int(x)}th",
+					'avg_annual_gross': currency_fmt,
+					'avg_annual_after_tax': currency_fmt,
+					f'total_gross ({num_years} yrs)': currency_fmt,
+					f'total_after_tax ({num_years} yrs)': currency_fmt,
+				}))
+
 		# Year-by-year median table (50th percentile across all simulations)
 		st.subheader('Year-by-year median across all runs')
 		st.caption('Each value is the 50th percentile across all simulation runs for that year — not a single run.')
-		median_cols = ['age_p1', 'withdrawal_used', 'after_tax_spending', 'total_portfolio',
+		median_cols = ['age_p1', 'withdrawal_used', 'after_tax_spending']
+		if has_goal_breakdown:
+			col_names = ['Age', 'Withdrawal Target (Total)', 'After-Tax Spending (Total)']
+		else:
+			col_names = ['Age', 'Withdrawal Target', 'After-Tax Spending']
+		col_formats = {}
+		# Insert base + per-goal columns when goals are active
+		if has_goal_breakdown:
+			median_cols += ['base_after_tax_spending']
+			col_names += ['Base Spending']
+			col_formats['Base Spending'] = currency_fmt
+			for gi, (g_label, g_amount, g_begin, g_end, *_gx) in enumerate(_active_goals):
+				col_key = f'goal_{gi}_after_tax_spending'
+				if col_key in all_yearly.columns:
+					median_cols.append(col_key)
+					goal_col_name = g_label or f'Goal {gi + 1}'
+					col_names.append(goal_col_name)
+					col_formats[goal_col_name] = currency_fmt
+		median_cols += ['total_portfolio',
 					   'end_taxable_total', 'end_tda_total', 'end_roth',
 					   'total_taxes', 'rmd_total', 'withdraw_from_tda', 'withdraw_from_roth',
 					   'withdraw_from_taxable_net', 'ss_income_total', 'pension_income_total',
 					   'pension_income_real', 'pension_erosion', 'ordinary_taxable_income',
 					   'capital_gains', 'effective_tax_rate_calc']
+		col_names += ['Total Portfolio',
+					  'Taxable', 'TDA', 'Roth',
+					  'Total Taxes', 'RMDs', 'Withdraw TDA', 'Withdraw Roth',
+					  'Withdraw Taxable', 'SS Income', 'Pension (Nominal)',
+					  'Pension (Real)', 'Pension Erosion', 'Ordinary Income',
+					  'Cap Gains', 'Eff Tax Rate']
 		all_yearly['effective_tax_rate_calc'] = (
 			all_yearly['total_taxes'] /
 			(all_yearly['ordinary_taxable_income'] + all_yearly['capital_gains']).replace(0, np.nan)
 		).fillna(0.0)
 		yearly_median = all_yearly.groupby('year')[median_cols].median()
-		yearly_median.columns = ['Age', 'Withdrawal Target', 'After-Tax Spending', 'Total Portfolio',
-								 'Taxable', 'TDA', 'Roth',
-								 'Total Taxes', 'RMDs', 'Withdraw TDA', 'Withdraw Roth',
-								 'Withdraw Taxable', 'SS Income', 'Pension (Nominal)',
-								 'Pension (Real)', 'Pension Erosion', 'Ordinary Income',
-								 'Cap Gains', 'Eff Tax Rate']
-		st.dataframe(yearly_median.style.format({
+		yearly_median.columns = col_names
+		_wd_col = 'Withdrawal Target (Total)' if has_goal_breakdown else 'Withdrawal Target'
+		_sp_col = 'After-Tax Spending (Total)' if has_goal_breakdown else 'After-Tax Spending'
+		col_formats.update({
 			'Age': '{:.0f}',
+			_wd_col: currency_fmt, _sp_col: currency_fmt,
 			'Total Portfolio': currency_fmt, 'Taxable': currency_fmt, 'TDA': currency_fmt, 'Roth': currency_fmt,
 			'Total Taxes': currency_fmt, 'RMDs': currency_fmt,
 			'Withdraw TDA': currency_fmt, 'Withdraw Roth': currency_fmt, 'Withdraw Taxable': currency_fmt,
 			'SS Income': currency_fmt, 'Pension (Nominal)': currency_fmt, 'Pension (Real)': currency_fmt, 'Pension Erosion': currency_fmt,
 			'Ordinary Income': currency_fmt, 'Cap Gains': currency_fmt,
 			'Eff Tax Rate': '{:.2%}'.format,
-			'Withdrawal Target': currency_fmt, 'After-Tax Spending': currency_fmt,
-		}))
+		})
+		st.dataframe(yearly_median.style.format(col_formats))
 
 		st.subheader('Total portfolio value — percentile bands across all runs')
 		port_value_mode = st.radio('Portfolio value display', ['Pre-tax', 'After-tax', 'Both'], horizontal=True, index=0, key='port_value_mode')
@@ -726,8 +871,23 @@ def main():
 		st.subheader('Year-by-year detail — single run')
 		st.caption(f'Years simulated: {len(df)} | This is one complete simulation path.')
 		# Reorder columns: put after_tax_spending and withdrawal_used before portfolio_return
+		# Include base and per-goal spending columns if available
+		_sr_goals = st.session_state.get('_add_goal_inputs', [])
+		_sr_active_goals = [g for g in _sr_goals if len(g) >= 4 and g[1] > 0]
+		_goal_detail_cols = []
+		_goal_detail_fmts = {}
+		if 'base_after_tax_spending' in display_df.columns:
+			_goal_detail_cols.append('base_after_tax_spending')
+			_goal_detail_fmts['base_after_tax_spending'] = currency_fmt
+			for gi, (g_label, g_amount, g_begin, g_end, *_gx) in enumerate(_sr_active_goals):
+				col_key = f'goal_{gi}_after_tax_spending'
+				if col_key in display_df.columns:
+					_goal_detail_cols.append(col_key)
+					_goal_detail_fmts[col_key] = currency_fmt
 		detail_col_order = [
-			'year', 'age_p1', 'age_p2', 'withdrawal_used', 'after_tax_spending', 'portfolio_return', 'roth_return_used',
+			'year', 'age_p1', 'age_p2', 'withdrawal_used', 'after_tax_spending',
+			] + _goal_detail_cols + [
+			'portfolio_return', 'roth_return_used',
 			'start_stocks_mv', 'start_bonds_mv', 'start_stocks_basis', 'start_bonds_basis',
 			'start_tda_p1', 'start_tda_p2', 'start_roth',
 			'rmd_divisor_p1', 'rmd_divisor_p2', 'rmd_p1', 'rmd_p2', 'rmd_total',
@@ -745,7 +905,7 @@ def main():
 		]
 		detail_col_order = [c for c in detail_col_order if c in display_df.columns]
 		display_df = display_df[detail_col_order]
-		st.dataframe(display_df.style.format({
+		_detail_fmts = {
 			'start_stocks_mv': currency_fmt, 'start_bonds_mv': currency_fmt, 'start_stocks_basis': currency_fmt, 'start_bonds_basis': currency_fmt,
 			'start_tda_p1': currency_fmt, 'start_tda_p2': currency_fmt, 'start_roth': currency_fmt,
 			'rmd_p1': currency_fmt, 'rmd_p2': currency_fmt, 'rmd_total': currency_fmt, 'withdraw_from_taxable_net': currency_fmt, 'withdraw_from_tda': currency_fmt, 'withdraw_from_roth': currency_fmt,
@@ -764,7 +924,9 @@ def main():
 			'withdrawal_used': currency_fmt, 'after_tax_spending': currency_fmt,
 			'portfolio_return': '{:.2%}'.format,
 			'roth_return_used': '{:.2%}'.format
-		}))
+		}
+		_detail_fmts.update(_goal_detail_fmts)
+		st.dataframe(display_df.style.format(_detail_fmts))
 		csv_data = display_df.to_csv(index=False)
 		st.download_button('Download single run detail as CSV', csv_data, file_name='single_run_detail.csv', mime='text/csv')
 

@@ -34,6 +34,7 @@ _SAVEABLE_KEYS = [
 	'stock_dividend_yield', 'stock_turnover', 'investment_fee_bps',
 	'guardrails_enabled', 'guardrail_lower', 'guardrail_upper', 'guardrail_target',
 	'guardrail_inner_sims', 'guardrail_max_spending_pct',
+	'flex_goal_min_pct', 'base_is_essential',
 	'display_decimals', 'monte_carlo_runs',
 	'num_scenarios',
 ]
@@ -95,6 +96,7 @@ def _save_inputs_to_json(client: str, name: str):
 			'amount': st.session_state.get(f'add_goal_amount_{g}', 0.0),
 			'begin': st.session_state.get(f'add_goal_begin_{g}', 1),
 			'end': st.session_state.get(f'add_goal_end_{g}', 1),
+			'priority': st.session_state.get(f'add_goal_priority_{g}', 'Need'),
 		})
 	data['add_goals'] = add_goals
 	# Save scenario override UI keys (dynamic)
@@ -183,6 +185,11 @@ def _load_inputs_from_json(client: str, name: str):
 			st.session_state[f'add_goal_amount_{g}'] = goal.get('amount', 0.0)
 			st.session_state[f'add_goal_begin_{g}'] = goal.get('begin', 1)
 			st.session_state[f'add_goal_end_{g}'] = goal.get('end', 1)
+			# Backward compat: map old Need/Want to Essential/Flexible
+			raw_priority = goal.get('priority', 'Essential')
+			if raw_priority == 'Need': raw_priority = 'Essential'
+			elif raw_priority == 'Want': raw_priority = 'Flexible'
+			st.session_state[f'add_goal_priority_{g}'] = raw_priority
 	# Restore scenario overrides
 	if 'scenario_overrides' in data:
 		for s_idx_str, sc_data in data['scenario_overrides'].items():
@@ -464,7 +471,7 @@ def _render_withdrawal_section(horizon):
 	}
 
 def _render_add_goals_section(horizon):
-	"""Render Additional Spending Goals expander. Returns list of (label, amount, begin, end)."""
+	"""Render Additional Spending Goals expander. Returns list of (label, amount, begin, end, priority)."""
 	with st.expander('Additional Spending Goals'):
 		st.caption('Extra spending layered on top of base withdrawals (e.g. long-term care, travel, home repair)')
 		num_add_goals = st.number_input('Number of additional goals', value=1, min_value=0, max_value=10, step=1, key='num_add_goals')
@@ -481,7 +488,9 @@ def _render_add_goals_section(horizon):
 			g_amount = st.number_input(f'Goal {g+1} annual amount', value=gd['amount'], step=1000.0, key=f'add_goal_amount_{g}')
 			g_begin = st.number_input(f'Goal {g+1} begin year', value=gd['begin'], min_value=1, max_value=horizon, step=1, key=f'add_goal_begin_{g}')
 			g_end = st.number_input(f'Goal {g+1} end year', value=gd['end'], min_value=1, max_value=horizon, step=1, key=f'add_goal_end_{g}')
-			add_goal_inputs.append((g_label, float(g_amount), int(g_begin), int(g_end)))
+			g_priority = st.selectbox(f'Goal {g+1} priority', ['Essential', 'Flexible'], index=0, key=f'add_goal_priority_{g}',
+				help='Essential = funded at full target even if markets are down; Flexible = adjusted with base spending when portfolio is under pressure')
+			add_goal_inputs.append((g_label, float(g_amount), int(g_begin), int(g_end), g_priority))
 	return add_goal_inputs
 
 def _render_income_section():
@@ -644,12 +653,22 @@ def _render_guardrail_section():
 				value=50.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
 				help='0 = spending can never exceed base target. 50 = up to 150% of base. -1 = unlimited.',
 				key='guardrail_max_spending_pct')
+			flex_goal_min_pct = st.number_input(
+				'Flexible goal minimum %', value=50.0, min_value=0.0, max_value=100.0,
+				format="%.0f", step=10.0,
+				help='Floor for flexible goal cuts. 50% = flexible goals can be cut by at most half before base spending is reduced.',
+				key='flex_goal_min_pct') / 100.0
+			base_is_essential = st.checkbox(
+				'Protect base spending', value=False, key='base_is_essential',
+				help='If checked, only flexible goals absorb spending cuts — base spending is never reduced by guardrails.')
 		else:
 			guardrail_lower = 0.75
 			guardrail_upper = 0.90
 			guardrail_target = 0.85
 			guardrail_inner_sims = 200
 			guardrail_max_spending_pct = -1.0
+			flex_goal_min_pct = 0.5
+			base_is_essential = False
 	return {
 		'guardrails_enabled': guardrails_enabled,
 		'guardrail_lower': guardrail_lower,
@@ -657,6 +676,8 @@ def _render_guardrail_section():
 		'guardrail_target': guardrail_target,
 		'guardrail_inner_sims': guardrail_inner_sims,
 		'guardrail_max_spending_pct': guardrail_max_spending_pct,
+		'flex_goal_min_pct': flex_goal_min_pct,
+		'base_is_essential': base_is_essential,
 	}
 
 def _render_sim_settings():
