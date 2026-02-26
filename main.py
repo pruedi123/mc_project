@@ -10,7 +10,7 @@ from sim_engine import (
 	auto_scenario_name, compute_scenario_summary, run_monte_carlo,
 	store_distribution_results, simulate_withdrawals, sample_lognormal_returns,
 )
-from ui_inputs import render_sidebar
+from ui_inputs import render_sidebar, save_results_to_json, load_plan_results, get_plans_with_results
 
 st.set_page_config(page_title='Withdrawal + RMD Simulator', layout='wide')
 
@@ -139,20 +139,83 @@ def _three_card_summary(data_series, target, currency_fmt='${:,.0f}'):
 		 'sub': '90th percentile upside', 'border': _card_colors(strong_val)[0], 'bg': _card_colors(strong_val)[1]},
 	]
 
-	cols = st.columns([1, 1, 1, 3])
-	for col, card in zip(cols[:3], cards):
+	card_htmls = []
+	for card in cards:
 		pct_line = _pct_vs_target(card['val'])
-		col.markdown(
-			f'<div style="border:1px solid {card["border"]}; border-left:4px solid {card["border"]}; '
+		card_htmls.append(
+			f'<div style="flex:1; border:1px solid {card["border"]}; border-left:4px solid {card["border"]}; '
 			f'border-radius:8px; padding:16px 14px; background:{card["bg"]}; text-align:center;">'
 			f'<div style="font-size:1.5em; margin-bottom:4px;">{card["icon"]}</div>'
 			f'<div style="font-weight:600; color:#374151; margin-bottom:2px;">{card["title"]}</div>'
 			f'<div style="font-size:1.6em; font-weight:700; color:#111827;">{currency_fmt.format(card["val"])}</div>'
 			f'{pct_line}'
 			f'<div style="color:#6b7280; font-size:0.82em; margin-top:4px;">{card["sub"]}</div>'
-			f'</div>',
-			unsafe_allow_html=True,
+			f'</div>'
 		)
+	st.markdown(
+		f'<div style="display:flex; gap:12px; align-items:stretch; max-width:50%;">{"".join(card_htmls)}</div>',
+		unsafe_allow_html=True,
+	)
+
+def _display_comparison(scenarios, currency_fmt, key_suffix=''):
+	"""Display a scenario comparison table and overlay charts.
+	Each scenario dict has: name, percentile_rows, spending_percentiles, pct_non_positive,
+	median_yearly_portfolio (list), median_yearly_spending (list), median_yearly_years (list)."""
+	compare_pct = st.selectbox('Compare at percentile', [0, 10, 25, 50, 75, 90], index=3,
+		key=f'compare_pct_{key_suffix}')
+	baseline = scenarios[0]
+	baseline_row = next(r for r in baseline['percentile_rows'] if r['percentile'] == compare_pct)
+	baseline_spend = next(r for r in baseline['spending_percentiles'] if r['percentile'] == compare_pct)
+	comparison_rows = []
+	for sc in scenarios:
+		sc_row = next(r for r in sc['percentile_rows'] if r['percentile'] == compare_pct)
+		sc_spend = next(r for r in sc['spending_percentiles'] if r['percentile'] == compare_pct)
+		comparison_rows.append({
+			'Scenario': sc['name'],
+			'After-Tax Ending': sc_row['after_tax_end'],
+			'vs Baseline': sc_row['after_tax_end'] - baseline_row['after_tax_end'],
+			'Total Taxes': sc_row['total_taxes'],
+			'Tax Delta': sc_row['total_taxes'] - baseline_row['total_taxes'],
+			'Eff Tax Rate': sc_row['effective_tax_rate'],
+			'Avg Annual Spending': sc_spend['avg_annual_after_tax_spending'],
+			'Spend Delta': sc_spend['avg_annual_after_tax_spending'] - baseline_spend['avg_annual_after_tax_spending'],
+			'% Below Goal': sc['pct_non_positive'] * 100,
+		})
+	comp_df = pd.DataFrame(comparison_rows).set_index('Scenario')
+	def _color_deltas(df):
+		delta_cols = {'vs Baseline', 'Tax Delta', 'Spend Delta'}
+		styles = pd.DataFrame('', index=df.index, columns=df.columns)
+		for col in df.columns:
+			if col in delta_cols:
+				styles[col] = df[col].apply(
+					lambda v: 'color: green' if isinstance(v, (int, float)) and v > 0
+					else ('color: red' if isinstance(v, (int, float)) and v < 0 else ''))
+		return styles
+	st.dataframe(comp_df.style.format({
+		'After-Tax Ending': currency_fmt,
+		'vs Baseline': currency_fmt,
+		'Total Taxes': currency_fmt,
+		'Tax Delta': currency_fmt,
+		'Eff Tax Rate': '{:.2%}'.format,
+		'Avg Annual Spending': currency_fmt,
+		'Spend Delta': currency_fmt,
+		'% Below Goal': '{:.1f}%'.format,
+	}).apply(_color_deltas, axis=None))
+
+	# Overlay charts
+	st.subheader('Portfolio Value Comparison (median)')
+	overlay_df = pd.DataFrame()
+	for sc in scenarios:
+		overlay_df[sc['name']] = pd.Series(sc['median_yearly_portfolio'],
+			index=sc['median_yearly_years'])
+	interactive_line_chart(overlay_df, y_title='Portfolio Value (Median)', zero_base=False)
+
+	st.subheader('After-Tax Spending Comparison (median)')
+	spend_overlay = pd.DataFrame()
+	for sc in scenarios:
+		spend_overlay[sc['name']] = pd.Series(sc['median_yearly_spending'],
+			index=sc['median_yearly_years'])
+	interactive_line_chart(spend_overlay, y_title='After-Tax Spending (Median)', zero_base=False)
 
 def main():
 	st.title('Withdrawal + RMD Simulator (30-year)')
@@ -160,7 +223,8 @@ def main():
 	if st.button('Reset saved scenarios'):
 		for key in ['scenario_summaries', 'last_summary', 'mc_percentile_rows', 'mc_all_yearly',
 					'mc_pct_non_positive', 'sim_df', 'sim_mode', 'mc_summaries', 'mc_percentiles',
-					'multi_scenario_results', 'selected_scenario_idx', 'num_sims']:
+					'multi_scenario_results', 'selected_scenario_idx', 'num_sims',
+					'saved_plan_comparison']:
 			st.session_state.pop(key, None)
 		st.success('Saved scenarios cleared.')
 
@@ -562,60 +626,20 @@ def main():
 		multi_results = st.session_state['multi_scenario_results']
 		if len(multi_results) > 1:
 			st.subheader('Scenario Comparison')
-			compare_pct = st.selectbox('Compare at percentile', [0, 10, 25, 50, 75, 90], index=3)
-			baseline = multi_results[0]
-			baseline_row = next(r for r in baseline['percentile_rows'] if r['percentile'] == compare_pct)
-			baseline_spend = next(r for r in baseline['spending_percentiles'] if r['percentile'] == compare_pct)
-			comparison_rows = []
+			# Convert multi_results to the common format for _display_comparison
+			comparison_scenarios = []
 			for sc in multi_results:
-				sc_row = next(r for r in sc['percentile_rows'] if r['percentile'] == compare_pct)
-				sc_spend = next(r for r in sc['spending_percentiles'] if r['percentile'] == compare_pct)
-				comparison_rows.append({
-					'Scenario': sc['name'],
-					'After-Tax Ending': sc_row['after_tax_end'],
-					'vs Baseline': sc_row['after_tax_end'] - baseline_row['after_tax_end'],
-					'Total Taxes': sc_row['total_taxes'],
-					'Tax Delta': sc_row['total_taxes'] - baseline_row['total_taxes'],
-					'Eff Tax Rate': sc_row['effective_tax_rate'],
-					'Avg Annual Spending': sc_spend['avg_annual_after_tax_spending'],
-					'Spend Delta': sc_spend['avg_annual_after_tax_spending'] - baseline_spend['avg_annual_after_tax_spending'],
-					'% Below Goal': sc['pct_non_positive'] * 100,
+				median_by_year = sc['all_yearly_df'].groupby('year')[['total_portfolio', 'after_tax_spending']].median()
+				comparison_scenarios.append({
+					'name': sc['name'],
+					'percentile_rows': sc['percentile_rows'],
+					'spending_percentiles': sc['spending_percentiles'],
+					'pct_non_positive': sc['pct_non_positive'],
+					'median_yearly_years': median_by_year.index.tolist(),
+					'median_yearly_portfolio': median_by_year['total_portfolio'].tolist(),
+					'median_yearly_spending': median_by_year['after_tax_spending'].tolist(),
 				})
-			comp_df = pd.DataFrame(comparison_rows).set_index('Scenario')
-			def _color_deltas(df):
-				delta_cols = {'vs Baseline', 'Tax Delta', 'Spend Delta'}
-				styles = pd.DataFrame('', index=df.index, columns=df.columns)
-				for col in df.columns:
-					if col in delta_cols:
-						styles[col] = df[col].apply(
-							lambda v: 'color: green' if isinstance(v, (int, float)) and v > 0
-							else ('color: red' if isinstance(v, (int, float)) and v < 0 else ''))
-				return styles
-			st.dataframe(comp_df.style.format({
-				'After-Tax Ending': currency_fmt,
-				'vs Baseline': currency_fmt,
-				'Total Taxes': currency_fmt,
-				'Tax Delta': currency_fmt,
-				'Eff Tax Rate': '{:.2%}'.format,
-				'Avg Annual Spending': currency_fmt,
-				'Spend Delta': currency_fmt,
-				'% Depleted': '{:.1f}%'.format,
-			}).apply(_color_deltas, axis=None))
-
-			# Overlay charts
-			st.subheader('Portfolio Value Comparison (median)')
-			overlay_df = pd.DataFrame()
-			for sc in multi_results:
-				median_portfolio = sc['all_yearly_df'].groupby('year')['total_portfolio'].median()
-				overlay_df[sc['name']] = median_portfolio
-			interactive_line_chart(overlay_df, y_title='Portfolio Value (Median)', zero_base=False)
-
-			st.subheader('After-Tax Spending Comparison (median)')
-			spend_overlay = pd.DataFrame()
-			for sc in multi_results:
-				median_spend = sc['all_yearly_df'].groupby('year')['after_tax_spending'].median()
-				spend_overlay[sc['name']] = median_spend
-			interactive_line_chart(spend_overlay, y_title='After-Tax Spending (Median)', zero_base=False)
+			_display_comparison(comparison_scenarios, currency_fmt, key_suffix='multi')
 
 			# Scenario selector for detail drill-down
 			st.markdown('---')
@@ -1207,43 +1231,39 @@ def main():
 	elif sim_mode is None:
 		st.info('Set inputs and click "Run simulation" to see results.')
 
-	# ── Scenario saving ──────────────────────────────────────────
-	scenario_name_default = st.session_state.get('last_summary', {}).get('name', 'Scenario 1')
-	scenario_name = st.text_input('Scenario name to save', value=scenario_name_default)
-	if 'scenario_summaries' not in st.session_state:
-		st.session_state['scenario_summaries'] = []
-
-	if st.button('Save scenario'):
-		if 'last_summary' not in st.session_state:
-			st.warning('Run a simulation first.')
+	# ── Compare Saved Plans ───────────────────────────────────────
+	client = st.session_state.get('client_select', '')
+	if client and client != '-- New Client --':
+		plans_with_results = get_plans_with_results(client)
+		if plans_with_results:
+			st.markdown('---')
+			st.subheader('Compare Saved Plans')
+			selected_plans = st.multiselect('Select plans to compare',
+				plans_with_results, key='compare_plans_select')
+			if st.button('Compare', key='compare_plans_btn') and len(selected_plans) >= 2:
+				comparison_scenarios = []
+				for plan_name in selected_plans:
+					r = load_plan_results(client, plan_name)
+					if r is None:
+						st.warning(f'Could not load results for {plan_name}')
+						continue
+					comparison_scenarios.append({
+						'name': plan_name,
+						'percentile_rows': r['percentile_rows'],
+						'spending_percentiles': r['spending_percentiles'],
+						'pct_non_positive': r['pct_non_positive'],
+						'median_yearly_years': r['median_yearly']['years'],
+						'median_yearly_portfolio': r['median_yearly']['portfolio'],
+						'median_yearly_spending': r['median_yearly']['spending'],
+					})
+				if len(comparison_scenarios) >= 2:
+					st.session_state['saved_plan_comparison'] = comparison_scenarios
+			if st.session_state.get('saved_plan_comparison'):
+				_display_comparison(st.session_state['saved_plan_comparison'],
+					currency_fmt, key_suffix='saved')
 		else:
-			summary = dict(st.session_state['last_summary'])
-			summary['name'] = scenario_name
-			st.session_state['scenario_summaries'] = [s for s in st.session_state['scenario_summaries'] if s['name'] != scenario_name]
-			if len(st.session_state['scenario_summaries']) >= 5:
-				st.warning('Maximum of 5 scenarios saved. Remove one by reusing a name.')
-			else:
-				st.session_state['scenario_summaries'].append(summary)
-				st.success(f"Saved scenario '{scenario_name}'.")
-
-	if st.session_state.get('scenario_summaries'):
-		st.markdown('### Saved scenarios')
-		for s in st.session_state['scenario_summaries']:
-			pcts = s.get('percentiles', [])
-			if pcts:
-				st.markdown(f"**{s['name']}**")
-				pct_df = pd.DataFrame(pcts)
-				pct_non_pos = s.get('pct_non_positive_end', 0.0)
-				st.dataframe(pct_df.style.format({
-					'percentile': lambda x: f"{int(x)}th",
-					'after_tax_end': currency_fmt,
-					'total_taxes': currency_fmt,
-					'effective_tax_rate': '{:.2%}'.format,
-					'portfolio_cagr': '{:.2%}'.format,
-					'roth_cagr': '{:.2%}'.format,
-				}))
-				if pct_non_pos is not None:
-					st.caption(f"% below ending balance goal: {pct_non_pos * 100:.1f}%")
+			if sim_mode is not None:
+				st.caption('No saved plans with simulation results yet. Run a simulation and click "Save Inputs" to save results.')
 
 	# ── Client PDF Report ────────────────────────────────────────
 	if sim_mode is not None and 'mc_percentile_rows' in st.session_state:

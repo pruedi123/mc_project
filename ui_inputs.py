@@ -66,11 +66,12 @@ def _default_plan_name(last: str, first: str, identifier: str, existing: list) -
 	return f'{base}_{n}'
 
 def _get_saved_files(client: str):
-	"""Return sorted list of .json filenames (without extension) for a client."""
+	"""Return sorted list of .json filenames (without extension) for a client, excluding _results companion files."""
 	client_dir = os.path.join(SAVES_DIR, client)
 	os.makedirs(client_dir, exist_ok=True)
 	files = globmod.glob(os.path.join(client_dir, '*.json'))
-	return sorted([os.path.splitext(os.path.basename(f))[0] for f in files])
+	return sorted([os.path.splitext(os.path.basename(f))[0] for f in files
+					if not os.path.basename(f).endswith('_results.json')])
 
 def _save_inputs_to_json(client: str, name: str):
 	"""Collect current widget values from session_state and write to Current Client Plans/{client}/{name}.json."""
@@ -199,6 +200,56 @@ def _load_inputs_from_json(client: str, name: str):
 			for key, val in sc_data.items():
 				st.session_state[key] = val
 
+def save_results_to_json(client: str, name: str):
+	"""Save pre-aggregated simulation results alongside a plan's input file.
+	Returns the path written, or '' if no results are available."""
+	import numpy as np
+	pct_rows = st.session_state.get('mc_percentile_rows')
+	all_yearly = st.session_state.get('mc_all_yearly')
+	if pct_rows is None or all_yearly is None:
+		return ''
+	median_by_year = all_yearly.groupby('year')[['total_portfolio', 'after_tax_spending']].median()
+	data = {
+		'saved_at': datetime.now().isoformat(timespec='seconds'),
+		'sim_mode': st.session_state.get('sim_mode', 'simulated'),
+		'num_sims': int(st.session_state.get('num_sims', 0)),
+		'percentile_rows': pct_rows,
+		'spending_percentiles': st.session_state.get('mc_spending_pct_rows', []),
+		'pct_non_positive': float(st.session_state.get('mc_pct_non_positive', 0.0)),
+		'median_yearly': {
+			'years': median_by_year.index.tolist(),
+			'portfolio': median_by_year['total_portfolio'].tolist(),
+			'spending': median_by_year['after_tax_spending'].tolist(),
+		},
+	}
+	client_dir = os.path.join(SAVES_DIR, client)
+	os.makedirs(client_dir, exist_ok=True)
+	path = os.path.join(client_dir, f'{name}_results.json')
+	with open(path, 'w') as f:
+		json.dump(data, f, indent=2, default=str)
+	return path
+
+def load_plan_results(client: str, name: str):
+	"""Load saved simulation results for a plan. Returns dict or None if not found."""
+	path = os.path.join(SAVES_DIR, client, f'{name}_results.json')
+	if not os.path.exists(path):
+		return None
+	with open(path) as f:
+		return json.load(f)
+
+def get_plans_with_results(client: str):
+	"""Return list of plan names that have companion _results.json files (and a matching input file)."""
+	client_dir = os.path.join(SAVES_DIR, client)
+	if not os.path.isdir(client_dir):
+		return []
+	plans = []
+	for f in sorted(os.listdir(client_dir)):
+		if f.endswith('_results.json'):
+			plan_name = f[:-len('_results.json')]
+			if os.path.exists(os.path.join(client_dir, f'{plan_name}.json')):
+				plans.append(plan_name)
+	return plans
+
 # ── Sidebar rendering ───────────────────────────────────────────
 
 def _render_save_load_section():
@@ -280,7 +331,11 @@ def _render_save_load_section():
 			if st.button('Save Inputs'):
 				if save_name.strip():
 					path = _save_inputs_to_json(client, save_name.strip())
-					st.success(f'Saved to {client}/{os.path.basename(path)}')
+					results_path = save_results_to_json(client, save_name.strip())
+					if results_path:
+						st.success(f'Saved inputs + results to {client}/{save_name.strip()}')
+					else:
+						st.success(f'Saved inputs to {client}/{os.path.basename(path)} (no simulation results yet)')
 				else:
 					st.warning('Enter a plan name.')
 			if saved_files:
@@ -293,6 +348,10 @@ def _render_save_load_section():
 				with col_del:
 					if st.button('Delete'):
 						os.remove(os.path.join(SAVES_DIR, client, f'{load_choice}.json'))
+						# Also remove companion results file if it exists
+						results_path = os.path.join(SAVES_DIR, client, f'{load_choice}_results.json')
+						if os.path.exists(results_path):
+							os.remove(results_path)
 						# Remove client folder if empty
 						client_dir = os.path.join(SAVES_DIR, client)
 						if not os.listdir(client_dir):
@@ -406,7 +465,7 @@ def _render_scenario_section():
 
 def _render_ages_section():
 	"""Render Ages & Timeline expander. Returns dict of age values."""
-	with st.expander('Ages & Timeline', expanded=True):
+	with st.expander('Ages & Timeline'):
 		start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65, key='start_age')
 		start_age_spouse = st.number_input('Starting age (person 2)', min_value=18, max_value=120, value=60, key='start_age_spouse')
 		life_expectancy_primary = st.number_input('Primary life expectancy (last age lived through)', min_value=int(start_age), max_value=120, value=84, step=1, key='life_expectancy_primary')
@@ -514,24 +573,26 @@ def _render_add_goals_section(horizon):
 	"""Render Additional Spending Goals expander. Returns list of (label, amount, begin, end, priority)."""
 	with st.expander('Additional Spending Goals'):
 		st.caption('Extra spending layered on top of base withdrawals (e.g. long-term care, travel, home repair)')
-		num_add_goals = st.number_input('Number of additional goals', value=1, min_value=0, max_value=10, step=1, key='num_add_goals')
+		num_add_goals = st.number_input('Number of additional goals', value=2, min_value=0, max_value=10, step=1, key='num_add_goals')
 		add_goal_inputs = []
-		# Defaults for goal 0: Long-term care in last 3 years
+		# Defaults for goal 0: Long-term care in last 3 years; goal 1: Legacy in final year
 		_ltc_default_begin = max(1, horizon - 2)
 		_goal_defaults = {
-			0: {'label': 'Long-term care', 'amount': 100000.0, 'begin': _ltc_default_begin, 'end': horizon},
+			0: {'label': 'Long-term care', 'amount': 100000.0, 'begin': _ltc_default_begin, 'end': horizon, 'priority': 'Flexible', 'cap': 50.0},
+			1: {'label': 'Legacy', 'amount': 1000000.0, 'begin': horizon, 'end': horizon, 'priority': 'Flexible', 'cap': 20.0},
 		}
 		for g in range(int(num_add_goals)):
 			st.markdown(f'**Goal {g+1}**')
-			gd = _goal_defaults.get(g, {'label': '', 'amount': 0.0, 'begin': 1, 'end': horizon})
+			gd = _goal_defaults.get(g, {'label': '', 'amount': 0.0, 'begin': 1, 'end': horizon, 'priority': 'Essential', 'cap': -1.0})
 			g_label = st.text_input(f'Goal {g+1} label', value=gd['label'], key=f'add_goal_label_{g}')
 			g_amount = st.number_input(f'Goal {g+1} annual amount', value=gd['amount'], step=1000.0, key=f'add_goal_amount_{g}')
 			g_begin = st.number_input(f'Goal {g+1} begin year', value=gd['begin'], min_value=1, max_value=horizon, step=1, key=f'add_goal_begin_{g}')
 			g_end = st.number_input(f'Goal {g+1} end year', value=gd['end'], min_value=1, max_value=horizon, step=1, key=f'add_goal_end_{g}')
-			g_priority = st.selectbox(f'Goal {g+1} priority', ['Essential', 'Flexible'], index=0, key=f'add_goal_priority_{g}',
+			priority_idx = ['Essential', 'Flexible'].index(gd['priority']) if gd['priority'] in ('Essential', 'Flexible') else 0
+			g_priority = st.selectbox(f'Goal {g+1} priority', ['Essential', 'Flexible'], index=priority_idx, key=f'add_goal_priority_{g}',
 				help='Essential = funded at full target even if markets are down; Flexible = adjusted with base spending when portfolio is under pressure')
 			g_cap = st.number_input(f'Goal {g+1} spending cap (% above target, -1=no cap)',
-				value=-1.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
+				value=gd['cap'], min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
 				help='Cap how much this goal can increase in good markets. 0 = never exceed target. 50 = up to 150% of target. -1 = no cap (unlimited).',
 				key=f'add_goal_cap_{g}')
 			add_goal_inputs.append((g_label, float(g_amount), int(g_begin), int(g_end), g_priority, float(g_cap)))
@@ -544,7 +605,7 @@ def _render_income_section():
 		ss_start_age_p1 = st.number_input('SS start age - person 1', min_value=60, max_value=90, value=67, step=1, key='ss_start_age_p1')
 		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=20000.0, step=1000.0, key='ss_income_spouse')
 		ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=65, step=1, key='ss_start_age_p2')
-		ss_cola = st.number_input('Social Security COLA', value=0.02, format="%.4f", key='ss_cola')
+		ss_cola = st.number_input('Social Security COLA', value=0.0, format="%.4f", key='ss_cola')
 		st.caption('Survivor receives the higher of their own or deceased spouse\'s benefit')
 		pension_income_input = st.number_input('Annual pension income - person 1', value=0.0, step=1000.0, key='pension_income')
 		pension_cola_p1 = st.number_input('Pension COLA - person 1', value=0.00, format="%.4f", key='pension_cola_p1')
@@ -694,7 +755,7 @@ def _render_guardrail_section():
 			guardrail_inner_sims = st.number_input('Inner MC simulations per check', value=200, min_value=50, max_value=1000, step=50, key='guardrail_inner_sims')
 			guardrail_max_spending_pct = st.number_input(
 				'Max spending cap (% above base withdrawal, -1=no cap, 0=no increase)',
-				value=10.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
+				value=50.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
 				help='0 = spending can never exceed base target. 50 = up to 150% of base. -1 = unlimited.',
 				key='guardrail_max_spending_pct')
 			flex_goal_min_pct = st.number_input(
