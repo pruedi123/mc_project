@@ -35,6 +35,7 @@ _SAVEABLE_KEYS = [
 	'guardrails_enabled', 'guardrail_lower', 'guardrail_upper', 'guardrail_target',
 	'guardrail_inner_sims', 'guardrail_max_spending_pct',
 	'flex_goal_min_pct',
+	'inheritance_enabled', 'inheritance_year', 'inheritance_taxable_amount', 'inheritance_ira_amount',
 	'display_decimals', 'monte_carlo_runs',
 	'num_scenarios',
 ]
@@ -495,6 +496,36 @@ def _render_accounts_section():
 		'tda_spouse_start': tda_spouse_start,
 	}
 
+def _render_inheritance_section():
+	"""Render Expected Inheritance expander. Returns dict of inheritance values."""
+	with st.expander('Expected Inheritance'):
+		inheritance_enabled = st.checkbox('Enable expected inheritance', value=False,
+			help='Model a one-time inheritance received during the simulation. '
+			'Inherited taxable assets get a stepped-up (100%) cost basis. '
+			'Inherited IRAs are subject to the SECURE Act 10-year drawdown rule.',
+			key='inheritance_enabled')
+		if inheritance_enabled:
+			inheritance_year = st.number_input('Year of inheritance (simulation year)',
+				min_value=1, max_value=40, value=10, step=1, key='inheritance_year',
+				help='Simulation year when the inheritance is received.')
+			inheritance_taxable_amount = st.number_input('Inherited taxable assets',
+				value=0.0, min_value=0.0, step=10000.0, key='inheritance_taxable_amount',
+				help='Amount received as taxable assets (stocks/bonds). Gets a stepped-up cost basis equal to market value — no embedded gains.')
+			inheritance_ira_amount = st.number_input('Inherited IRA amount',
+				value=0.0, min_value=0.0, step=10000.0, key='inheritance_ira_amount',
+				help='Amount received as an inherited IRA (pre-tax). Subject to SECURE Act 10-year drawdown: '
+				'distributed evenly over 10 years as ordinary income.')
+		else:
+			inheritance_year = 10
+			inheritance_taxable_amount = 0.0
+			inheritance_ira_amount = 0.0
+	return {
+		'inheritance_enabled': inheritance_enabled,
+		'inheritance_year': inheritance_year,
+		'inheritance_taxable_amount': inheritance_taxable_amount,
+		'inheritance_ira_amount': inheritance_ira_amount,
+	}
+
 _BRACKET_RATE_OPTIONS = {
 	'10%': 0.10, '12%': 0.12, '22%': 0.22, '24%': 0.24,
 	'32%': 0.32, '35%': 0.35, '37%': 0.37,
@@ -560,8 +591,8 @@ def _render_withdrawal_section(horizon):
 			period_start = int(period_end) + 1
 		rmd_start_age = st.number_input('RMD start age (person 1)', min_value=65, max_value=89, value=73, key='rmd_start_age')
 		rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73, key='rmd_start_age_spouse')
-		ending_balance_goal = st.number_input('Ending balance goal', value=1.0, min_value=0.0, step=50000.0, key='ending_balance_goal',
-			help='Success = ending portfolio ≥ this amount. Default $1 means simply not depleted.')
+		ending_balance_goal = st.number_input('Ending balance goal (legacy target)', value=1000000.0, min_value=0.0, step=50000.0, key='ending_balance_goal',
+			help='Success = ending portfolio ≥ this amount. Use this as your legacy target — money left in the portfolio avoids the tax drag of withdrawing and re-gifting. $1 = simply not depleted.')
 	return {
 		'withdrawal_schedule_inputs': withdrawal_schedule_inputs,
 		'rmd_start_age': rmd_start_age,
@@ -573,13 +604,12 @@ def _render_add_goals_section(horizon):
 	"""Render Additional Spending Goals expander. Returns list of (label, amount, begin, end, priority)."""
 	with st.expander('Additional Spending Goals'):
 		st.caption('Extra spending layered on top of base withdrawals (e.g. long-term care, travel, home repair)')
-		num_add_goals = st.number_input('Number of additional goals', value=2, min_value=0, max_value=10, step=1, key='num_add_goals')
+		num_add_goals = st.number_input('Number of additional goals', value=1, min_value=0, max_value=10, step=1, key='num_add_goals')
 		add_goal_inputs = []
 		# Defaults for goal 0: Long-term care in last 3 years; goal 1: Legacy in final year
 		_ltc_default_begin = max(1, horizon - 2)
 		_goal_defaults = {
 			0: {'label': 'Long-term care', 'amount': 100000.0, 'begin': _ltc_default_begin, 'end': horizon, 'priority': 'Flexible', 'cap': 50.0},
-			1: {'label': 'Legacy', 'amount': 1000000.0, 'begin': horizon, 'end': horizon, 'priority': 'Flexible', 'cap': 20.0},
 		}
 		for g in range(int(num_add_goals)):
 			st.markdown(f'**Goal {g+1}**')
@@ -801,6 +831,7 @@ def render_sidebar():
 		num_scenarios, scenario_overrides_ui = _render_scenario_section()
 		ages = _render_ages_section()
 		accounts = _render_accounts_section()
+		inheritance = _render_inheritance_section()
 		allocation = _render_allocation_section()
 		horizon = max(1, max(int(ages['life_expectancy_primary']) - int(ages['start_age']),
 							  int(ages['life_expectancy_spouse']) - int(ages['start_age_spouse'])) + 1)
@@ -818,6 +849,7 @@ def render_sidebar():
 		'scenario_overrides_ui': scenario_overrides_ui,
 		**ages,
 		**accounts,
+		**inheritance,
 		**allocation,
 		**withdrawals,
 		'add_goal_inputs': add_goal_inputs,

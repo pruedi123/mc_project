@@ -273,6 +273,10 @@ def main():
 	pension_buyout_income = inputs['pension_buyout_income']
 	pension_buyout_cola = inputs['pension_buyout_cola']
 	pension_buyout_survivor = inputs['pension_buyout_survivor']
+	inheritance_enabled = inputs['inheritance_enabled']
+	inheritance_year = inputs['inheritance_year']
+	inheritance_taxable_amount = inputs['inheritance_taxable_amount']
+	inheritance_ira_amount = inputs['inheritance_ira_amount']
 	taxes_enabled = inputs['taxes_enabled']
 	filing_status_key = inputs['filing_status_key']
 	use_itemized = inputs['use_itemized']
@@ -401,6 +405,10 @@ def main():
 		base_is_essential=bool(base_is_essential),
 		flex_capped_base_schedule=flex_capped_base_schedule if has_flex_caps else None,
 		flex_cap_max_schedule=flex_cap_max_schedule if has_flex_caps else None,
+		inheritance_enabled=bool(inheritance_enabled),
+		inheritance_year=int(inheritance_year),
+		inheritance_taxable_amount=float(inheritance_taxable_amount),
+		inheritance_ira_amount=float(inheritance_ira_amount),
 	)
 
 	# Compute stock/bond return parameters (needed for guardrails and scenario comparison)

@@ -907,7 +907,11 @@ def simulate_withdrawals(start_age_primary: int,
 						 flex_goal_min_pct: float = 0.5,
 						 base_is_essential: bool = False,
 						 flex_capped_base_schedule: Optional[Sequence[float]] = None,
-						 flex_cap_max_schedule: Optional[Sequence[float]] = None):
+						 flex_cap_max_schedule: Optional[Sequence[float]] = None,
+						 inheritance_enabled: bool = False,
+						 inheritance_year: int = 10,
+						 inheritance_taxable_amount: float = 0.0,
+						 inheritance_ira_amount: float = 0.0):
 	table = get_uniform_lifetime_table()
 
 	# assume taxable holds 50% stocks / 50% bonds
@@ -1021,6 +1025,8 @@ def simulate_withdrawals(start_age_primary: int,
 	primary_death_year = None
 	spouse_death_year = None
 	cap_loss_carryforward = 0.0
+	inh_ira_balance = 0.0
+	inh_ira_years_remaining = 10
 
 	for y in range(1, years+1):
 		age_p1 = start_age_primary + y - 1
@@ -1043,6 +1049,19 @@ def simulate_withdrawals(start_age_primary: int,
 			tda1_bonds_mv += tda2_bonds_mv
 			tda2_stocks_mv = 0.0
 			tda2_bonds_mv = 0.0
+
+		# Inheritance event: add inherited assets in the specified year
+		if inheritance_enabled and y == inheritance_year:
+			if inheritance_taxable_amount > 0:
+				add_stocks = inheritance_taxable_amount * target_stock_pct
+				add_bonds = inheritance_taxable_amount * (1 - target_stock_pct)
+				stocks_mv += add_stocks
+				bonds_mv += add_bonds
+				stocks_basis += add_stocks   # stepped-up basis = FMV
+				bonds_basis += add_bonds
+			if inheritance_ira_amount > 0:
+				inh_ira_balance = inheritance_ira_amount
+				inh_ira_years_remaining = 10
 
 		# rebalance at start of each year to target allocation with rounding
 		(stocks_mv, bonds_mv, stocks_basis, bonds_basis,
@@ -1231,6 +1250,15 @@ def simulate_withdrawals(start_age_primary: int,
 		stocks_mv = stocks_mv  # unchanged net of round trip
 		stocks_basis = stocks_basis - turnover_basis_sold + turnover_sale
 
+		# Inherited IRA: grow and compute forced distribution
+		inh_ira_distribution = 0.0
+		if inh_ira_balance > 0:
+			blended_return = stock_return_year * target_stock_pct + bond_return_year * (1 - target_stock_pct)
+			inh_ira_balance *= (1 + blended_return)
+			inh_ira_distribution = inh_ira_balance / max(1, inh_ira_years_remaining)
+			inh_ira_balance -= inh_ira_distribution
+			inh_ira_years_remaining -= 1
+
 		# capture portfolio growth before any withdrawals/RMDs/taxes
 		start_total_balance = start_stocks_mv + start_bonds_mv + start_tda + start_tda_spouse + start_roth
 		investable_start_total = start_total_balance - conversion_gross
@@ -1312,7 +1340,7 @@ def simulate_withdrawals(start_age_primary: int,
 		deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(filing_status_this_year)
 
 		# Snapshot mutable balances (post-growth, post-RMD) for iterative solve
-		total_rmd_cash = rmd_p1 + rmd_p2
+		total_rmd_cash = rmd_p1 + rmd_p2 + inh_ira_distribution
 		snap_balances = {
 			'stocks_mv': stocks_mv, 'bonds_mv': bonds_mv,
 			'stocks_basis': stocks_basis, 'bonds_basis': bonds_basis,
@@ -1405,6 +1433,8 @@ def simulate_withdrawals(start_age_primary: int,
 			'rmd_p1': rmd_p1,
 			'rmd_p2': rmd_p2,
 			'rmd_total': rmd_p1 + rmd_p2,
+			'inh_ira_distribution': inh_ira_distribution,
+			'inh_ira_balance': inh_ira_balance,
 			'withdraw_from_taxable_net': chosen['out_taxable_cash'],
 			'withdraw_from_tda': chosen['withdraw_from_tda'],
 			'withdraw_from_roth': chosen['withdraw_from_roth'],
