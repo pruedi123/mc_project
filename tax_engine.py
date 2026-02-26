@@ -123,6 +123,21 @@ def get_marginal_rates(taxable_ordinary: float, cap_gains: float, filing_status:
 
 	return marginal_ordinary, marginal_cg
 
+def bracket_ceiling(filing_status: str, target_rate: float) -> float:
+	"""Return the taxable income where the bracket at `target_rate` ends.
+
+	E.g. for MFJ 22% → 201050 (income above this enters the 24% bracket).
+	For the top rate (37%) returns float('inf').
+	"""
+	brackets = get_ordinary_brackets(filing_status)
+	for i, (start, rate) in enumerate(brackets):
+		if abs(rate - target_rate) < 1e-9:
+			if i + 1 < len(brackets):
+				return float(brackets[i + 1][0])
+			return float('inf')
+	raise ValueError(f"No bracket with rate {target_rate} for filing status '{filing_status}'")
+
+
 def compute_niit(agi: float, net_investment_income: float, filing_status: str) -> float:
 	"""Compute Net Investment Income Tax (3.8% surtax)."""
 	niit_threshold = 200000 if filing_status == 'single' else 250000

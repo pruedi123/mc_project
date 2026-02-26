@@ -11,7 +11,7 @@ from typing import Dict, Optional, Sequence
 
 from tax_engine import (get_standard_deduction, get_ordinary_brackets,
 	compute_taxable_social_security, apply_brackets, compute_capital_gains_tax,
-	get_marginal_rates, compute_niit, compute_state_tax)
+	get_marginal_rates, compute_niit, compute_state_tax, bracket_ceiling)
 
 # ── Data loading ────────────────────────────────────────────────
 
@@ -103,17 +103,20 @@ def get_all_historical_windows(years_needed: int):
 
 def get_uniform_lifetime_table():
 	"""Return a dict age -> distribution period (divisor) using the IRS Uniform Lifetime Table."""
+	# Updated IRS Uniform Lifetime Table (effective 2022, Publication 590-B)
 	table = {
-		70:27.4,71:26.5,72:25.6,73:24.7,74:23.8,75:22.9,76:22.0,77:21.2,78:20.3,79:19.5,
-		80:18.7,81:17.9,82:17.1,83:16.3,84:15.5,85:14.8,86:14.1,87:13.4,88:12.7,89:12.0,
-		90:11.4,91:10.8,92:10.2,93:9.6,94:9.1,95:8.6,96:8.1,97:7.6,98:7.1,99:6.7,100:6.3,
-		101:5.9,102:5.5,103:5.2,104:4.9,105:4.6,106:4.3,107:4.1,108:3.9,109:3.7,110:3.5,
-		111:3.3,112:3.1,113:2.9,114:2.7,115:2.5,116:2.3,117:2.1,118:1.9,119:1.7,120:1.5
+		72:27.4,73:26.5,74:25.5,75:24.6,76:23.7,77:22.9,78:22.0,79:21.1,
+		80:20.2,81:19.4,82:18.5,83:17.7,84:16.8,85:16.0,86:15.2,87:14.4,88:13.7,89:12.9,
+		90:12.2,91:11.5,92:10.8,93:10.1,94:9.5,95:8.9,96:8.4,97:7.8,98:7.3,99:6.8,100:6.4,
+		101:6.0,102:5.6,103:5.2,104:4.9,105:4.6,106:4.3,107:4.1,108:3.9,109:3.7,110:3.5,
+		111:3.4,112:3.3,113:3.1,114:3.0,115:2.9,116:2.8,117:2.7,118:2.5,119:2.3,120:2.0
 	}
 	return table
 
-def process_rmd(tda_stocks_mv: float, tda_bonds_mv: float, current_age: int, rmd_start_age: int, table):
-	"""Calculate and withdraw RMD for one person; returns updated balances plus rmd amount and divisor used."""
+def process_rmd(tda_stocks_mv: float, tda_bonds_mv: float, current_age: int, rmd_start_age: int, table, rmd_base: float = None):
+	"""Calculate and withdraw RMD for one person; returns updated balances plus rmd amount and divisor used.
+	rmd_base: prior year-end TDA balance used to compute the RMD amount.
+	          If None, uses current tda_stocks_mv + tda_bonds_mv (legacy behavior)."""
 	rmd = 0.0
 	divisor = None
 	if current_age >= rmd_start_age:
@@ -121,7 +124,8 @@ def process_rmd(tda_stocks_mv: float, tda_bonds_mv: float, current_age: int, rmd
 		if divisor is None:
 			divisor = max(1.0, 25.0 - (current_age - rmd_start_age))
 		total_tda_balance = tda_stocks_mv + tda_bonds_mv
-		rmd = total_tda_balance / divisor if divisor > 0 else 0.0
+		base = rmd_base if rmd_base is not None else total_tda_balance
+		rmd = base / divisor if divisor > 0 else 0.0
 		take_rmd = min(rmd, total_tda_balance)
 		tda_stock_ratio = (tda_stocks_mv / total_tda_balance) if total_tda_balance > 0 else 0.5
 		tda_stocks_mv -= take_rmd * tda_stock_ratio
@@ -141,11 +145,13 @@ def rebalance_accounts(target_stock_pct: float,
 	Priority for stocks: Roth first (tax-free growth), then taxable, then TDAs.
 	Priority for bonds: TDAs first (interest taxed as ordinary anyway), then taxable, then Roth.
 	TDAs and Roth can hold mixed allocations when needed to meet the household target.
+
+	Returns the 10-tuple of account balances/bases plus realized_gain from taxable trades.
 	"""
 	total_household = taxable_stock_mv + taxable_bond_mv + tda1_mv + tda2_mv + roth_mv
 	if total_household <= 0:
 		return (taxable_stock_mv, taxable_bond_mv, taxable_stock_basis, taxable_bond_basis,
-				0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+				0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 	desired_stock_total = total_household * target_stock_pct
 	desired_bond_total = total_household - desired_stock_total
@@ -181,24 +187,45 @@ def rebalance_accounts(target_stock_pct: float,
 	tda2_stock = tda_stock - tda1_stock
 	tda2_bond = tda2_mv - tda2_stock
 
-	# adjust taxable basis proportionally
-	taxable_basis_total = taxable_stock_basis + taxable_bond_basis
-	if taxable_stock + taxable_bond > 0 and taxable_basis_total > 0:
-		taxable_stock_basis = taxable_basis_total * (taxable_stock / (taxable_stock + taxable_bond))
-		taxable_bond_basis = taxable_basis_total - taxable_stock_basis
+	# Compute realized gains from taxable account rebalancing trades
+	realized_gain = 0.0
+	stock_sold = max(0.0, taxable_stock_mv - taxable_stock)
+	bond_sold = max(0.0, taxable_bond_mv - taxable_bond)
+	if stock_sold > 0 and taxable_stock_mv > 0:
+		basis_sold = taxable_stock_basis * (stock_sold / taxable_stock_mv)
+		realized_gain += max(0.0, stock_sold - basis_sold)
+		taxable_stock_basis -= basis_sold
+	if bond_sold > 0 and taxable_bond_mv > 0:
+		basis_sold = taxable_bond_basis * (bond_sold / taxable_bond_mv)
+		realized_gain += max(0.0, bond_sold - basis_sold)
+		taxable_bond_basis -= basis_sold
+
+	# Proceeds from sales are reinvested into the other asset at cost = market value
+	taxable_stock_basis += bond_sold   # bonds sold to buy stocks
+	taxable_bond_basis += stock_sold   # stocks sold to buy bonds
 
 	return (taxable_stock, taxable_bond, taxable_stock_basis, taxable_bond_basis,
-			tda1_stock, tda1_bond, tda2_stock, tda2_bond, roth_stock, roth_bond)
+			tda1_stock, tda1_bond, tda2_stock, tda2_bond, roth_stock, roth_bond, realized_gain)
 
 def compute_prioritized_target(scale_factor, base, flex_goals, essential_goals,
-							   flex_min_pct=0.5, base_is_essential=False):
+							   flex_min_pct=0.5, base_is_essential=False,
+							   flex_capped_base=0.0, flex_cap_max=None):
 	"""Map a single scale_factor to spending with prioritized cuts.
 	When scale < 1.0: cut flexible goals first (down to floor), then base.
-	When scale >= 1.0: scale base + flex equally (unchanged behavior).
+	When scale >= 1.0: scale base + flex equally; per-goal caps limit flex upside.
 	Essential goals are never scaled.
-	Monotonically non-decreasing in scale_factor (required for binary search)."""
+	Monotonically non-decreasing in scale_factor (required for binary search).
+	flex_capped_base: base amount of flex goals that have spending caps.
+	flex_cap_max: max allowed spending for those capped flex goals."""
 	if scale_factor >= 1.0:
-		return base * scale_factor + flex_goals * scale_factor + essential_goals
+		base_scaled = base * scale_factor
+		if flex_capped_base > 0 and flex_cap_max is not None:
+			flex_uncapped = flex_goals - flex_capped_base
+			capped_scaled = min(flex_capped_base * scale_factor, flex_cap_max)
+			flex_scaled = capped_scaled + flex_uncapped * scale_factor
+		else:
+			flex_scaled = flex_goals * scale_factor
+		return base_scaled + flex_scaled + essential_goals
 	# Cuts needed
 	scalable = base + flex_goals
 	if scalable <= 0:
@@ -218,7 +245,8 @@ def compute_prioritized_target(scale_factor, base, flex_goals, essential_goals,
 
 
 def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu, blended_sigma, n_sims=200, income_schedule=None, goal_schedule=None,
-						 flex_goal_schedule=None, flex_goal_min_pct=0.5, base_is_essential=False):
+						 flex_goal_schedule=None, flex_goal_min_pct=0.5, base_is_essential=False,
+						 flex_capped_base_schedule=None, flex_cap_max_schedule=None):
 	"""Fast vectorized MC to estimate probability portfolio survives the remaining schedule.
 	If goal_schedule is provided, only the base portion (schedule - goals) is scaled;
 	goals are added unscaled on top."""
@@ -236,7 +264,10 @@ def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu
 		essential = goal_schedule[y] if goal_schedule is not None and y < len(goal_schedule) else 0.0
 		flex = flex_goal_schedule[y] if flex_goal_schedule is not None and y < len(flex_goal_schedule) else 0.0
 		base = remaining_schedule[y] - essential - flex
-		target = compute_prioritized_target(scale_factor, base, flex, essential, flex_goal_min_pct, base_is_essential)
+		fcb = flex_capped_base_schedule[y] if flex_capped_base_schedule is not None and y < len(flex_capped_base_schedule) else 0.0
+		fcm = flex_cap_max_schedule[y] if flex_cap_max_schedule is not None and y < len(flex_cap_max_schedule) else None
+		target = compute_prioritized_target(scale_factor, base, flex, essential, flex_goal_min_pct, base_is_essential,
+			flex_capped_base=fcb, flex_cap_max=fcm)
 		net_draw = max(0.0, target - inc)
 		balances *= growth_factors[:, y]
 		balances -= net_draw
@@ -244,7 +275,8 @@ def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu
 	return float(np.mean(balances > 0))
 
 def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, blended_sigma, target_success=0.85, n_sims=200, tol=0.005, income_schedule=None, goal_schedule=None,
-								 flex_goal_schedule=None, flex_goal_min_pct=0.5, base_is_essential=False):
+								 flex_goal_schedule=None, flex_goal_min_pct=0.5, base_is_essential=False,
+								 flex_capped_base_schedule=None, flex_cap_max_schedule=None):
 	"""Binary search for the scaling factor on the remaining withdrawal schedule
 	that gives target_success survival rate.
 	If goal_schedule is provided, only the base portion is scaled; goals are unscaled."""
@@ -262,7 +294,10 @@ def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, ble
 			essential = goal_schedule[y] if goal_schedule is not None and y < len(goal_schedule) else 0.0
 			flex = flex_goal_schedule[y] if flex_goal_schedule is not None and y < len(flex_goal_schedule) else 0.0
 			base = remaining_schedule[y] - essential - flex
-			target = compute_prioritized_target(scale, base, flex, essential, flex_goal_min_pct, base_is_essential)
+			fcb = flex_capped_base_schedule[y] if flex_capped_base_schedule is not None and y < len(flex_capped_base_schedule) else 0.0
+			fcm = flex_cap_max_schedule[y] if flex_cap_max_schedule is not None and y < len(flex_cap_max_schedule) else None
+			target = compute_prioritized_target(scale, base, flex, essential, flex_goal_min_pct, base_is_essential,
+				flex_capped_base=fcb, flex_cap_max=fcm)
 			net_draw = max(0.0, target - inc)
 			balances *= growth_factors[:, y]
 			balances -= net_draw
@@ -342,18 +377,35 @@ def build_scenario_params(base_params: dict, overrides: dict, stock_mu: float = 
 			params['goal_schedule'] = [v * overrides['spend_scale'] for v in params['goal_schedule']]
 		if params.get('flex_goal_schedule'):
 			params['flex_goal_schedule'] = [v * overrides['spend_scale'] for v in params['flex_goal_schedule']]
+		if params.get('flex_capped_base_schedule'):
+			params['flex_capped_base_schedule'] = [v * overrides['spend_scale'] for v in params['flex_capped_base_schedule']]
+		if params.get('flex_cap_max_schedule'):
+			params['flex_cap_max_schedule'] = [v * overrides['spend_scale'] for v in params['flex_cap_max_schedule']]
 	elif 'spend_flat' in overrides:
 		params['withdrawal_schedule'] = [overrides['spend_flat']] * len(params['withdrawal_schedule'])
 		params['goal_schedule'] = None  # flat override replaces everything, no goal distinction
 		params['flex_goal_schedule'] = None
+		params['flex_capped_base_schedule'] = None
+		params['flex_cap_max_schedule'] = None
 	if 'target_stock_pct' in overrides:
 		params['target_stock_pct'] = overrides['target_stock_pct']
 		if params.get('guardrails_enabled'):
 			pct = overrides['target_stock_pct']
 			params['blended_mu'] = pct * stock_mu + (1 - pct) * bond_mu
 			params['blended_sigma'] = pct * stock_sigma + (1 - pct) * bond_sigma
+	if 'roth_conversion_mode' in overrides:
+		mode = overrides['roth_conversion_mode']
+		if mode == 'None':
+			params['roth_conversion_mode'] = 'none'
+			params['roth_conversion_years'] = 0
+		elif mode == 'Fixed amount':
+			params['roth_conversion_mode'] = 'fixed'
+		elif mode == 'Fill to bracket':
+			params['roth_conversion_mode'] = 'bracket_fill'
 	if 'roth_conversion_amount' in overrides:
 		params['roth_conversion_amount'] = overrides['roth_conversion_amount']
+	if 'roth_bracket_fill_rate' in overrides:
+		params['roth_bracket_fill_rate'] = overrides['roth_bracket_fill_rate']
 	if 'roth_conversion_years' in overrides:
 		params['roth_conversion_years'] = overrides['roth_conversion_years']
 	if 'annuity_purchase' in overrides:
@@ -415,13 +467,20 @@ def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) ->
 		parts.append(f"Spend ${overrides['spend_flat']:,.0f}")
 	if 'target_stock_pct' in overrides:
 		parts.append(f"{overrides['target_stock_pct'] * 100:.0f}% stocks")
-	if 'roth_conversion_amount' in overrides:
-		amt = overrides['roth_conversion_amount']
+	if 'roth_conversion_mode' in overrides or 'roth_conversion_amount' in overrides:
+		mode = overrides.get('roth_conversion_mode', base_params.get('roth_conversion_mode', 'fixed'))
 		yrs = overrides.get('roth_conversion_years', base_params.get('roth_conversion_years', 0))
-		if amt == 0 or yrs == 0:
+		if mode == 'None' or yrs == 0:
 			parts.append("No Roth conv")
+		elif mode == 'Fill to bracket':
+			rate = overrides.get('roth_bracket_fill_rate', base_params.get('roth_bracket_fill_rate', 0.22))
+			parts.append(f"Roth fill\u2192{rate*100:.0f}% x {yrs}yr")
 		else:
-			parts.append(f"Roth ${amt / 1000:.0f}k x {yrs}yr")
+			amt = overrides.get('roth_conversion_amount', base_params.get('roth_conversion_amount', 0))
+			if amt == 0:
+				parts.append("No Roth conv")
+			else:
+				parts.append(f"Roth ${amt / 1000:.0f}k x {yrs}yr")
 	if 'annuity_purchase' in overrides:
 		purchase = overrides['annuity_purchase']
 		income = overrides.get('annuity_annual_income', 0)
@@ -532,6 +591,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 	interest = year_income['interest']
 	div = year_income['div']
 	turnover_realized_gain = year_income['turnover_realized_gain']
+	rebalance_realized_gain = year_income.get('rebalance_realized_gain', 0.0)
 	ss_income = year_income['ss_income']
 	pension_income = year_income['pension_nominal']
 	pension_income_real = year_income['pension_real']
@@ -559,15 +619,14 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 		rmd_excess = total_rmd_cash - gross_target
 		total_mv = s_mv + b_mv
 		if total_mv > 0:
-			s_mv += rmd_excess * (s_mv / total_mv)
-			b_mv += rmd_excess * (b_mv / total_mv)
-			total_basis = s_basis + b_basis
-			if total_basis > 0:
-				s_basis += rmd_excess * (s_basis / total_basis)
-				b_basis += rmd_excess * (b_basis / total_basis)
-			else:
-				s_basis += rmd_excess * 0.5
-				b_basis += rmd_excess * 0.5
+			stock_frac = s_mv / total_mv
+			s_reinvest = rmd_excess * stock_frac
+			b_reinvest = rmd_excess * (1 - stock_frac)
+			s_mv += s_reinvest
+			b_mv += b_reinvest
+			# New purchases have basis = amount invested
+			s_basis += s_reinvest
+			b_basis += b_reinvest
 		else:
 			s_mv += rmd_excess * 0.5
 			b_mv += rmd_excess * 0.5
@@ -581,7 +640,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 	if remaining > 0 and b_mv > 0:
 		take = min(remaining, b_mv)
 		basis_sold = take * (b_basis / b_mv) if b_mv > 0 else 0.0
-		realized_gains += max(0.0, take - basis_sold)
+		realized_gains += take - basis_sold
 		sold_bonds += take
 		b_mv -= take
 		b_basis -= basis_sold
@@ -591,7 +650,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 	if remaining > 1e-8 and s_mv > 0:
 		take = min(remaining, s_mv)
 		basis_sold = take * (s_basis / s_mv) if s_mv > 0 else 0.0
-		realized_gains += max(0.0, take - basis_sold)
+		realized_gains += take - basis_sold
 		sold_stocks += take
 		s_mv -= take
 		s_basis -= basis_sold
@@ -626,20 +685,34 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 		remaining -= take
 
 	# Full tax computation
-	ordinary_pre_ss_base = interest + w_tda + pension_income + annuity_income + other_income
+	cap_loss_cf = year_income.get('cap_loss_carryforward', 0.0)
+	ordinary_pre_ss_base = interest + w_tda + pension_income_real + annuity_income_real + other_income
 	ordinary_pre_ss_with_conv = ordinary_pre_ss_base + pending_roth_conversion
-	cg_total = div + turnover_realized_gain + realized_gains
+	raw_cg = div + turnover_realized_gain + rebalance_realized_gain + realized_gains
+	# Apply capital loss carryforward against gains
+	net_cg = raw_cg - cap_loss_cf
+	if net_cg >= 0:
+		cg_total = net_cg
+		cap_loss_deduction = 0.0
+		cap_loss_cf_out = 0.0
+	else:
+		# Net loss: offset up to $3,000 against ordinary income, carry rest forward
+		cg_total = 0.0
+		cap_loss_deduction = min(3000.0, -net_cg)
+		cap_loss_cf_out = -net_cg - cap_loss_deduction
+	ordinary_pre_ss_base -= cap_loss_deduction
+	ordinary_pre_ss_with_conv -= cap_loss_deduction
 
 	if taxes_enabled:
 		# With conversion
-		t_ss = compute_taxable_social_security(ss_income, ordinary_pre_ss_with_conv, cg_total, filing_status_this_year)
+		t_ss = compute_taxable_social_security(ss_income, max(0.0, ordinary_pre_ss_with_conv), cg_total, filing_status_this_year)
 		t_ordinary = max(0.0, ordinary_pre_ss_with_conv + t_ss - deduction)
 		ord_tax = apply_brackets(t_ordinary, get_ordinary_brackets(filing_status_this_year))
 		cg_tax = compute_capital_gains_tax(t_ordinary, cg_total, filing_status_this_year)
 		total_tax = ord_tax + cg_tax
 
 		# Without conversion (for delta — include state tax so conversion cost is accurate)
-		t_ss_nc = compute_taxable_social_security(ss_income, ordinary_pre_ss_base, cg_total, filing_status_this_year)
+		t_ss_nc = compute_taxable_social_security(ss_income, max(0.0, ordinary_pre_ss_base), cg_total, filing_status_this_year)
 		t_ordinary_nc = max(0.0, ordinary_pre_ss_base + t_ss_nc - deduction)
 		ord_tax_nc = apply_brackets(t_ordinary_nc, get_ordinary_brackets(filing_status_this_year))
 		cg_tax_nc = compute_capital_gains_tax(t_ordinary_nc, cg_total, filing_status_this_year)
@@ -687,22 +760,41 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 		s_tax = 0.0
 		marg_ord = 0.0
 		marg_cg = 0.0
+		cap_loss_cf_out = cap_loss_cf  # no tax, just pass through
 
 	# Roth conversion tax payment
 	conv_net_to_roth = 0.0
 	if pending_roth_conversion > 0:
 		if roth_conversion_tax_source == 'taxable' and taxes_enabled:
 			tax_to_pay = conv_tax_delta
+			conv_sale_gain = 0.0
+			# Sell bonds first, then stocks to cover conversion tax
 			pay_b = min(tax_to_pay, b_mv)
 			if pay_b > 0 and b_mv > 0:
-				b_basis -= pay_b * (b_basis / b_mv)
+				basis_sold = pay_b * (b_basis / b_mv)
+				conv_sale_gain += max(0.0, pay_b - basis_sold)
+				b_basis -= basis_sold
 				b_mv -= pay_b
 			rem_tax = tax_to_pay - pay_b
 			pay_s = min(rem_tax, s_mv)
 			if pay_s > 0 and s_mv > 0:
-				s_basis -= pay_s * (s_basis / s_mv)
+				basis_sold = pay_s * (s_basis / s_mv)
+				conv_sale_gain += max(0.0, pay_s - basis_sold)
+				s_basis -= basis_sold
 				s_mv -= pay_s
 			rem_tax -= pay_s
+			# Recompute taxes with the additional realized gains from the sales
+			if conv_sale_gain > 0:
+				cg_total_updated = cg_total + conv_sale_gain
+				t_ss2 = compute_taxable_social_security(ss_income, ordinary_pre_ss_with_conv, cg_total_updated, filing_status_this_year)
+				t_ordinary2 = max(0.0, ordinary_pre_ss_with_conv + t_ss2 - deduction)
+				ord_tax2 = apply_brackets(t_ordinary2, get_ordinary_brackets(filing_status_this_year))
+				cg_tax2 = compute_capital_gains_tax(t_ordinary2, cg_total_updated, filing_status_this_year)
+				niit2 = compute_niit(ordinary_pre_ss_with_conv + t_ss2 + cg_total_updated,
+									max(0.0, cg_total_updated + interest), filing_status_this_year)
+				s_tax2 = compute_state_tax(t_ordinary2, cg_total_updated, interest, state_tax_rate, state_exempt_retirement)
+				total_tax = ord_tax2 + cg_tax2 + niit2 + s_tax2
+				cg_total = cg_total_updated
 			conv_net_to_roth = max(0.0, pending_roth_conversion - rem_tax)
 		elif not taxes_enabled:
 			conv_net_to_roth = pending_roth_conversion
@@ -714,7 +806,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 	nst = (
 		rmd_excess * marg_ord
 		+ max(0.0, interest) * marg_ord
-		+ (div + turnover_realized_gain) * marg_cg
+		+ (div + turnover_realized_gain + rebalance_realized_gain) * marg_cg
 	)
 	nst = max(0.0, min(nst, total_tax - conv_tax_delta))
 
@@ -738,6 +830,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 		'cap_gains_total': cg_total, 'cap_gains_tax': cg_tax,
 		'niit_tax': niit, 'state_tax': s_tax, 'total_taxes': total_tax,
 		'roth_conversion_tax_delta': conv_tax_delta,
+		'cap_loss_carryforward_out': cap_loss_cf_out,
 		'non_spending_tax': nst,
 		'marginal_ordinary_rate': marg_ord, 'marginal_cg_rate': marg_cg,
 		'net_spending': net_spending,
@@ -789,6 +882,8 @@ def simulate_withdrawals(start_age_primary: int,
 						 roth_conversion_tax_source: str = 'taxable',
 						 roth_conversion_years: int = 0,
 						 roth_conversion_source: str = 'person1',
+						 roth_conversion_mode: str = 'fixed',
+						 roth_bracket_fill_rate: float = 0.22,
 						 ss_start_age_p1: int = 67,
 						 ss_start_age_p2: int = 67,
 						 state_tax_rate: float = 0.0,
@@ -810,7 +905,9 @@ def simulate_withdrawals(start_age_primary: int,
 						 goal_schedule: Optional[Sequence[float]] = None,
 						 flex_goal_schedule: Optional[Sequence[float]] = None,
 						 flex_goal_min_pct: float = 0.5,
-						 base_is_essential: bool = False):
+						 base_is_essential: bool = False,
+						 flex_capped_base_schedule: Optional[Sequence[float]] = None,
+						 flex_cap_max_schedule: Optional[Sequence[float]] = None):
 	table = get_uniform_lifetime_table()
 
 	# assume taxable holds 50% stocks / 50% bonds
@@ -830,7 +927,7 @@ def simulate_withdrawals(start_age_primary: int,
 	roth_total = float(roth_start)
 
 	(stocks_mv, bonds_mv, stocks_basis, bonds_basis,
-		tda1_stocks_mv, tda1_bonds_mv, tda2_stocks_mv, tda2_bonds_mv, roth_stocks_mv, roth_bonds_mv) = rebalance_accounts(
+		tda1_stocks_mv, tda1_bonds_mv, tda2_stocks_mv, tda2_bonds_mv, roth_stocks_mv, roth_bonds_mv, _) = rebalance_accounts(
 		target_stock_pct,
 		stocks_mv, bonds_mv, stocks_basis, bonds_basis,
 		tda1_total, tda2_total, roth_total
@@ -855,9 +952,13 @@ def simulate_withdrawals(start_age_primary: int,
 		if p1_alive and p2_alive:
 			yr_ss = (ss_b1 if age_p1 >= ss_start_age_p1 else 0.0) + (ss_b2 if age_p2 >= ss_start_age_p2 else 0.0)
 		elif p1_alive:
-			yr_ss = max(ss_b1, ss_b2) if age_p1 >= ss_start_age_p1 else 0.0
+			own = ss_b1 if age_p1 >= ss_start_age_p1 else 0.0
+			surv = ss_b2 if age_p1 >= 60 else 0.0
+			yr_ss = max(own, surv)
 		elif p2_alive:
-			yr_ss = max(ss_b1, ss_b2) if age_p2 >= ss_start_age_p2 else 0.0
+			own = ss_b2 if age_p2 >= ss_start_age_p2 else 0.0
+			surv = ss_b1 if age_p2 >= 60 else 0.0
+			yr_ss = max(own, surv)
 		else:
 			yr_ss = 0.0
 		pen_p1_nom = pension_income_annual * ((1 + pension_cola_p1) ** (y - 1))
@@ -898,7 +999,9 @@ def simulate_withdrawals(start_age_primary: int,
 			guardrail_target, guardrail_inner_sims, income_schedule=income_schedule,
 			goal_schedule=list(goal_schedule) if goal_schedule else None,
 			flex_goal_schedule=list(flex_goal_schedule) if flex_goal_schedule else None,
-			flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential)
+			flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential,
+			flex_capped_base_schedule=list(flex_capped_base_schedule) if flex_capped_base_schedule else None,
+			flex_cap_max_schedule=list(flex_cap_max_schedule) if flex_cap_max_schedule else None)
 		# Apply max spending cap to scale factor
 		if guardrail_max_spending_pct >= 0:
 			max_scale = 1.0 + guardrail_max_spending_pct / 100.0
@@ -914,11 +1017,20 @@ def simulate_withdrawals(start_age_primary: int,
 		'roth_conversion_tax_source': roth_conversion_tax_source,
 	}
 
+	# Track year of death for qualifying surviving spouse filing status
+	primary_death_year = None
+	spouse_death_year = None
+	cap_loss_carryforward = 0.0
+
 	for y in range(1, years+1):
 		age_p1 = start_age_primary + y - 1
 		age_p2 = start_age_spouse + y - 1
 		primary_alive = age_p1 <= life_expectancy_primary
 		spouse_alive = age_p2 <= life_expectancy_spouse
+		if not primary_alive and primary_death_year is None:
+			primary_death_year = y
+		if not spouse_alive and spouse_death_year is None:
+			spouse_death_year = y
 
 		# Inherited IRA rollover: merge deceased spouse's TDA into survivor's
 		if not primary_alive and (tda1_stocks_mv + tda1_bonds_mv) > 0 and spouse_alive:
@@ -934,7 +1046,7 @@ def simulate_withdrawals(start_age_primary: int,
 
 		# rebalance at start of each year to target allocation with rounding
 		(stocks_mv, bonds_mv, stocks_basis, bonds_basis,
-			tda1_stocks_mv, tda1_bonds_mv, tda2_stocks_mv, tda2_bonds_mv, roth_stocks_mv, roth_bonds_mv) = rebalance_accounts(
+			tda1_stocks_mv, tda1_bonds_mv, tda2_stocks_mv, tda2_bonds_mv, roth_stocks_mv, roth_bonds_mv, rebalance_realized_gain) = rebalance_accounts(
 			target_stock_pct,
 			stocks_mv, bonds_mv, stocks_basis, bonds_basis,
 			tda1_stocks_mv + tda1_bonds_mv,
@@ -951,19 +1063,23 @@ def simulate_withdrawals(start_age_primary: int,
 			remaining_income = income_schedule[y-1:]
 			remaining_goals = list(goal_schedule[y-1:]) if goal_schedule else None
 			remaining_flex_goals = list(flex_goal_schedule[y-1:]) if flex_goal_schedule else None
+			remaining_fcb = list(flex_capped_base_schedule[y-1:]) if flex_capped_base_schedule else None
+			remaining_fcm = list(flex_cap_max_schedule[y-1:]) if flex_cap_max_schedule else None
 			if len(remaining_schedule) > 1 and total_portfolio_now > 0:
 				sr = forward_success_rate(total_portfolio_now, remaining_schedule,
 					current_scale_factor, blended_mu, blended_sigma, guardrail_inner_sims,
 					income_schedule=remaining_income, goal_schedule=remaining_goals,
 					flex_goal_schedule=remaining_flex_goals,
-					flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential)
+					flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential,
+					flex_capped_base_schedule=remaining_fcb, flex_cap_max_schedule=remaining_fcm)
 				if sr < guardrail_lower or sr > guardrail_upper:
 					current_scale_factor = find_sustainable_scale_factor(
 						total_portfolio_now, remaining_schedule, blended_mu, blended_sigma,
 						guardrail_target, guardrail_inner_sims, income_schedule=remaining_income,
 						goal_schedule=remaining_goals,
 						flex_goal_schedule=remaining_flex_goals,
-						flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential)
+						flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential,
+						flex_capped_base_schedule=remaining_fcb, flex_cap_max_schedule=remaining_fcm)
 					# Apply max spending cap to scale factor
 					if guardrail_max_spending_pct >= 0:
 						max_scale = 1.0 + guardrail_max_spending_pct / 100.0
@@ -978,14 +1094,87 @@ def simulate_withdrawals(start_age_primary: int,
 		start_roth = roth_stocks_mv + roth_bonds_mv
 
 		# apply Roth conversion at start of year before growth
-		if y <= roth_conversion_years:
+		if y <= roth_conversion_years and roth_conversion_mode != 'none':
 			if roth_conversion_source == 'person1' and primary_alive:
 				src_stocks, src_bonds = tda1_stocks_mv, tda1_bonds_mv
 			elif roth_conversion_source == 'person2' and spouse_alive:
 				src_stocks, src_bonds = tda2_stocks_mv, tda2_bonds_mv
 			else:
 				src_stocks, src_bonds = 0.0, 0.0
-			conversion_gross = min(roth_conversion_amount, src_stocks + src_bonds)
+			src_available = src_stocks + src_bonds
+			if roth_conversion_mode == 'bracket_fill' and src_available > 0:
+				# Estimate non-conversion ordinary taxable income for this year
+				# Use pre-growth TDA balances for RMD estimate
+				est_rmd_p1 = 0.0
+				if primary_alive and age_p1 >= rmd_start_age:
+					est_tda1 = tda1_stocks_mv + tda1_bonds_mv
+					_div_p1 = table.get(age_p1)
+					if _div_p1 is None:
+						_div_p1 = max(1.0, 25.0 - (age_p1 - rmd_start_age))
+					est_rmd_p1 = est_tda1 / _div_p1 if _div_p1 > 0 else 0.0
+				est_rmd_p2 = 0.0
+				if spouse_alive and age_p2 >= rmd_start_age_spouse:
+					est_tda2 = tda2_stocks_mv + tda2_bonds_mv
+					_div_p2 = table.get(age_p2)
+					if _div_p2 is None:
+						_div_p2 = max(1.0, 25.0 - (age_p2 - rmd_start_age_spouse))
+					est_rmd_p2 = est_tda2 / _div_p2 if _div_p2 > 0 else 0.0
+				est_rmd = est_rmd_p1 + est_rmd_p2
+				# Estimate filing status (qualifying surviving spouse for 2 years after death)
+				est_filing = filing_status
+				if filing_status == 'mfj' and (not spouse_alive or not primary_alive):
+					death_yr = primary_death_year if not primary_alive else spouse_death_year
+					if death_yr is not None and y <= death_yr + 2:
+						est_filing = 'mfj'
+					else:
+						est_filing = 'single'
+				# Estimate SS income (conservative: assume 85% taxable)
+				est_ss_b1 = ss_income_annual * ((1 + ss_cola) ** (y - 1))
+				est_ss_b2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1))
+				if primary_alive and spouse_alive:
+					est_ss = (est_ss_b1 if age_p1 >= ss_start_age_p1 else 0.0) + (est_ss_b2 if age_p2 >= ss_start_age_p2 else 0.0)
+				elif primary_alive:
+					_own = est_ss_b1 if age_p1 >= ss_start_age_p1 else 0.0
+					_surv = est_ss_b2 if age_p1 >= 60 else 0.0
+					est_ss = max(_own, _surv)
+				elif spouse_alive:
+					_own = est_ss_b2 if age_p2 >= ss_start_age_p2 else 0.0
+					_surv = est_ss_b1 if age_p2 >= 60 else 0.0
+					est_ss = max(_own, _surv)
+				else:
+					est_ss = 0.0
+				est_ss_taxable = est_ss * 0.85
+				# Estimate pension
+				est_pen_p1 = pension_income_annual * ((1 + pension_cola_p1) ** (y - 1))
+				est_pen_p2 = pension_income_spouse_annual * ((1 + pension_cola_p2) ** (y - 1))
+				if primary_alive and spouse_alive:
+					est_pension = est_pen_p1 + est_pen_p2
+				elif primary_alive:
+					est_pension = est_pen_p1 + est_pen_p2 * pension_survivor_pct_p2
+				elif spouse_alive:
+					est_pension = est_pen_p2 + est_pen_p1 * pension_survivor_pct_p1
+				else:
+					est_pension = 0.0
+				# Estimate annuity
+				est_annuity = 0.0
+				if y >= annuity_start_year:
+					_ann_yrs = y - annuity_start_year
+					_ann_p1 = annuity_income_p1 * ((1 + annuity_cola_p1) ** _ann_yrs)
+					_ann_p2 = annuity_income_p2 * ((1 + annuity_cola_p2) ** _ann_yrs)
+					if primary_alive and spouse_alive:
+						est_annuity = _ann_p1 + _ann_p2
+					elif primary_alive:
+						est_annuity = _ann_p1 + _ann_p2 * annuity_survivor_pct_p2
+					elif spouse_alive:
+						est_annuity = _ann_p2 + _ann_p1 * annuity_survivor_pct_p1
+				est_ordinary = est_rmd + est_ss_taxable + est_pension + est_annuity + other_income_annual
+				est_deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(est_filing)
+				est_taxable = max(0.0, est_ordinary - est_deduction)
+				ceiling = bracket_ceiling(est_filing, roth_bracket_fill_rate)
+				room = max(0.0, ceiling - est_taxable)
+				conversion_gross = min(room, src_available)
+			else:
+				conversion_gross = min(roth_conversion_amount, src_available)
 		else:
 			conversion_gross = 0.0
 		if conversion_gross > 0:
@@ -1000,6 +1189,10 @@ def simulate_withdrawals(start_age_primary: int,
 			pending_roth_conversion = conversion_gross
 		else:
 			pending_roth_conversion = 0.0
+
+		# Capture pre-growth TDA balances for RMD computation (prior year-end basis)
+		rmd_base_p1 = tda1_stocks_mv + tda1_bonds_mv
+		rmd_base_p2 = tda2_stocks_mv + tda2_bonds_mv
 
 		stock_return_year = stock_return_series[y-1] if stock_return_series is not None else stock_total_return
 		bond_return_year = bond_return_series[y-1] if bond_return_series is not None else bond_return
@@ -1049,20 +1242,24 @@ def simulate_withdrawals(start_age_primary: int,
 
 		# compute RMD for each spouse if applicable
 		if primary_alive:
-			tda1_stocks_mv, tda1_bonds_mv, rmd_p1, divisor_p1 = process_rmd(tda1_stocks_mv, tda1_bonds_mv, age_p1, rmd_start_age, table)
+			tda1_stocks_mv, tda1_bonds_mv, rmd_p1, divisor_p1 = process_rmd(tda1_stocks_mv, tda1_bonds_mv, age_p1, rmd_start_age, table, rmd_base=rmd_base_p1)
 		else:
 			rmd_p1 = 0.0
 			divisor_p1 = None
 		if spouse_alive:
-			tda2_stocks_mv, tda2_bonds_mv, rmd_p2, divisor_p2 = process_rmd(tda2_stocks_mv, tda2_bonds_mv, age_p2, rmd_start_age_spouse, table)
+			tda2_stocks_mv, tda2_bonds_mv, rmd_p2, divisor_p2 = process_rmd(tda2_stocks_mv, tda2_bonds_mv, age_p2, rmd_start_age_spouse, table, rmd_base=rmd_base_p2)
 		else:
 			rmd_p2 = 0.0
 			divisor_p2 = None
 
-		# Determine filing status and income for this year (needed by tax solve)
+		# Determine filing status: MFJ in death year + 2 more years (qualifying surviving spouse)
 		filing_status_this_year = filing_status
 		if filing_status == 'mfj' and (not spouse_alive or not primary_alive):
-			filing_status_this_year = 'single'
+			death_yr = primary_death_year if not primary_alive else spouse_death_year
+			if death_yr is not None and y <= death_yr + 2:
+				filing_status_this_year = 'mfj'  # qualifying surviving spouse uses MFJ rates
+			else:
+				filing_status_this_year = 'single'
 		# SS with start ages and survivor benefit rules
 		ss_benefit_p1 = ss_income_annual * ((1 + ss_cola) ** (y - 1))
 		ss_benefit_p2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1))
@@ -1071,10 +1268,14 @@ def simulate_withdrawals(start_age_primary: int,
 			ss_income_p2 = ss_benefit_p2 if age_p2 >= ss_start_age_p2 else 0.0
 			ss_income = ss_income_p1 + ss_income_p2
 		elif primary_alive and not spouse_alive:
-			# Survivor gets the higher of own or deceased spouse's benefit
-			ss_income = max(ss_benefit_p1, ss_benefit_p2) if age_p1 >= ss_start_age_p1 else 0.0
+			# Survivor gets own benefit (if started) OR deceased's benefit (available at 60), whichever is higher
+			own_benefit = ss_benefit_p1 if age_p1 >= ss_start_age_p1 else 0.0
+			survivor_benefit = ss_benefit_p2 if age_p1 >= 60 else 0.0
+			ss_income = max(own_benefit, survivor_benefit)
 		elif spouse_alive and not primary_alive:
-			ss_income = max(ss_benefit_p1, ss_benefit_p2) if age_p2 >= ss_start_age_p2 else 0.0
+			own_benefit = ss_benefit_p2 if age_p2 >= ss_start_age_p2 else 0.0
+			survivor_benefit = ss_benefit_p1 if age_p2 >= 60 else 0.0
+			ss_income = max(own_benefit, survivor_benefit)
 		else:
 			ss_income = 0.0
 		pen_nom_p1 = pension_income_annual * ((1 + pension_cola_p1) ** (y - 1))
@@ -1123,6 +1324,7 @@ def simulate_withdrawals(start_age_primary: int,
 		year_income = {
 			'interest': interest, 'div': div,
 			'turnover_realized_gain': turnover_realized_gain,
+			'rebalance_realized_gain': rebalance_realized_gain,
 			'ss_income': ss_income,
 			'pension_nominal': pension_income, 'pension_real': pension_income_real,
 			'annuity_nominal': annuity_income_yr, 'annuity_real': annuity_income_real,
@@ -1130,6 +1332,7 @@ def simulate_withdrawals(start_age_primary: int,
 			'deduction': deduction,
 			'filing_status': filing_status_this_year,
 			'pending_roth_conversion': pending_roth_conversion,
+			'cap_loss_carryforward': cap_loss_carryforward,
 		}
 
 		# Binary search: find gross withdrawal that delivers the net spending target
@@ -1138,8 +1341,11 @@ def simulate_withdrawals(start_age_primary: int,
 		essential_this_year = goal_schedule[y-1] if goal_schedule and y-1 < len(goal_schedule) else 0.0
 		flex_this_year = flex_goal_schedule[y-1] if flex_goal_schedule and y-1 < len(flex_goal_schedule) else 0.0
 		base_this_year = combined_this_year - essential_this_year - flex_this_year
+		fcb_this_year = flex_capped_base_schedule[y-1] if flex_capped_base_schedule and y-1 < len(flex_capped_base_schedule) else 0.0
+		fcm_this_year = flex_cap_max_schedule[y-1] if flex_cap_max_schedule and y-1 < len(flex_cap_max_schedule) else None
 		net_target = compute_prioritized_target(current_scale_factor, base_this_year, flex_this_year,
-			essential_this_year, flex_goal_min_pct, base_is_essential)
+			essential_this_year, flex_goal_min_pct, base_is_essential,
+			flex_capped_base=fcb_this_year, flex_cap_max=fcm_this_year)
 
 		base_net, base_result = try_gross_withdrawal(0.0, snap_balances, year_income, tax_cfg)
 
@@ -1178,6 +1384,7 @@ def simulate_withdrawals(start_age_primary: int,
 		tda2_bonds_mv = chosen['tda2_bonds']
 		roth_stocks_mv = chosen['roth_stocks']
 		roth_bonds_mv = chosen['roth_bonds']
+		cap_loss_carryforward = chosen.get('cap_loss_carryforward_out', 0.0)
 
 		actual_portfolio_return = (investment_return_dollars / investable_start_total) if investable_start_total > 0 else 0.0
 		rows.append({

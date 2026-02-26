@@ -17,8 +17,8 @@ _SAVEABLE_KEYS = [
 	'start_age', 'start_age_spouse', 'life_expectancy_primary', 'life_expectancy_spouse',
 	'taxable_start', 'taxable_stock_basis_pct', 'taxable_bond_basis_pct',
 	'roth_start', 'tda_start', 'tda_spouse_start',
-	'target_stock_pct', 'roth_conversion_amount', 'roth_conversion_years',
-	'roth_conversion_source_tda', 'roth_conversion_tax_source',
+	'target_stock_pct', 'roth_conversion_mode', 'roth_conversion_amount', 'roth_conversion_years',
+	'roth_conversion_source_tda', 'roth_conversion_tax_source', 'roth_bracket_fill_rate',
 	'num_withdrawal_periods',
 	'rmd_start_age', 'rmd_start_age_spouse', 'ending_balance_goal', 'num_add_goals',
 	'ss_income', 'ss_start_age_p1', 'ss_income_spouse', 'ss_start_age_p2', 'ss_cola',
@@ -97,6 +97,7 @@ def _save_inputs_to_json(client: str, name: str):
 			'begin': st.session_state.get(f'add_goal_begin_{g}', 1),
 			'end': st.session_state.get(f'add_goal_end_{g}', 1),
 			'priority': st.session_state.get(f'add_goal_priority_{g}', 'Need'),
+			'cap': st.session_state.get(f'add_goal_cap_{g}', -1.0),
 		})
 	data['add_goals'] = add_goals
 	# Save scenario override UI keys (dynamic)
@@ -106,7 +107,8 @@ def _save_inputs_to_json(client: str, name: str):
 		for s_idx in range(2, n_sc + 1):
 			sc_data = {}
 			for suffix in ['spend_mode', 'spend_scale', 'spend_flat', 'stock_chk', 'stock',
-							'roth_chk', 'roth_amt', 'roth_yrs', 'annuity_chk', 'ann_purchase',
+							'roth_chk', 'roth_mode', 'roth_amt', 'roth_yrs', 'roth_bracket',
+							'annuity_chk', 'ann_purchase',
 							'ann_income', 'ann_cola', 'ann_person', 'ann_surv', 'ann_start',
 							'buyout_chk', 'buyout_choice', 'buyout_person', 'buyout_lump',
 							'buyout_income', 'buyout_cola', 'buyout_surv']:
@@ -190,6 +192,7 @@ def _load_inputs_from_json(client: str, name: str):
 			if raw_priority == 'Need': raw_priority = 'Essential'
 			elif raw_priority == 'Want': raw_priority = 'Flexible'
 			st.session_state[f'add_goal_priority_{g}'] = raw_priority
+			st.session_state[f'add_goal_cap_{g}'] = goal.get('cap', -1.0)
 	# Restore scenario overrides
 	if 'scenario_overrides' in data:
 		for s_idx_str, sc_data in data['scenario_overrides'].items():
@@ -333,14 +336,26 @@ def _render_scenario_section():
 						0, 100, 60, 5, key=f'sc_stock_{i}') / 100.0
 				roth_chk = st.checkbox(f'S{i} override Roth conversions', key=f'sc_roth_chk_{i}',
 					help='Test a different Roth conversion strategy for this scenario. '
-					'Set amount to 0 and years to 0 for no conversions.')
+					'Set to None for no conversions.')
 				if roth_chk:
-					sc_overrides['roth_conversion_amount'] = st.number_input(f'S{i} annual Roth conversion',
-						value=0.0, step=10000.0, key=f'sc_roth_amt_{i}',
-						help='Amount converted from TDA to Roth each year. Taxed as ordinary income in the year of conversion.')
-					sc_overrides['roth_conversion_years'] = int(st.number_input(f'S{i} conversion years',
-						value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}',
-						help='Number of years to perform conversions, starting from year 1 of the simulation.'))
+					sc_roth_mode = st.radio(f'S{i} Roth mode',
+						['None', 'Fixed amount', 'Fill to bracket'],
+						horizontal=True, key=f'sc_roth_mode_{i}')
+					sc_overrides['roth_conversion_mode'] = sc_roth_mode
+					if sc_roth_mode == 'Fixed amount':
+						sc_overrides['roth_conversion_amount'] = st.number_input(f'S{i} annual Roth conversion',
+							value=0.0, step=10000.0, key=f'sc_roth_amt_{i}',
+							help='Amount converted from TDA to Roth each year. Taxed as ordinary income in the year of conversion.')
+					elif sc_roth_mode == 'Fill to bracket':
+						sc_bracket_label = st.selectbox(f'S{i} fill up to bracket',
+							list(_BRACKET_RATE_OPTIONS.keys()), index=2, key=f'sc_roth_bracket_{i}')
+						sc_overrides['roth_bracket_fill_rate'] = _BRACKET_RATE_OPTIONS[sc_bracket_label]
+					if sc_roth_mode != 'None':
+						sc_overrides['roth_conversion_years'] = int(st.number_input(f'S{i} conversion years',
+							value=0, min_value=0, max_value=100, key=f'sc_roth_yrs_{i}',
+							help='Number of years to perform conversions, starting from year 1 of the simulation.'))
+					else:
+						sc_overrides['roth_conversion_years'] = 0
 				annuity_chk = st.checkbox(f'S{i} buy annuity (from taxable)', key=f'sc_annuity_chk_{i}',
 					help='Purchase an annuity using money from the taxable account. '
 					'Reduces taxable balance and adds an income stream.')
@@ -421,17 +436,42 @@ def _render_accounts_section():
 		'tda_spouse_start': tda_spouse_start,
 	}
 
+_BRACKET_RATE_OPTIONS = {
+	'10%': 0.10, '12%': 0.12, '22%': 0.22, '24%': 0.24,
+	'32%': 0.32, '35%': 0.35, '37%': 0.37,
+}
+
 def _render_allocation_section():
 	"""Render Allocation & Roth Conversions expander. Returns dict of allocation values."""
 	with st.expander('Allocation & Roth Conversions'):
 		target_stock_pct = st.slider('Household target % in stocks', min_value=0, max_value=100, value=60, step=10, key='target_stock_pct') / 100.0
-		roth_conversion_amount = st.number_input('Annual Roth conversion amount (from TDA)', value=0.0, step=1000.0, key='roth_conversion_amount')
-		roth_conversion_years = st.number_input('Years to perform conversions', value=0, min_value=0, max_value=100, step=1, key='roth_conversion_years')
-		roth_conversion_source_tda = st.radio('Convert from', ['Person 1 TDA', 'Person 2 TDA'], horizontal=True, key='roth_conversion_source_tda')
-		roth_conversion_tax_source = st.radio('Pay conversion taxes from', ['Taxable', 'TDA (reduce net conversion)'], horizontal=False, key='roth_conversion_tax_source')
+		roth_conversion_mode = st.radio('Roth conversion mode',
+			['None', 'Fixed amount', 'Fill to bracket'],
+			horizontal=True, key='roth_conversion_mode',
+			help='None = no conversions. Fixed = convert a set dollar amount each year. '
+			'Fill to bracket = automatically convert enough to fill up to a chosen tax bracket ceiling.')
+		roth_conversion_amount = 0.0
+		roth_bracket_fill_rate = 0.22
+		if roth_conversion_mode == 'Fixed amount':
+			roth_conversion_amount = st.number_input('Annual Roth conversion amount (from TDA)', value=0.0, step=1000.0, key='roth_conversion_amount')
+		elif roth_conversion_mode == 'Fill to bracket':
+			bracket_label = st.selectbox('Fill up to bracket',
+				list(_BRACKET_RATE_OPTIONS.keys()), index=2, key='roth_bracket_fill_rate',
+				help='Convert enough each year to fill taxable income up to the top of this bracket.')
+			roth_bracket_fill_rate = _BRACKET_RATE_OPTIONS[bracket_label]
+		if roth_conversion_mode != 'None':
+			roth_conversion_years = st.number_input('Years to perform conversions', value=0, min_value=0, max_value=100, step=1, key='roth_conversion_years')
+			roth_conversion_source_tda = st.radio('Convert from', ['Person 1 TDA', 'Person 2 TDA'], horizontal=True, key='roth_conversion_source_tda')
+			roth_conversion_tax_source = st.radio('Pay conversion taxes from', ['Taxable', 'TDA (reduce net conversion)'], horizontal=False, key='roth_conversion_tax_source')
+		else:
+			roth_conversion_years = 0
+			roth_conversion_source_tda = 'Person 1 TDA'
+			roth_conversion_tax_source = 'Taxable'
 	return {
 		'target_stock_pct': target_stock_pct,
+		'roth_conversion_mode': roth_conversion_mode,
 		'roth_conversion_amount': roth_conversion_amount,
+		'roth_bracket_fill_rate': roth_bracket_fill_rate,
 		'roth_conversion_years': roth_conversion_years,
 		'roth_conversion_source_tda': roth_conversion_source_tda,
 		'roth_conversion_tax_source': roth_conversion_tax_source,
@@ -490,7 +530,11 @@ def _render_add_goals_section(horizon):
 			g_end = st.number_input(f'Goal {g+1} end year', value=gd['end'], min_value=1, max_value=horizon, step=1, key=f'add_goal_end_{g}')
 			g_priority = st.selectbox(f'Goal {g+1} priority', ['Essential', 'Flexible'], index=0, key=f'add_goal_priority_{g}',
 				help='Essential = funded at full target even if markets are down; Flexible = adjusted with base spending when portfolio is under pressure')
-			add_goal_inputs.append((g_label, float(g_amount), int(g_begin), int(g_end), g_priority))
+			g_cap = st.number_input(f'Goal {g+1} spending cap (% above target, -1=no cap)',
+				value=-1.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
+				help='Cap how much this goal can increase in good markets. 0 = never exceed target. 50 = up to 150% of target. -1 = no cap (unlimited).',
+				key=f'add_goal_cap_{g}')
+			add_goal_inputs.append((g_label, float(g_amount), int(g_begin), int(g_end), g_priority, float(g_cap)))
 	return add_goal_inputs
 
 def _render_income_section():

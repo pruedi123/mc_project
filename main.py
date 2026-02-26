@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+import matplotlib.pyplot as plt
 
 from sim_engine import (
 	PP_FACTORS, compute_run_pp_factors, load_master_global, load_bond_factors,
@@ -37,6 +38,122 @@ def interactive_line_chart(data_df, y_title='Value', fmt='$,.0f', height=400, ze
 	chart = (lines + points + rules).properties(height=height).interactive()
 	st.altair_chart(chart, use_container_width=True)
 
+_OUTCOME_CFG = [
+	(0,   'Worst case',    'Markets tank'),
+	(10,  'Below average', 'Weak markets'),
+	(25,  'Modest',        'Slower growth'),
+	(50,  'Typical',       'Most likely'),
+	(75,  'Above average', 'Good markets'),
+	(100, 'Best case',     'Strong markets'),
+]
+_BAR_COLORS = ['#94a3b8', '#7cafc8', '#5bb8c0', '#3bbfb0', '#2ec4a0', '#22c990']
+
+def _spending_outcomes_chart(data_series, target=None, currency_fmt='${:,.0f}'):
+	"""Horizontal bar chart: compressed x-axis, gradient colors, red target line, two-line labels."""
+	plt.rcParams['font.family'] = 'sans-serif'
+	values = [float(np.percentile(data_series, p)) for p, _, _ in _OUTCOME_CFG]
+	labels = [lbl for _, lbl, _ in _OUTCOME_CFG]
+	subs = [sub for _, _, sub in _OUTCOME_CFG]
+	n = len(values)
+	y_pos = list(range(n))
+
+	fig, ax = plt.subplots(figsize=(4, 1.8), dpi=100)
+	fig.patch.set_facecolor('white')
+	ax.set_facecolor('white')
+
+	# Compressed x-axis: start near the min so differences are visually meaningful
+	val_min, val_max = min(values), max(values)
+	val_range = val_max - val_min if val_max > val_min else val_max * 0.1
+	x_min = val_min - val_range * 0.4
+	if target and target > 0:
+		x_min = min(x_min, target - val_range * 0.4)
+	x_max = val_max + val_range * 0.5  # room for value labels
+
+	# Draw bars starting from x_min (left edge)
+	bar_widths = [v - x_min for v in values]
+	bar_height = 0.52
+	ax.barh(y_pos, bar_widths, left=x_min, height=bar_height, color=_BAR_COLORS,
+			edgecolor='none', zorder=2, linewidth=0)
+
+	# Remove all spines and gridlines
+	for spine in ax.spines.values():
+		spine.set_visible(False)
+	ax.grid(False)
+
+	# Value labels just outside each bar
+	for i, v in enumerate(values):
+		ax.text(v + val_range * 0.04, i, currency_fmt.format(v),
+				va='center', ha='left', fontsize=5, fontweight='bold', color='#334155')
+
+	# Y-axis: bold label + lighter gray subtitle
+	ax.set_yticks(y_pos)
+	ax.set_yticklabels([''] * n)
+	for i, (lbl, sub) in enumerate(zip(labels, subs)):
+		ax.text(x_min - val_range * 0.03, i - 0.13, lbl, va='center', ha='right',
+				fontsize=5, fontweight='bold', color='#1e293b')
+		ax.text(x_min - val_range * 0.03, i + 0.18, sub, va='center', ha='right',
+				fontsize=4, color='#94a3b8')
+
+	# Red dashed target line with label above the chart
+	if target and target > 0:
+		ax.axvline(x=target, color='#ef4444', linestyle='--', linewidth=1.2, zorder=3)
+		target_k = target / 1000
+		target_label = f'Your ${target_k:.0f}K target' if target_k == int(target_k) else f'Your ${target_k:,.1f}K target'
+		ax.text(target, -0.6, target_label, va='bottom', ha='center',
+				fontsize=5, color='#ef4444', fontweight='bold')
+
+	ax.set_xlim(x_min, x_max)
+	ax.xaxis.set_visible(False)
+	ax.tick_params(left=False)
+	ax.invert_yaxis()
+	fig.subplots_adjust(left=0.18, right=0.90, top=0.92, bottom=0.02)
+	st.pyplot(fig, use_container_width=False)
+	plt.close(fig)
+
+def _three_card_summary(data_series, target, currency_fmt='${:,.0f}'):
+	"""3-card layout: Income Floor / Likely Lifestyle / Strong Markets with styled cards."""
+	floor_val = float(np.percentile(data_series, 0))
+	typical_val = float(np.percentile(data_series, 50))
+	strong_val = float(np.percentile(data_series, 90))
+
+	def _pct_vs_target(val):
+		if target and target > 0:
+			diff = (val / target - 1) * 100
+			if diff >= 0:
+				return f'<span style="color:#16a34a;font-size:0.85em;">+{diff:.0f}% vs target</span>'
+			else:
+				return f'<span style="color:#dc2626;font-size:0.85em;">{diff:.0f}% vs target</span>'
+		return ''
+
+	def _card_colors(val):
+		if target and target > 0 and val >= target:
+			return '#b8860b', '#fdf6e3'  # warm beige: at/above target
+		return '#ef4444', '#fef2f2'      # red/pink: below target
+
+	cards = [
+		{'icon': '\U0001f6e1\ufe0f', 'title': 'Income Floor', 'val': floor_val,
+		 'sub': 'Worst case across all runs', 'border': _card_colors(floor_val)[0], 'bg': _card_colors(floor_val)[1]},
+		{'icon': '\U0001f3af', 'title': 'Likely Lifestyle', 'val': typical_val,
+		 'sub': 'Median outcome', 'border': _card_colors(typical_val)[0], 'bg': _card_colors(typical_val)[1]},
+		{'icon': '\U0001f680', 'title': 'Strong Markets', 'val': strong_val,
+		 'sub': '90th percentile upside', 'border': _card_colors(strong_val)[0], 'bg': _card_colors(strong_val)[1]},
+	]
+
+	cols = st.columns([1, 1, 1, 3])
+	for col, card in zip(cols[:3], cards):
+		pct_line = _pct_vs_target(card['val'])
+		col.markdown(
+			f'<div style="border:1px solid {card["border"]}; border-left:4px solid {card["border"]}; '
+			f'border-radius:8px; padding:16px 14px; background:{card["bg"]}; text-align:center;">'
+			f'<div style="font-size:1.5em; margin-bottom:4px;">{card["icon"]}</div>'
+			f'<div style="font-weight:600; color:#374151; margin-bottom:2px;">{card["title"]}</div>'
+			f'<div style="font-size:1.6em; font-weight:700; color:#111827;">{currency_fmt.format(card["val"])}</div>'
+			f'{pct_line}'
+			f'<div style="color:#6b7280; font-size:0.82em; margin-top:4px;">{card["sub"]}</div>'
+			f'</div>',
+			unsafe_allow_html=True,
+		)
+
 def main():
 	st.title('Withdrawal + RMD Simulator (30-year)')
 
@@ -62,7 +179,9 @@ def main():
 	tda_start = inputs['tda_start']
 	tda_spouse_start = inputs['tda_spouse_start']
 	target_stock_pct = inputs['target_stock_pct']
+	roth_conversion_mode_ui = inputs['roth_conversion_mode']
 	roth_conversion_amount = inputs['roth_conversion_amount']
+	roth_bracket_fill_rate = inputs['roth_bracket_fill_rate']
 	roth_conversion_years = inputs['roth_conversion_years']
 	roth_conversion_source_tda = inputs['roth_conversion_source_tda']
 	roth_conversion_tax_source = inputs['roth_conversion_tax_source']
@@ -146,7 +265,11 @@ def main():
 	# "Want" goals are added to base (scaled by guardrails)
 	goal_schedule = [0.0] * years
 	flex_goal_schedule = [0.0] * years
-	for g_label, g_amount, g_begin, g_end, g_priority in add_goal_inputs:
+	flex_capped_base_schedule = [0.0] * years
+	flex_cap_max_schedule = [0.0] * years
+	has_flex_caps = False
+	for g_label, g_amount, g_begin, g_end, g_priority, *g_rest in add_goal_inputs:
+		g_cap = g_rest[0] if g_rest else -1.0
 		if g_amount > 0:
 			for y_idx in range(g_begin - 1, min(g_end, years)):
 				withdrawal_schedule[y_idx] += g_amount
@@ -154,6 +277,10 @@ def main():
 					goal_schedule[y_idx] += g_amount
 				elif g_priority == 'Flexible':
 					flex_goal_schedule[y_idx] += g_amount
+					if g_cap >= 0:
+						has_flex_caps = True
+						flex_capped_base_schedule[y_idx] += g_amount
+						flex_cap_max_schedule[y_idx] += g_amount * (1.0 + g_cap / 100.0)
 	withdraw_amount = withdrawal_schedule[0]  # for backward-compat references
 	st.session_state['_add_goal_inputs'] = add_goal_inputs
 	st.session_state['_base_withdrawal_schedule'] = base_withdrawal_schedule
@@ -189,6 +316,8 @@ def main():
 		roth_conversion_years=int(roth_conversion_years),
 		roth_conversion_tax_source='taxable' if roth_conversion_tax_source == 'Taxable' else 'tda',
 		roth_conversion_source='person1' if roth_conversion_source_tda == 'Person 1 TDA' else 'person2',
+		roth_conversion_mode={'None': 'none', 'Fixed amount': 'fixed', 'Fill to bracket': 'bracket_fill'}[roth_conversion_mode_ui],
+		roth_bracket_fill_rate=float(roth_bracket_fill_rate),
 		ss_start_age_p1=int(ss_start_age_p1),
 		ss_start_age_p2=int(ss_start_age_p2),
 		state_tax_rate=float(state_tax_rate),
@@ -206,6 +335,8 @@ def main():
 		flex_goal_schedule=flex_goal_schedule if any(g > 0 for g in flex_goal_schedule) else None,
 		flex_goal_min_pct=float(flex_goal_min_pct),
 		base_is_essential=bool(base_is_essential),
+		flex_capped_base_schedule=flex_capped_base_schedule if has_flex_caps else None,
+		flex_cap_max_schedule=flex_cap_max_schedule if has_flex_caps else None,
 	)
 
 	# Compute stock/bond return parameters (needed for guardrails and scenario comparison)
@@ -225,7 +356,19 @@ def main():
 		bond_sigma = float(np.std(bond_log_returns))
 	if guardrails_enabled:
 		blended_mu = target_stock_pct * stock_mu + (1 - target_stock_pct) * bond_mu
-		blended_sigma = target_stock_pct * stock_sigma + (1 - target_stock_pct) * bond_sigma
+		if return_mode != 'Simulated (lognormal)':
+			# Compute sigma from actual blended portfolio log returns — captures real correlation
+			n = min(len(stock_log_rets), len(bond_log_returns))
+			blended_log_rets = target_stock_pct * stock_log_rets[:n] + (1 - target_stock_pct) * bond_log_returns[:n]
+			blended_sigma = float(np.std(blended_log_rets))
+		else:
+			# No raw return series available; use variance formula with assumed correlation
+			rho = 0.10
+			w_s, w_b = target_stock_pct, 1 - target_stock_pct
+			blended_sigma = float(np.sqrt(
+				(w_s * stock_sigma) ** 2 + (w_b * bond_sigma) ** 2
+				+ 2 * w_s * w_b * stock_sigma * bond_sigma * rho
+			))
 		sim_params['blended_mu'] = blended_mu
 		sim_params['blended_sigma'] = blended_sigma
 	else:
@@ -492,26 +635,6 @@ def main():
 
 	if sim_mode in ('simulated', 'historical_dist') and 'mc_percentile_rows' in st.session_state:
 		pct_rows = st.session_state['mc_percentile_rows']
-		percentile_df = pd.DataFrame(pct_rows)
-		st.subheader('Distribution summary')
-		num_sims = st.session_state.get('num_sims', 0)
-		if sim_mode == 'historical_dist':
-			st.caption(f'{num_sims} historical periods')
-		else:
-			st.caption(f'{num_sims} simulations')
-		st.dataframe(percentile_df.style.format({
-			'percentile': lambda x: f"{int(x)}th",
-			'after_tax_end': currency_fmt,
-			'total_taxes': currency_fmt,
-			'effective_tax_rate': '{:.2%}'.format,
-			'portfolio_cagr': '{:.2%}'.format,
-			'roth_cagr': '{:.2%}'.format,
-		}))
-		ending_goal = float(st.session_state.get('ending_balance_goal', 1.0))
-		pct_non_positive = st.session_state.get('mc_pct_non_positive', 0.0)
-		success_rate = (1.0 - pct_non_positive) * 100
-		st.metric('Success rate (ending portfolio ≥ goal)', f"{success_rate:.1f}%")
-		st.caption(f"Ending balance goal: {currency_fmt.format(ending_goal)}  —  {pct_non_positive * 100:.1f}% of runs fell short")
 
 		all_yearly = st.session_state['mc_all_yearly']
 
@@ -521,73 +644,47 @@ def main():
 		_base_schedule = st.session_state.get('_base_withdrawal_schedule', [])
 		_combined_schedule = st.session_state.get('_withdrawal_schedule', [])
 		if _base_schedule and _combined_schedule:
-			# Compute base proportion of combined target for each year
-			def _base_pct(yr):
-				if yr < 1 or yr > len(_combined_schedule):
-					return 1.0
-				total = _combined_schedule[yr - 1]
-				return _base_schedule[yr - 1] / total if total > 0 else 1.0
-			all_yearly['base_after_tax_spending'] = (
-				all_yearly['after_tax_spending'] * all_yearly['year'].map(_base_pct))
-			all_yearly['base_withdrawal_used'] = (
-				all_yearly['withdrawal_used'] * all_yearly['year'].map(_base_pct))
-
+			# Allocate actual spending to goals, capping each at its max contribution.
+			# Essential goals: capped at target (never scale up).
+			# Flexible goals with cap: capped at target * (1 + cap/100).
+			# Flexible goals without cap: proportional (no ceiling).
+			# Base gets the remainder.
+			goal_spending_cols = []
+			goal_wd_cols = []
 			for gi, (g_label, g_amount, g_begin, g_end, *_gx) in enumerate(_active_goals):
+				g_priority = _gx[0] if _gx else 'Essential'
+				g_cap = _gx[1] if len(_gx) > 1 else -1.0
+				# Determine per-year ceiling for this goal's after-tax share
+				if g_priority in ('Essential', 'Need'):
+					goal_ceiling = g_amount  # essential: never exceeds target
+				elif g_cap >= 0:
+					goal_ceiling = g_amount * (1.0 + g_cap / 100.0)
+				else:
+					goal_ceiling = None  # no ceiling
 				def _goal_pct(yr, _amt=g_amount, _bg=g_begin, _ed=g_end):
 					if yr < 1 or yr > len(_combined_schedule):
 						return 0.0
 					if _bg <= yr <= _ed and _combined_schedule[yr - 1] > 0:
 						return _amt / _combined_schedule[yr - 1]
 					return 0.0
-				all_yearly[f'goal_{gi}_after_tax_spending'] = (
+				col_sp = f'goal_{gi}_after_tax_spending'
+				col_wd = f'goal_{gi}_withdrawal_used'
+				all_yearly[col_sp] = (
 					all_yearly['after_tax_spending'] * all_yearly['year'].map(_goal_pct))
-				all_yearly[f'goal_{gi}_withdrawal_used'] = (
+				all_yearly[col_wd] = (
 					all_yearly['withdrawal_used'] * all_yearly['year'].map(_goal_pct))
+				if goal_ceiling is not None:
+					all_yearly[col_sp] = all_yearly[col_sp].clip(upper=goal_ceiling)
+					all_yearly[col_wd] = all_yearly[col_wd].clip(upper=goal_ceiling)
+				goal_spending_cols.append(col_sp)
+				goal_wd_cols.append(col_wd)
+			# Base = total minus all goal allocations
+			all_yearly['base_after_tax_spending'] = (
+				all_yearly['after_tax_spending'] - all_yearly[goal_spending_cols].sum(axis=1)).clip(lower=0)
+			all_yearly['base_withdrawal_used'] = (
+				all_yearly['withdrawal_used'] - all_yearly[goal_wd_cols].sum(axis=1)).clip(lower=0)
 
-		# ── Additional spending goal analysis ──
-		if _active_goals and _combined_schedule:
-			st.subheader('Spending Goal Breakdown')
-			goal_summary_rows = []
-			for gi, (g_label, g_amount, g_begin, g_end, *_gx) in enumerate(_active_goals):
-				num_years = g_end - g_begin + 1
-				total_goal_cost = g_amount * num_years
-				col_name = f'goal_{gi}_after_tax_spending'
-				if col_name in all_yearly.columns:
-					# Per-run total spending on this goal
-					goal_year_data = all_yearly[all_yearly['year'].between(g_begin, g_end)]
-					run_goal_totals = goal_year_data.groupby('run')[col_name].sum()
-					# Fully funded = run's total goal spending >= target cost (within 0.5% tolerance)
-					pct_fully_funded = min(float((run_goal_totals >= total_goal_cost * 0.995).mean()) * 100, 100.0)
-					median_annual = float(goal_year_data[col_name].median()) if not goal_year_data.empty else 0.0
-				else:
-					pct_fully_funded = 0.0
-					median_annual = 0.0
-				g_priority = _gx[0] if _gx else 'Need'
-				goal_summary_rows.append({
-					'Goal': g_label or f'Goal {gi + 1}',
-					'Priority': g_priority,
-					'Target/Year': currency_fmt.format(g_amount),
-					'Years': f'{g_begin}–{g_end} ({num_years} yrs)',
-					'Total Target': currency_fmt.format(total_goal_cost),
-					'Median Actual/Year': currency_fmt.format(median_annual),
-					'% Fully Funded': f'{pct_fully_funded:.0f}%',
-				})
-			if goal_summary_rows:
-				st.dataframe(pd.DataFrame(goal_summary_rows), hide_index=True)
-
-		run_ending_portfolios = all_yearly.groupby('run')['total_portfolio'].last()
-		target_ending_value = st.number_input('Explore: chance of ending above...', value=ending_goal, step=50000.0, key='target_ending_val')
-		pct_at_or_above = float((run_ending_portfolios >= target_ending_value).mean()) * 100
-		st.metric('Chance of ending with at least this amount', f"{pct_at_or_above:.1f}%")
-		spending_pivot = all_yearly.pivot(index='year', columns='run', values='after_tax_spending')
-		spending_pivot.columns = [f'Run {c}' for c in spending_pivot.columns]
-		spending_csv = spending_pivot.to_csv()
-		st.download_button('Download after-tax spending (all runs) as CSV', spending_csv, file_name='after_tax_spending_all_runs.csv', mime='text/csv')
-
-		# Per-run spending summary: total and average annual spending across the retirement period
-		st.subheader('Lifetime spending distribution (per run)')
-
-		# Combined (total) spending distribution
+		# Compute spending percentiles (used by PDF report and scenario comparison)
 		run_spending = all_yearly.groupby('run').agg(
 			total_withdrawal_used=('withdrawal_used', 'sum'),
 			total_after_tax_spending=('after_tax_spending', 'sum'),
@@ -595,9 +692,8 @@ def main():
 		)
 		run_spending['avg_annual_withdrawal'] = run_spending['total_withdrawal_used'] / run_spending['years_in_run']
 		run_spending['avg_annual_after_tax_spending'] = run_spending['total_after_tax_spending'] / run_spending['years_in_run']
-		spending_pctiles = [0, 10, 25, 50, 75, 90, 100]
 		spending_pct_rows = []
-		for p in spending_pctiles:
+		for p in [0, 10, 25, 50, 75, 90, 100]:
 			spending_pct_rows.append({
 				'percentile': p,
 				'avg_annual_withdrawal': np.percentile(run_spending['avg_annual_withdrawal'], p),
@@ -605,33 +701,13 @@ def main():
 				'total_lifetime_withdrawal': np.percentile(run_spending['total_withdrawal_used'], p),
 				'total_lifetime_after_tax_spending': np.percentile(run_spending['total_after_tax_spending'], p),
 			})
-		spending_pct_df = pd.DataFrame(spending_pct_rows)
 		st.session_state['mc_spending_pct_rows'] = spending_pct_rows
 
 		has_goal_breakdown = 'base_after_tax_spending' in all_yearly.columns and _active_goals
 
+		# Base spending cards (always shown)
+		spending_pctiles = [0, 10, 25, 50, 75, 90, 100]
 		if has_goal_breakdown:
-			st.caption('**Combined (base + all goals)**')
-		sched = sim_params.get('withdrawal_schedule', [])
-		base_avg_wd = np.mean(sched) if sched else 0
-		if base_avg_wd > 0:
-			median_avg_spending = np.percentile(run_spending['avg_annual_after_tax_spending'], 50)
-			pct_above = (median_avg_spending / base_avg_wd - 1) * 100
-			direction = 'above' if pct_above >= 0 else 'below'
-			st.caption(f'After-tax spending target: {currency_fmt.format(base_avg_wd)} | '
-					   f'Median avg annual after-tax spending: {currency_fmt.format(median_avg_spending)} '
-					   f'({abs(pct_above):.1f}% {direction} target)')
-		st.dataframe(spending_pct_df.style.format({
-			'percentile': lambda x: f"{int(x)}th",
-			'avg_annual_withdrawal': currency_fmt,
-			'avg_annual_after_tax_spending': currency_fmt,
-			'total_lifetime_withdrawal': currency_fmt,
-			'total_lifetime_after_tax_spending': currency_fmt,
-		}))
-
-		# Base withdrawal spending (excludes additional goals)
-		if has_goal_breakdown:
-			st.caption('**Base withdrawals only** (excluding additional goals)')
 			run_base = all_yearly.groupby('run').agg(
 				total_base_wd=('base_withdrawal_used', 'sum'),
 				total_base_spending=('base_after_tax_spending', 'sum'),
@@ -639,32 +715,48 @@ def main():
 			)
 			run_base['avg_annual_base_wd'] = run_base['total_base_wd'] / run_base['years_in_run']
 			run_base['avg_annual_base_spending'] = run_base['total_base_spending'] / run_base['years_in_run']
-			base_pct_rows = []
-			for p in spending_pctiles:
-				base_pct_rows.append({
-					'percentile': p,
-					'avg_annual_withdrawal': np.percentile(run_base['avg_annual_base_wd'], p),
-					'avg_annual_after_tax_spending': np.percentile(run_base['avg_annual_base_spending'], p),
-					'total_lifetime_withdrawal': np.percentile(run_base['total_base_wd'], p),
-					'total_lifetime_after_tax_spending': np.percentile(run_base['total_base_spending'], p),
-				})
 			base_sched_avg = np.mean(_base_schedule) if _base_schedule else 0
-			if base_sched_avg > 0:
-				median_base_spending = np.percentile(run_base['avg_annual_base_spending'], 50)
-				pct_above_base = (median_base_spending / base_sched_avg - 1) * 100
-				direction_base = 'above' if pct_above_base >= 0 else 'below'
-				st.caption(f'Base target: {currency_fmt.format(base_sched_avg)} | '
-						   f'Median avg annual: {currency_fmt.format(median_base_spending)} '
-						   f'({abs(pct_above_base):.1f}% {direction_base} target)')
-			st.dataframe(pd.DataFrame(base_pct_rows).style.format({
-				'percentile': lambda x: f"{int(x)}th",
-				'avg_annual_withdrawal': currency_fmt,
-				'avg_annual_after_tax_spending': currency_fmt,
-				'total_lifetime_withdrawal': currency_fmt,
-				'total_lifetime_after_tax_spending': currency_fmt,
-			}))
+			base_spending_series = run_base['avg_annual_base_spending']
+		else:
+			sched = sim_params.get('withdrawal_schedule', [])
+			base_sched_avg = np.mean(sched) if sched else 0
+			base_spending_series = run_spending['avg_annual_after_tax_spending']
 
-			# Per-goal spending distribution
+		base_target_str = currency_fmt.format(base_sched_avg) if base_sched_avg > 0 else ''
+		if base_target_str:
+			st.markdown(f'#### Base spending — {base_target_str}/yr target')
+		else:
+			st.markdown('#### Base spending')
+		_three_card_summary(base_spending_series, base_sched_avg, currency_fmt)
+		if st.checkbox('Show detailed table', value=False, key='show_base_table'):
+			if has_goal_breakdown:
+				base_pct_rows = []
+				for p in spending_pctiles:
+					base_pct_rows.append({
+						'percentile': p,
+						'avg_annual_withdrawal': np.percentile(run_base['avg_annual_base_wd'], p),
+						'avg_annual_after_tax_spending': np.percentile(run_base['avg_annual_base_spending'], p),
+						'total_lifetime_withdrawal': np.percentile(run_base['total_base_wd'], p),
+						'total_lifetime_after_tax_spending': np.percentile(run_base['total_base_spending'], p),
+					})
+				st.dataframe(pd.DataFrame(base_pct_rows).style.format({
+					'percentile': lambda x: f"{int(x)}th",
+					'avg_annual_withdrawal': currency_fmt,
+					'avg_annual_after_tax_spending': currency_fmt,
+					'total_lifetime_withdrawal': currency_fmt,
+					'total_lifetime_after_tax_spending': currency_fmt,
+				}))
+			else:
+				st.dataframe(pd.DataFrame(spending_pct_rows).style.format({
+					'percentile': lambda x: f"{int(x)}th",
+					'avg_annual_withdrawal': currency_fmt,
+					'avg_annual_after_tax_spending': currency_fmt,
+					'total_lifetime_withdrawal': currency_fmt,
+					'total_lifetime_after_tax_spending': currency_fmt,
+				}))
+
+		# Per-goal spending (only when additional goals are active)
+		if has_goal_breakdown and st.checkbox('Show per-goal spending breakdown', value=True, key='show_per_goal_cards'):
 			for gi, (g_label, g_amount, g_begin, g_end, *_gx) in enumerate(_active_goals):
 				col_spending = f'goal_{gi}_after_tax_spending'
 				col_wd = f'goal_{gi}_withdrawal_used'
@@ -672,8 +764,7 @@ def main():
 					continue
 				num_years = g_end - g_begin + 1
 				goal_name = g_label or f'Goal {gi + 1}'
-				st.caption(f'**{goal_name}** — {currency_fmt.format(g_amount)}/yr, years {g_begin}–{g_end} ({num_years} yrs)')
-				# Only look at the goal's active years for per-year stats
+				st.markdown(f'#### {goal_name} — {currency_fmt.format(g_amount)}/yr, years {g_begin}–{g_end} ({num_years} yrs)')
 				goal_years = all_yearly[all_yearly['year'].between(g_begin, g_end)]
 				if goal_years.empty:
 					continue
@@ -684,22 +775,35 @@ def main():
 				)
 				run_goal['avg_annual_goal_wd'] = run_goal['total_goal_wd'] / run_goal['years_in_goal']
 				run_goal['avg_annual_goal_spending'] = run_goal['total_goal_spending'] / run_goal['years_in_goal']
-				goal_pct_rows = []
-				for p in spending_pctiles:
-					goal_pct_rows.append({
-						'percentile': p,
-						'avg_annual_gross': np.percentile(run_goal['avg_annual_goal_wd'], p),
-						'avg_annual_after_tax': np.percentile(run_goal['avg_annual_goal_spending'], p),
-						f'total_gross ({num_years} yrs)': np.percentile(run_goal['total_goal_wd'], p),
-						f'total_after_tax ({num_years} yrs)': np.percentile(run_goal['total_goal_spending'], p),
-					})
-				st.dataframe(pd.DataFrame(goal_pct_rows).style.format({
-					'percentile': lambda x: f"{int(x)}th",
-					'avg_annual_gross': currency_fmt,
-					'avg_annual_after_tax': currency_fmt,
-					f'total_gross ({num_years} yrs)': currency_fmt,
-					f'total_after_tax ({num_years} yrs)': currency_fmt,
-				}))
+				_three_card_summary(run_goal['avg_annual_goal_spending'],
+									 g_amount, currency_fmt)
+				if st.checkbox('Show detailed table', value=False, key=f'show_goal_{gi}_table'):
+					goal_pct_rows = []
+					for p in spending_pctiles:
+						goal_pct_rows.append({
+							'percentile': p,
+							'avg_annual_gross': np.percentile(run_goal['avg_annual_goal_wd'], p),
+							'avg_annual_after_tax': np.percentile(run_goal['avg_annual_goal_spending'], p),
+							f'total_gross ({num_years} yrs)': np.percentile(run_goal['total_goal_wd'], p),
+							f'total_after_tax ({num_years} yrs)': np.percentile(run_goal['total_goal_spending'], p),
+						})
+					st.dataframe(pd.DataFrame(goal_pct_rows).style.format({
+						'percentile': lambda x: f"{int(x)}th",
+						'avg_annual_gross': currency_fmt,
+						'avg_annual_after_tax': currency_fmt,
+						f'total_gross ({num_years} yrs)': currency_fmt,
+						f'total_after_tax ({num_years} yrs)': currency_fmt,
+					}))
+
+		ending_goal = float(st.session_state.get('ending_balance_goal', 1.0))
+		run_ending_portfolios = all_yearly.groupby('run')['total_portfolio'].last()
+		target_ending_value = st.number_input('Explore: chance of ending above...', value=ending_goal, step=50000.0, key='target_ending_val')
+		pct_at_or_above = float((run_ending_portfolios >= target_ending_value).mean()) * 100
+		st.metric('Chance of ending with at least this amount', f"{pct_at_or_above:.1f}%")
+		spending_pivot = all_yearly.pivot(index='year', columns='run', values='after_tax_spending')
+		spending_pivot.columns = [f'Run {c}' for c in spending_pivot.columns]
+		spending_csv = spending_pivot.to_csv()
+		st.download_button('Download after-tax spending (all runs) as CSV', spending_csv, file_name='after_tax_spending_all_runs.csv', mime='text/csv')
 
 		# Year-by-year median table (50th percentile across all simulations)
 		st.subheader('Year-by-year median across all runs')
@@ -1082,7 +1186,8 @@ def main():
 			pre_tax_total = med_taxable + med_tda + med_roth
 			after_tax_total = med_taxable + med_roth + med_tda * max(0.0, 1.0 - inh_rate_save)
 		summary_data = {
-			'label': f"conversion ${roth_conversion_amount:,.0f} for {roth_conversion_years} yrs, taxes from {roth_conversion_tax_source}",
+			'label': f"Roth fill→{roth_bracket_fill_rate*100:.0f}% for {roth_conversion_years} yrs" if roth_conversion_mode_ui == 'Fill to bracket'
+			else f"conversion ${roth_conversion_amount:,.0f} for {roth_conversion_years} yrs, taxes from {roth_conversion_tax_source}",
 			'total_taxes': med_taxes,
 			'total_accounts': pre_tax_total,
 			'taxable_end': med_taxable,
@@ -1139,17 +1244,6 @@ def main():
 				}))
 				if pct_non_pos is not None:
 					st.caption(f"% below ending balance goal: {pct_non_pos * 100:.1f}%")
-			spending_pcts = s.get('spending_percentiles', [])
-			if spending_pcts:
-				st.markdown(f"*{s['name']} — Lifetime spending distribution*")
-				sp_df = pd.DataFrame(spending_pcts)
-				st.dataframe(sp_df.style.format({
-					'percentile': lambda x: f"{int(x)}th",
-					'avg_annual_withdrawal': currency_fmt,
-					'avg_annual_after_tax_spending': currency_fmt,
-					'total_lifetime_withdrawal': currency_fmt,
-					'total_lifetime_after_tax_spending': currency_fmt,
-				}))
 
 	# ── Client PDF Report ────────────────────────────────────────
 	if sim_mode is not None and 'mc_percentile_rows' in st.session_state:
