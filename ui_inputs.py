@@ -21,7 +21,7 @@ _SAVEABLE_KEYS = [
 	'roth_conversion_source_tda', 'roth_conversion_tax_source', 'roth_bracket_fill_rate',
 	'num_withdrawal_periods',
 	'rmd_start_age', 'rmd_start_age_spouse', 'ending_balance_goal', 'num_add_goals',
-	'ss_income', 'ss_start_age_p1', 'ss_income_spouse', 'ss_start_age_p2', 'ss_cola',
+	'ss_income', 'ss_start_age_p1', 'ss_fra_age_p1', 'ss_income_spouse', 'ss_start_age_p2', 'ss_fra_age_p2', 'ss_cola',
 	'pension_income', 'pension_cola_p1', 'pension_survivor_pct_p1',
 	'pension_income_spouse', 'pension_cola_p2', 'pension_survivor_pct_p2',
 	'other_income',
@@ -36,6 +36,9 @@ _SAVEABLE_KEYS = [
 	'guardrail_inner_sims', 'guardrail_max_spending_pct',
 	'flex_goal_min_pct',
 	'inheritance_enabled', 'inheritance_year', 'inheritance_taxable_amount', 'inheritance_ira_amount',
+	'tcja_sunset', 'tcja_sunset_year',
+	'qcd_annual', 'earned_income', 'earned_income_years',
+	'irmaa_enabled', 'prefer_tda_before_taxable',
 	'display_decimals', 'monte_carlo_runs',
 	'num_scenarios',
 ]
@@ -535,6 +538,11 @@ def _render_allocation_section():
 	"""Render Allocation & Roth Conversions expander. Returns dict of allocation values."""
 	with st.expander('Allocation & Roth Conversions'):
 		target_stock_pct = st.slider('Household target % in stocks', min_value=0, max_value=100, value=60, step=10, key='target_stock_pct') / 100.0
+		prefer_tda_before_taxable = st.checkbox('Prefer TDA withdrawals before taxable',
+			value=False, key='prefer_tda_before_taxable',
+			help='Default waterfall: taxable bonds → stocks → TDA → Roth. '
+			'When checked: TDA → taxable bonds → stocks → Roth. '
+			'Useful to deplete TDA faster (reduce future RMDs) or take advantage of low tax brackets.')
 		roth_conversion_mode = st.radio('Roth conversion mode',
 			['None', 'Fixed amount', 'Fill to bracket'],
 			horizontal=True, key='roth_conversion_mode',
@@ -559,6 +567,7 @@ def _render_allocation_section():
 			roth_conversion_tax_source = 'Taxable'
 	return {
 		'target_stock_pct': target_stock_pct,
+		'prefer_tda_before_taxable': prefer_tda_before_taxable,
 		'roth_conversion_mode': roth_conversion_mode,
 		'roth_conversion_amount': roth_conversion_amount,
 		'roth_bracket_fill_rate': roth_bracket_fill_rate,
@@ -633,10 +642,13 @@ def _render_income_section():
 	with st.expander('Other Income'):
 		ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=25000.0, step=1000.0, key='ss_income')
 		ss_start_age_p1 = st.number_input('SS start age - person 1', min_value=60, max_value=90, value=67, step=1, key='ss_start_age_p1')
+		ss_fra_age_p1 = st.selectbox('SS full retirement age - person 1', [66, 67], index=1, key='ss_fra_age_p1')
 		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=20000.0, step=1000.0, key='ss_income_spouse')
 		ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=65, step=1, key='ss_start_age_p2')
+		ss_fra_age_p2 = st.selectbox('SS full retirement age - person 2', [66, 67], index=1, key='ss_fra_age_p2')
 		ss_cola = st.number_input('Social Security COLA', value=0.0, format="%.4f", key='ss_cola')
-		st.caption('Survivor receives the higher of their own or deceased spouse\'s benefit')
+		st.caption('Enter each person\'s own worker benefit from their SSA statement. '
+			'Spousal top-up and survivor benefits are computed automatically for married filers.')
 		pension_income_input = st.number_input('Annual pension income - person 1', value=0.0, step=1000.0, key='pension_income')
 		pension_cola_p1 = st.number_input('Pension COLA - person 1', value=0.00, format="%.4f", key='pension_cola_p1')
 		pension_survivor_pct_p1 = st.number_input('Pension survivor % - person 1', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
@@ -646,11 +658,26 @@ def _render_income_section():
 		pension_survivor_pct_p2 = st.number_input('Pension survivor % - person 2', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
 			help='Fraction of person 2 pension paid to survivor after person 2 dies', key='pension_survivor_pct_p2')
 		other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0, key='other_income')
+		st.markdown('---')
+		st.caption('**Earned Income** (part-time work in early retirement)')
+		earned_income_input = st.number_input('Annual earned income', value=0.0, step=1000.0, key='earned_income',
+			help='Annual earned income (W-2 or self-employment) included as ordinary taxable income. '
+			'FICA taxes are not modeled separately.')
+		earned_income_years = st.number_input('Years of earned income', value=0, min_value=0, max_value=40, step=1,
+			key='earned_income_years',
+			help='Number of years from the start of simulation during which earned income is received.')
+		st.markdown('---')
+		st.caption('**Qualified Charitable Distributions (QCDs)**')
+		qcd_annual = st.number_input('Annual QCD amount (from IRA, age 70+)', value=0.0, step=1000.0, key='qcd_annual',
+			help='QCDs go directly from your IRA to charity. They satisfy RMD requirements but are excluded '
+			'from taxable income. Available at age 70\u00bd (modeled as 70). Max $105,000/year per person.')
 	return {
 		'ss_income': ss_income_input,
 		'ss_start_age_p1': ss_start_age_p1,
+		'ss_fra_age_p1': ss_fra_age_p1,
 		'ss_income_spouse': ss_income_spouse_input,
 		'ss_start_age_p2': ss_start_age_p2,
+		'ss_fra_age_p2': ss_fra_age_p2,
 		'ss_cola': ss_cola,
 		'pension_income': pension_income_input,
 		'pension_cola_p1': pension_cola_p1,
@@ -659,6 +686,9 @@ def _render_income_section():
 		'pension_cola_p2': pension_cola_p2,
 		'pension_survivor_pct_p2': pension_survivor_pct_p2,
 		'other_income': other_income_input,
+		'earned_income': earned_income_input,
+		'earned_income_years': earned_income_years,
+		'qcd_annual': qcd_annual,
 	}
 
 def _render_pension_buyout_section():
@@ -722,6 +752,26 @@ def _render_tax_section():
 			value=True, key='state_exempt_retirement')
 		if state_exempt_retirement:
 			st.caption('State tax applies only to investment income (interest, dividends, capital gains). SS, pensions, TDA withdrawals, and Roth conversions are exempt.')
+		st.markdown('---')
+		tcja_sunset = st.checkbox('Model TCJA sunset (brackets revert to pre-2018 law)',
+			value=False, key='tcja_sunset',
+			help='After the sunset year, tax brackets revert from TCJA (10/12/22/24/32/35/37%) '
+			'to pre-TCJA (10/15/25/28/33/35/39.6%). Standard deduction also decreases. '
+			'If using bracket-fill Roth conversions, note that TCJA-specific rates (12%, 22%, 24%) '
+			'do not exist under pre-TCJA law and conversions will be skipped for those years.')
+		if tcja_sunset:
+			tcja_sunset_year = st.number_input('TCJA sunset begins (simulation year)',
+				value=2, min_value=1, max_value=40, step=1, key='tcja_sunset_year',
+				help='Simulation year when TCJA provisions expire. Year 2 = second year of simulation.')
+		else:
+			tcja_sunset_year = 2
+		st.markdown('---')
+		irmaa_enabled = st.checkbox('Model Medicare IRMAA surcharges',
+			value=False, key='irmaa_enabled',
+			help='Adds Medicare Part B + Part D income-related surcharges for persons age 65+. '
+			'Based on MAGI from 2 years prior (surcharges start year 3 of simulation). '
+			'2024 brackets: MFJ surcharges begin at $206K MAGI; single at $103K. '
+			'Max surcharge ~$6,004/person/year.')
 	return {
 		'taxes_enabled': taxes_enabled,
 		'filing_status_choice': filing_status_choice,
@@ -731,6 +781,9 @@ def _render_tax_section():
 		'inheritor_marginal_rate': inheritor_marginal_rate,
 		'state_tax_rate': state_tax_rate,
 		'state_exempt_retirement': state_exempt_retirement,
+		'tcja_sunset': tcja_sunset,
+		'tcja_sunset_year': tcja_sunset_year,
+		'irmaa_enabled': irmaa_enabled,
 	}
 
 def _render_return_section():

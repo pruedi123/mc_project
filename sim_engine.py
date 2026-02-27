@@ -11,7 +11,7 @@ from typing import Dict, Optional, Sequence
 
 from tax_engine import (get_standard_deduction, get_ordinary_brackets,
 	compute_taxable_social_security, apply_brackets, compute_capital_gains_tax,
-	get_marginal_rates, compute_niit, compute_state_tax, bracket_ceiling)
+	get_marginal_rates, compute_niit, compute_state_tax, bracket_ceiling, compute_irmaa)
 
 # ── Data loading ────────────────────────────────────────────────
 
@@ -79,6 +79,206 @@ def sample_lognormal_returns(years: int, drift: float, volatility: float, rng: n
 	"""Return `years` draws from a lognormal distribution built from the provided normal parameters."""
 	log_returns = rng.normal(loc=drift, scale=volatility, size=years)
 	return np.exp(log_returns) - 1
+
+# ── Income computation (shared by guardrail, bracket-fill, main loop) ──
+
+def compute_year_income(y, age_p1, age_p2, p1_alive, p2_alive, pp_factor, income_cfg):
+	"""Compute all income streams for a single simulation year.
+
+	Returns dict with ss_income, pension_nominal, pension_real,
+	annuity_nominal, annuity_real, other_income, total_real_income.
+	"""
+	cfg = income_cfg
+
+	# Social Security with spousal top-up, filing dependency, and survivor rules
+	cola_factor = (1 + cfg['ss_cola']) ** (y - 1)
+	if p1_alive and p2_alive:
+		p1_own = cfg['ss_own_p1'] if age_p1 >= cfg['ss_start_age_p1'] else 0.0
+		p2_own = cfg['ss_own_p2'] if age_p2 >= cfg['ss_start_age_p2'] else 0.0
+		# Spousal top-up requires the OTHER person to have filed (filing dependency)
+		p1_filed = age_p1 >= cfg['ss_start_age_p1']
+		p2_filed = age_p2 >= cfg['ss_start_age_p2']
+		p1_spousal = cfg['ss_spousal_topup_p1'] if (p1_filed and p2_filed) else 0.0
+		p2_spousal = cfg['ss_spousal_topup_p2'] if (p2_filed and p1_filed) else 0.0
+		ss_income = (p1_own + p1_spousal + p2_own + p2_spousal) * cola_factor
+	elif p1_alive:
+		# P1 survived, P2 died — P1 gets max(own + spousal, survivor from P2)
+		own = (cfg['ss_own_p1'] + cfg['ss_spousal_topup_p1']) if age_p1 >= cfg['ss_start_age_p1'] else 0.0
+		surv_full = cfg['ss_survivor_from_p2']
+		surv = surv_full * ss_survivor_reduction_factor(age_p1, cfg['ss_fra_age_p1']) if age_p1 < cfg['ss_fra_age_p1'] else surv_full
+		ss_income = max(own, surv if age_p1 >= 60 else 0.0) * cola_factor
+	elif p2_alive:
+		# P2 survived, P1 died — P2 gets max(own + spousal, survivor from P1)
+		own = (cfg['ss_own_p2'] + cfg['ss_spousal_topup_p2']) if age_p2 >= cfg['ss_start_age_p2'] else 0.0
+		surv_full = cfg['ss_survivor_from_p1']
+		surv = surv_full * ss_survivor_reduction_factor(age_p2, cfg['ss_fra_age_p2']) if age_p2 < cfg['ss_fra_age_p2'] else surv_full
+		ss_income = max(own, surv if age_p2 >= 60 else 0.0) * cola_factor
+	else:
+		ss_income = 0.0
+
+	# Pension income with COLA and survivor rules
+	pen_p1_nom = cfg['pension_income_annual'] * ((1 + cfg['pension_cola_p1']) ** (y - 1))
+	pen_p2_nom = cfg['pension_income_spouse_annual'] * ((1 + cfg['pension_cola_p2']) ** (y - 1))
+	if p1_alive and p2_alive:
+		pension_nominal = pen_p1_nom + pen_p2_nom
+	elif p1_alive:
+		pension_nominal = pen_p1_nom + pen_p2_nom * cfg['pension_survivor_pct_p2']
+	elif p2_alive:
+		pension_nominal = pen_p2_nom + pen_p1_nom * cfg['pension_survivor_pct_p1']
+	else:
+		pension_nominal = 0.0
+	pension_real = pension_nominal * pp_factor
+
+	# Annuity income with COLA, start year, and survivor rules
+	if y >= cfg['annuity_start_year']:
+		ann_yrs = y - cfg['annuity_start_year']
+		ann_p1_nom = cfg['annuity_income_p1'] * ((1 + cfg['annuity_cola_p1']) ** ann_yrs)
+		ann_p2_nom = cfg['annuity_income_p2'] * ((1 + cfg['annuity_cola_p2']) ** ann_yrs)
+		if p1_alive and p2_alive:
+			annuity_nominal = ann_p1_nom + ann_p2_nom
+		elif p1_alive:
+			annuity_nominal = ann_p1_nom + ann_p2_nom * cfg['annuity_survivor_pct_p2']
+		elif p2_alive:
+			annuity_nominal = ann_p2_nom + ann_p1_nom * cfg['annuity_survivor_pct_p1']
+		else:
+			annuity_nominal = 0.0
+	else:
+		annuity_nominal = 0.0
+	annuity_real = annuity_nominal * pp_factor
+
+	other_income = cfg['other_income_annual']
+	earned_income = cfg['earned_income_annual'] if y <= cfg['earned_income_years'] else 0.0
+
+	return {
+		'ss_income': ss_income,
+		'pension_nominal': pension_nominal,
+		'pension_real': pension_real,
+		'annuity_nominal': annuity_nominal,
+		'annuity_real': annuity_real,
+		'other_income': other_income,
+		'earned_income': earned_income,
+		'total_real_income': ss_income + pension_real + annuity_real + other_income + earned_income,
+	}
+
+# ── Social Security claiming age analysis ─────────────────────
+
+def ss_adjustment_factor(claiming_age: int, fra_age: int) -> float:
+	"""Return the SS benefit multiplier for a given claiming age relative to FRA.
+	Before FRA: 5/9 of 1% per month for first 36 months early, then 5/12 of 1% beyond.
+	After FRA: 8%/year (2/3% per month) delayed retirement credits up to age 70."""
+	months_diff = (claiming_age - fra_age) * 12
+	if months_diff < 0:
+		# Early claiming — reduction
+		early_months = -months_diff
+		if early_months <= 36:
+			reduction = early_months * (5 / 9 / 100)
+		else:
+			reduction = 36 * (5 / 9 / 100) + (early_months - 36) * (5 / 12 / 100)
+		return 1.0 - reduction
+	elif months_diff > 0:
+		# Delayed credits — capped at age 70
+		delay_months = min(months_diff, (70 - fra_age) * 12)
+		return 1.0 + delay_months * (2 / 3 / 100)
+	return 1.0
+
+def ss_back_calculate_fra_benefit(entered_benefit: float, claiming_age: int, fra_age: int) -> float:
+	"""Back-calculate the FRA benefit from a benefit entered at a specific claiming age."""
+	return entered_benefit / ss_adjustment_factor(claiming_age, fra_age)
+
+def ss_breakeven_table(fra_benefit: float, fra_age: int,
+					   claiming_ages=range(62, 71),
+					   milestone_ages=(75, 80, 85, 90, 95)) -> list:
+	"""Compute cumulative SS collected by milestone age for each claiming age.
+	Returns list of dicts with 'claiming_age', 'annual_benefit', and one key per milestone."""
+	rows = []
+	for ca in claiming_ages:
+		factor = ss_adjustment_factor(ca, fra_age)
+		annual = fra_benefit * factor
+		row = {'claiming_age': ca, 'annual_benefit': annual}
+		for ma in milestone_ages:
+			years_collecting = max(0, ma - ca)
+			row[f'cumulative_{ma}'] = annual * years_collecting
+		rows.append(row)
+	return rows
+
+def ss_spousal_reduction_factor(claiming_age: int, fra_age: int) -> float:
+	"""Return the reduction factor for the spousal excess when claiming before FRA.
+	Spousal excess uses a different formula than worker benefits:
+	25/36 of 1% per month for first 36 months early, then 5/12 of 1% beyond.
+	At FRA or later: 1.0 (no reduction)."""
+	months_early = (fra_age - claiming_age) * 12
+	if months_early <= 0:
+		return 1.0
+	if months_early <= 36:
+		reduction = months_early * (25 / 36 / 100)
+	else:
+		reduction = 36 * (25 / 36 / 100) + (months_early - 36) * (5 / 12 / 100)
+	return max(0.0, 1.0 - reduction)
+
+def ss_survivor_reduction_factor(survivor_age: int, survivor_fra: int) -> float:
+	"""Return the reduction factor for survivor benefits claimed before FRA.
+	Linear reduction from 71.5% at age 60 to 100% at survivor's FRA.
+	At FRA or later: 1.0."""
+	if survivor_age >= survivor_fra:
+		return 1.0
+	if survivor_age < 60:
+		return 0.0
+	months_early = (survivor_fra - survivor_age) * 12
+	max_months = (survivor_fra - 60) * 12
+	if max_months <= 0:
+		return 1.0
+	# Linear from 0.715 at age 60 to 1.0 at FRA
+	return 0.715 + (1.0 - 0.715) * (1.0 - months_early / max_months)
+
+def compute_ss_benefits(ss_income_p1: float, start_age_p1: int, fra_age_p1: int,
+						ss_income_p2: float, start_age_p2: int, fra_age_p2: int,
+						filing_status: str) -> dict:
+	"""Pre-compute all SS benefit components (own, spousal, survivor) once per run.
+
+	Parameters are the entered benefit amounts (at claimed age) and claiming/FRA ages.
+	Returns dict with keys for own benefits, spousal top-ups, survivor benefits, and FRA ages.
+	"""
+	# Back-calculate PIAs (benefit at FRA)
+	pia_p1 = ss_back_calculate_fra_benefit(ss_income_p1, start_age_p1, fra_age_p1) if ss_income_p1 > 0 else 0.0
+	pia_p2 = ss_back_calculate_fra_benefit(ss_income_p2, start_age_p2, fra_age_p2) if ss_income_p2 > 0 else 0.0
+
+	# Own worker benefits (what each person entered — already adjusted for claiming age)
+	own_p1 = ss_income_p1
+	own_p2 = ss_income_p2
+
+	# Spousal top-up (MFJ only): excess of 50% of other's PIA over own PIA, reduced for early claiming
+	is_mfj = (filing_status == 'married_filing_jointly')
+	if is_mfj:
+		excess_p1 = max(0.0, 0.5 * pia_p2 - pia_p1)  # P1 gets spousal from P2's record
+		excess_p2 = max(0.0, 0.5 * pia_p1 - pia_p2)  # P2 gets spousal from P1's record
+		topup_p1 = excess_p1 * ss_spousal_reduction_factor(start_age_p1, fra_age_p1)
+		topup_p2 = excess_p2 * ss_spousal_reduction_factor(start_age_p2, fra_age_p2)
+	else:
+		topup_p1 = 0.0
+		topup_p2 = 0.0
+
+	# Survivor benefits: what the surviving spouse would receive
+	# Survivor gets the higher of: (a) what the deceased was actually receiving, or
+	# (b) 82.5% of the deceased's PIA (floor for survivors)
+	if is_mfj:
+		survivor_from_p1 = max(own_p1, 0.825 * pia_p1)  # what P2 gets if P1 dies
+		survivor_from_p2 = max(own_p2, 0.825 * pia_p2)  # what P1 gets if P2 dies
+	else:
+		survivor_from_p1 = 0.0
+		survivor_from_p2 = 0.0
+
+	return {
+		'ss_pia_p1': pia_p1,
+		'ss_pia_p2': pia_p2,
+		'ss_own_p1': own_p1,
+		'ss_own_p2': own_p2,
+		'ss_spousal_topup_p1': topup_p1,
+		'ss_spousal_topup_p2': topup_p2,
+		'ss_survivor_from_p1': survivor_from_p1,
+		'ss_survivor_from_p2': survivor_from_p2,
+		'ss_fra_age_p1': fra_age_p1,
+		'ss_fra_age_p2': fra_age_p2,
+	}
 
 # ── Simulation helpers ──────────────────────────────────────────
 
@@ -598,6 +798,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 	annuity_income = year_income['annuity_nominal']
 	annuity_income_real = year_income['annuity_real']
 	other_income = year_income['other_income']
+	earned_income = year_income.get('earned_income', 0.0)
 	deduction = year_income['deduction']
 	filing_status_this_year = year_income['filing_status']
 	pending_roth_conversion = year_income['pending_roth_conversion']
@@ -606,6 +807,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 	state_tax_rate = tax_cfg['state_tax_rate']
 	state_exempt_retirement = tax_cfg['state_exempt_retirement']
 	roth_conversion_tax_source = tax_cfg['roth_conversion_tax_source']
+	tax_law = tax_cfg.get('tax_law', 'tcja')
 
 	out_taxable_cash = 0.0
 	w_tda = total_rmd_cash
@@ -636,7 +838,29 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 	else:
 		remaining = gross_target - total_rmd_cash
 
-	# Waterfall: taxable bonds -> stocks -> TDA -> Roth
+	# Waterfall: order depends on preference
+	prefer_tda = tax_cfg.get('prefer_tda_before_taxable', False)
+
+	# TDA before taxable (if preferred)
+	if prefer_tda:
+		if remaining > 1e-8:
+			t1_total = t1s + t1b
+			take = min(remaining, t1_total)
+			ratio = (t1s / t1_total) if t1_total > 0 else 0.5
+			t1s -= take * ratio
+			t1b -= take * (1 - ratio)
+			w_tda += take
+			remaining -= take
+		if remaining > 1e-8:
+			t2_total = t2s + t2b
+			take = min(remaining, t2_total)
+			ratio = (t2s / t2_total) if t2_total > 0 else 0.5
+			t2s -= take * ratio
+			t2b -= take * (1 - ratio)
+			w_tda += take
+			remaining -= take
+
+	# Taxable bonds then stocks
 	if remaining > 0 and b_mv > 0:
 		take = min(remaining, b_mv)
 		basis_sold = take * (b_basis / b_mv) if b_mv > 0 else 0.0
@@ -657,24 +881,26 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 		out_taxable_cash += take
 		remaining -= take
 
-	if remaining > 1e-8:
-		t1_total = t1s + t1b
-		take = min(remaining, t1_total)
-		ratio = (t1s / t1_total) if t1_total > 0 else 0.5
-		t1s -= take * ratio
-		t1b -= take * (1 - ratio)
-		w_tda += take
-		remaining -= take
+	# TDA after taxable (default order)
+	if not prefer_tda:
+		if remaining > 1e-8:
+			t1_total = t1s + t1b
+			take = min(remaining, t1_total)
+			ratio = (t1s / t1_total) if t1_total > 0 else 0.5
+			t1s -= take * ratio
+			t1b -= take * (1 - ratio)
+			w_tda += take
+			remaining -= take
+		if remaining > 1e-8:
+			t2_total = t2s + t2b
+			take = min(remaining, t2_total)
+			ratio = (t2s / t2_total) if t2_total > 0 else 0.5
+			t2s -= take * ratio
+			t2b -= take * (1 - ratio)
+			w_tda += take
+			remaining -= take
 
-	if remaining > 1e-8:
-		t2_total = t2s + t2b
-		take = min(remaining, t2_total)
-		ratio = (t2s / t2_total) if t2_total > 0 else 0.5
-		t2s -= take * ratio
-		t2b -= take * (1 - ratio)
-		w_tda += take
-		remaining -= take
-
+	# Roth always last
 	if remaining > 1e-8:
 		r_total = rs + rb
 		take = min(remaining, r_total)
@@ -686,7 +912,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 
 	# Full tax computation
 	cap_loss_cf = year_income.get('cap_loss_carryforward', 0.0)
-	ordinary_pre_ss_base = interest + w_tda + pension_income_real + annuity_income_real + other_income
+	ordinary_pre_ss_base = interest + w_tda + pension_income_real + annuity_income_real + other_income + earned_income
 	ordinary_pre_ss_with_conv = ordinary_pre_ss_base + pending_roth_conversion
 	raw_cg = div + turnover_realized_gain + rebalance_realized_gain + realized_gains
 	# Apply capital loss carryforward against gains
@@ -707,15 +933,15 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 		# With conversion
 		t_ss = compute_taxable_social_security(ss_income, max(0.0, ordinary_pre_ss_with_conv), cg_total, filing_status_this_year)
 		t_ordinary = max(0.0, ordinary_pre_ss_with_conv + t_ss - deduction)
-		ord_tax = apply_brackets(t_ordinary, get_ordinary_brackets(filing_status_this_year))
-		cg_tax = compute_capital_gains_tax(t_ordinary, cg_total, filing_status_this_year)
+		ord_tax = apply_brackets(t_ordinary, get_ordinary_brackets(filing_status_this_year, tax_law))
+		cg_tax = compute_capital_gains_tax(t_ordinary, cg_total, filing_status_this_year, tax_law)
 		total_tax = ord_tax + cg_tax
 
 		# Without conversion (for delta — include state tax so conversion cost is accurate)
 		t_ss_nc = compute_taxable_social_security(ss_income, max(0.0, ordinary_pre_ss_base), cg_total, filing_status_this_year)
 		t_ordinary_nc = max(0.0, ordinary_pre_ss_base + t_ss_nc - deduction)
-		ord_tax_nc = apply_brackets(t_ordinary_nc, get_ordinary_brackets(filing_status_this_year))
-		cg_tax_nc = compute_capital_gains_tax(t_ordinary_nc, cg_total, filing_status_this_year)
+		ord_tax_nc = apply_brackets(t_ordinary_nc, get_ordinary_brackets(filing_status_this_year, tax_law))
+		cg_tax_nc = compute_capital_gains_tax(t_ordinary_nc, cg_total, filing_status_this_year, tax_law)
 		total_tax_nc = ord_tax_nc + cg_tax_nc
 		total_tax_with = total_tax  # ord_tax + cg_tax (with conversion)
 		if state_tax_rate > 0:
@@ -740,7 +966,7 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 		s_tax = compute_state_tax(t_ordinary, cg_total, interest, state_tax_rate, state_exempt_retirement)
 		total_tax += s_tax
 
-		marg_ord, marg_cg = get_marginal_rates(t_ordinary, cg_total, filing_status_this_year)
+		marg_ord, marg_cg = get_marginal_rates(t_ordinary, cg_total, filing_status_this_year, tax_law)
 		niit_threshold = 200000 if filing_status_this_year == 'single' else 250000
 		niit_base_val = max(0.0, agi - niit_threshold)
 		if niit_base_val > 0 and cg_total > 0:
@@ -788,8 +1014,8 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 				cg_total_updated = cg_total + conv_sale_gain
 				t_ss2 = compute_taxable_social_security(ss_income, ordinary_pre_ss_with_conv, cg_total_updated, filing_status_this_year)
 				t_ordinary2 = max(0.0, ordinary_pre_ss_with_conv + t_ss2 - deduction)
-				ord_tax2 = apply_brackets(t_ordinary2, get_ordinary_brackets(filing_status_this_year))
-				cg_tax2 = compute_capital_gains_tax(t_ordinary2, cg_total_updated, filing_status_this_year)
+				ord_tax2 = apply_brackets(t_ordinary2, get_ordinary_brackets(filing_status_this_year, tax_law))
+				cg_tax2 = compute_capital_gains_tax(t_ordinary2, cg_total_updated, filing_status_this_year, tax_law)
 				niit2 = compute_niit(ordinary_pre_ss_with_conv + t_ss2 + cg_total_updated,
 									max(0.0, cg_total_updated + interest), filing_status_this_year)
 				s_tax2 = compute_state_tax(t_ordinary2, cg_total_updated, interest, state_tax_rate, state_exempt_retirement)
@@ -810,8 +1036,12 @@ def try_gross_withdrawal(gross_target, snap_balances, year_income, tax_cfg):
 	)
 	nst = max(0.0, min(nst, total_tax - conv_tax_delta))
 
+	# IRMAA surcharge (pre-computed based on 2-year lookback, passed in)
+	irmaa = year_income.get('irmaa_surcharge', 0.0) if taxes_enabled else 0.0
+	total_tax += irmaa
+
 	net_spending = (out_taxable_cash + w_tda + w_roth
-		- rmd_excess + ss_income + pension_income_real + annuity_income_real + other_income
+		- rmd_excess + ss_income + pension_income_real + annuity_income_real + other_income + earned_income
 		- (total_tax - conv_tax_delta - nst))
 
 	return net_spending, {
@@ -886,6 +1116,8 @@ def simulate_withdrawals(start_age_primary: int,
 						 roth_bracket_fill_rate: float = 0.22,
 						 ss_start_age_p1: int = 67,
 						 ss_start_age_p2: int = 67,
+						 ss_fra_age_p1: int = 67,
+						 ss_fra_age_p2: int = 67,
 						 state_tax_rate: float = 0.0,
 						 state_exempt_retirement: bool = False,
 						 stock_return_series: Optional[Sequence[float]] = None,
@@ -911,8 +1143,47 @@ def simulate_withdrawals(start_age_primary: int,
 						 inheritance_enabled: bool = False,
 						 inheritance_year: int = 10,
 						 inheritance_taxable_amount: float = 0.0,
-						 inheritance_ira_amount: float = 0.0):
+						 inheritance_ira_amount: float = 0.0,
+						 tcja_sunset: bool = False,
+						 tcja_sunset_year: int = 2,
+						 qcd_annual: float = 0.0,
+						 earned_income_annual: float = 0.0,
+						 earned_income_years: int = 0,
+						 irmaa_enabled: bool = False,
+						 prefer_tda_before_taxable: bool = False):
 	table = get_uniform_lifetime_table()
+
+	# Income config dict (shared across all years — constant per run)
+	income_cfg = {
+		'ss_income_annual': ss_income_annual,
+		'ss_income_spouse_annual': ss_income_spouse_annual,
+		'ss_cola': ss_cola,
+		'ss_start_age_p1': ss_start_age_p1,
+		'ss_start_age_p2': ss_start_age_p2,
+		'pension_income_annual': pension_income_annual,
+		'pension_income_spouse_annual': pension_income_spouse_annual,
+		'pension_cola_p1': pension_cola_p1,
+		'pension_cola_p2': pension_cola_p2,
+		'pension_survivor_pct_p1': pension_survivor_pct_p1,
+		'pension_survivor_pct_p2': pension_survivor_pct_p2,
+		'annuity_income_p1': annuity_income_p1,
+		'annuity_income_p2': annuity_income_p2,
+		'annuity_cola_p1': annuity_cola_p1,
+		'annuity_cola_p2': annuity_cola_p2,
+		'annuity_survivor_pct_p1': annuity_survivor_pct_p1,
+		'annuity_survivor_pct_p2': annuity_survivor_pct_p2,
+		'annuity_start_year': annuity_start_year,
+		'other_income_annual': other_income_annual,
+		'earned_income_annual': earned_income_annual,
+		'earned_income_years': earned_income_years,
+	}
+
+	# Pre-compute SS spousal/survivor benefits and merge into income_cfg
+	ss_benefits = compute_ss_benefits(
+		ss_income_annual, ss_start_age_p1, ss_fra_age_p1,
+		ss_income_spouse_annual, ss_start_age_p2, ss_fra_age_p2,
+		filing_status)
+	income_cfg.update(ss_benefits)
 
 	# assume taxable holds 50% stocks / 50% bonds
 	stocks_share = 0.5
@@ -951,49 +1222,9 @@ def simulate_withdrawals(start_age_primary: int,
 		age_p2 = start_age_spouse + y - 1
 		p1_alive = age_p1 <= life_expectancy_primary
 		p2_alive = age_p2 <= life_expectancy_spouse
-		ss_b1 = ss_income_annual * ((1 + ss_cola) ** (y - 1))
-		ss_b2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1))
-		if p1_alive and p2_alive:
-			yr_ss = (ss_b1 if age_p1 >= ss_start_age_p1 else 0.0) + (ss_b2 if age_p2 >= ss_start_age_p2 else 0.0)
-		elif p1_alive:
-			own = ss_b1 if age_p1 >= ss_start_age_p1 else 0.0
-			surv = ss_b2 if age_p1 >= 60 else 0.0
-			yr_ss = max(own, surv)
-		elif p2_alive:
-			own = ss_b2 if age_p2 >= ss_start_age_p2 else 0.0
-			surv = ss_b1 if age_p2 >= 60 else 0.0
-			yr_ss = max(own, surv)
-		else:
-			yr_ss = 0.0
-		pen_p1_nom = pension_income_annual * ((1 + pension_cola_p1) ** (y - 1))
-		pen_p2_nom = pension_income_spouse_annual * ((1 + pension_cola_p2) ** (y - 1))
-		if p1_alive and p2_alive:
-			yr_pen_nom = pen_p1_nom + pen_p2_nom
-		elif p1_alive:
-			yr_pen_nom = pen_p1_nom + pen_p2_nom * pension_survivor_pct_p2
-		elif p2_alive:
-			yr_pen_nom = pen_p2_nom + pen_p1_nom * pension_survivor_pct_p1
-		else:
-			yr_pen_nom = 0.0
 		pp = pp_factors[y - 1] if pp_factors and y <= len(pp_factors) else 1.0
-		yr_pen_real = yr_pen_nom * pp
-		# Annuity income (same logic as pension: COLA, survivor, PP-adjusted)
-		if y >= annuity_start_year:
-			ann_yrs = y - annuity_start_year
-			ann_p1_nom = annuity_income_p1 * ((1 + annuity_cola_p1) ** ann_yrs)
-			ann_p2_nom = annuity_income_p2 * ((1 + annuity_cola_p2) ** ann_yrs)
-			if p1_alive and p2_alive:
-				yr_ann_nom = ann_p1_nom + ann_p2_nom
-			elif p1_alive:
-				yr_ann_nom = ann_p1_nom + ann_p2_nom * annuity_survivor_pct_p2
-			elif p2_alive:
-				yr_ann_nom = ann_p2_nom + ann_p1_nom * annuity_survivor_pct_p1
-			else:
-				yr_ann_nom = 0.0
-			yr_ann_real = yr_ann_nom * pp
-		else:
-			yr_ann_real = 0.0
-		income_schedule.append(yr_ss + yr_pen_real + yr_ann_real + other_income_annual)
+		yr_inc = compute_year_income(y, age_p1, age_p2, p1_alive, p2_alive, pp, income_cfg)
+		income_schedule.append(yr_inc['total_real_income'])
 
 	# Guardrail: compute initial scaling factor via binary search
 	if guardrails_enabled:
@@ -1019,12 +1250,14 @@ def simulate_withdrawals(start_age_primary: int,
 		'state_tax_rate': state_tax_rate,
 		'state_exempt_retirement': state_exempt_retirement,
 		'roth_conversion_tax_source': roth_conversion_tax_source,
+		'prefer_tda_before_taxable': prefer_tda_before_taxable,
 	}
 
 	# Track year of death for qualifying surviving spouse filing status
 	primary_death_year = None
 	spouse_death_year = None
 	cap_loss_carryforward = 0.0
+	magi_history = []
 	inh_ira_balance = 0.0
 	inh_ira_years_remaining = 10
 
@@ -1035,8 +1268,17 @@ def simulate_withdrawals(start_age_primary: int,
 		spouse_alive = age_p2 <= life_expectancy_spouse
 		if not primary_alive and primary_death_year is None:
 			primary_death_year = y
+			# Stepped-up basis at death on taxable account (community property)
+			stocks_basis = stocks_mv
+			bonds_basis = bonds_mv
 		if not spouse_alive and spouse_death_year is None:
 			spouse_death_year = y
+			stocks_basis = stocks_mv
+			bonds_basis = bonds_mv
+
+		# Determine tax law for this year (TCJA vs pre-TCJA)
+		tax_law = 'pre_tcja' if tcja_sunset and y >= tcja_sunset_year else 'tcja'
+		tax_cfg['tax_law'] = tax_law
 
 		# Inherited IRA rollover: merge deceased spouse's TDA into survivor's
 		if not primary_alive and (tda1_stocks_mv + tda1_bonds_mv) > 0 and spouse_alive:
@@ -1147,49 +1389,13 @@ def simulate_withdrawals(start_age_primary: int,
 						est_filing = 'mfj'
 					else:
 						est_filing = 'single'
-				# Estimate SS income (conservative: assume 85% taxable)
-				est_ss_b1 = ss_income_annual * ((1 + ss_cola) ** (y - 1))
-				est_ss_b2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1))
-				if primary_alive and spouse_alive:
-					est_ss = (est_ss_b1 if age_p1 >= ss_start_age_p1 else 0.0) + (est_ss_b2 if age_p2 >= ss_start_age_p2 else 0.0)
-				elif primary_alive:
-					_own = est_ss_b1 if age_p1 >= ss_start_age_p1 else 0.0
-					_surv = est_ss_b2 if age_p1 >= 60 else 0.0
-					est_ss = max(_own, _surv)
-				elif spouse_alive:
-					_own = est_ss_b2 if age_p2 >= ss_start_age_p2 else 0.0
-					_surv = est_ss_b1 if age_p2 >= 60 else 0.0
-					est_ss = max(_own, _surv)
-				else:
-					est_ss = 0.0
-				est_ss_taxable = est_ss * 0.85
-				# Estimate pension
-				est_pen_p1 = pension_income_annual * ((1 + pension_cola_p1) ** (y - 1))
-				est_pen_p2 = pension_income_spouse_annual * ((1 + pension_cola_p2) ** (y - 1))
-				if primary_alive and spouse_alive:
-					est_pension = est_pen_p1 + est_pen_p2
-				elif primary_alive:
-					est_pension = est_pen_p1 + est_pen_p2 * pension_survivor_pct_p2
-				elif spouse_alive:
-					est_pension = est_pen_p2 + est_pen_p1 * pension_survivor_pct_p1
-				else:
-					est_pension = 0.0
-				# Estimate annuity
-				est_annuity = 0.0
-				if y >= annuity_start_year:
-					_ann_yrs = y - annuity_start_year
-					_ann_p1 = annuity_income_p1 * ((1 + annuity_cola_p1) ** _ann_yrs)
-					_ann_p2 = annuity_income_p2 * ((1 + annuity_cola_p2) ** _ann_yrs)
-					if primary_alive and spouse_alive:
-						est_annuity = _ann_p1 + _ann_p2
-					elif primary_alive:
-						est_annuity = _ann_p1 + _ann_p2 * annuity_survivor_pct_p2
-					elif spouse_alive:
-						est_annuity = _ann_p2 + _ann_p1 * annuity_survivor_pct_p1
-				est_ordinary = est_rmd + est_ss_taxable + est_pension + est_annuity + other_income_annual
-				est_deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(est_filing)
+				# Estimate SS/pension/annuity for bracket-fill (nominal values, pp irrelevant)
+				est_inc = compute_year_income(y, age_p1, age_p2, primary_alive, spouse_alive, 1.0, income_cfg)
+				est_ss_taxable = est_inc['ss_income'] * 0.85
+				est_ordinary = est_rmd + est_ss_taxable + est_inc['pension_nominal'] + est_inc['annuity_nominal'] + est_inc['other_income']
+				est_deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(est_filing, tax_law)
 				est_taxable = max(0.0, est_ordinary - est_deduction)
-				ceiling = bracket_ceiling(est_filing, roth_bracket_fill_rate)
+				ceiling = bracket_ceiling(est_filing, roth_bracket_fill_rate, tax_law)
 				room = max(0.0, ceiling - est_taxable)
 				conversion_gross = min(room, src_available)
 			else:
@@ -1288,59 +1494,39 @@ def simulate_withdrawals(start_age_primary: int,
 				filing_status_this_year = 'mfj'  # qualifying surviving spouse uses MFJ rates
 			else:
 				filing_status_this_year = 'single'
-		# SS with start ages and survivor benefit rules
-		ss_benefit_p1 = ss_income_annual * ((1 + ss_cola) ** (y - 1))
-		ss_benefit_p2 = ss_income_spouse_annual * ((1 + ss_cola) ** (y - 1))
-		if primary_alive and spouse_alive:
-			ss_income_p1 = ss_benefit_p1 if age_p1 >= ss_start_age_p1 else 0.0
-			ss_income_p2 = ss_benefit_p2 if age_p2 >= ss_start_age_p2 else 0.0
-			ss_income = ss_income_p1 + ss_income_p2
-		elif primary_alive and not spouse_alive:
-			# Survivor gets own benefit (if started) OR deceased's benefit (available at 60), whichever is higher
-			own_benefit = ss_benefit_p1 if age_p1 >= ss_start_age_p1 else 0.0
-			survivor_benefit = ss_benefit_p2 if age_p1 >= 60 else 0.0
-			ss_income = max(own_benefit, survivor_benefit)
-		elif spouse_alive and not primary_alive:
-			own_benefit = ss_benefit_p2 if age_p2 >= ss_start_age_p2 else 0.0
-			survivor_benefit = ss_benefit_p1 if age_p2 >= 60 else 0.0
-			ss_income = max(own_benefit, survivor_benefit)
-		else:
-			ss_income = 0.0
-		pen_nom_p1 = pension_income_annual * ((1 + pension_cola_p1) ** (y - 1))
-		pen_nom_p2 = pension_income_spouse_annual * ((1 + pension_cola_p2) ** (y - 1))
-		if primary_alive and spouse_alive:
-			pension_income = pen_nom_p1 + pen_nom_p2
-		elif primary_alive and not spouse_alive:
-			pension_income = pen_nom_p1 + pen_nom_p2 * pension_survivor_pct_p2
-		elif spouse_alive and not primary_alive:
-			pension_income = pen_nom_p2 + pen_nom_p1 * pension_survivor_pct_p1
-		else:
-			pension_income = 0.0
-		# Use per-run CPI factors if available (historical), otherwise median PP factors
+		# Compute all income streams for this year
 		run_pp = pp_factors_run if pp_factors_run is not None else pp_factors
 		pp_yr = run_pp[y - 1] if run_pp and y <= len(run_pp) else 1.0
-		pension_income_real = pension_income * pp_yr
-		# Annuity income (same structure as pension)
-		if y >= annuity_start_year:
-			ann_yrs = y - annuity_start_year
-			ann_nom_p1 = annuity_income_p1 * ((1 + annuity_cola_p1) ** ann_yrs)
-			ann_nom_p2 = annuity_income_p2 * ((1 + annuity_cola_p2) ** ann_yrs)
-			if primary_alive and spouse_alive:
-				annuity_income_yr = ann_nom_p1 + ann_nom_p2
-			elif primary_alive and not spouse_alive:
-				annuity_income_yr = ann_nom_p1 + ann_nom_p2 * annuity_survivor_pct_p2
-			elif spouse_alive and not primary_alive:
-				annuity_income_yr = ann_nom_p2 + ann_nom_p1 * annuity_survivor_pct_p1
-			else:
-				annuity_income_yr = 0.0
-		else:
-			annuity_income_yr = 0.0
-		annuity_income_real = annuity_income_yr * pp_yr
-		other_income = other_income_annual
-		deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(filing_status_this_year)
+		yr_inc = compute_year_income(y, age_p1, age_p2, primary_alive, spouse_alive, pp_yr, income_cfg)
+		ss_income = yr_inc['ss_income']
+		pension_income = yr_inc['pension_nominal']
+		pension_income_real = yr_inc['pension_real']
+		annuity_income_yr = yr_inc['annuity_nominal']
+		annuity_income_real = yr_inc['annuity_real']
+		other_income = yr_inc['other_income']
+		deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(filing_status_this_year, tax_law)
+
+		# IRMAA surcharge based on 2-year lookback MAGI
+		irmaa_surcharge = 0.0
+		if irmaa_enabled and y >= 3:
+			lookback_magi = magi_history[y - 3]
+			num_medicare = 0
+			if primary_alive and age_p1 >= 65:
+				num_medicare += 1
+			if spouse_alive and age_p2 >= 65:
+				num_medicare += 1
+			if num_medicare > 0:
+				irmaa_surcharge = compute_irmaa(lookback_magi, filing_status_this_year, num_medicare)
+
+		# QCD: reduce taxable RMD income (charity gets QCD, retiree doesn't)
+		qcd_eligible = rmd_p1 + rmd_p2  # QCDs only from own TDAs, not inherited
+		qcd_this_year = 0.0
+		if qcd_annual > 0 and qcd_eligible > 0:
+			if (primary_alive and age_p1 >= 70) or (spouse_alive and age_p2 >= 70):
+				qcd_this_year = min(qcd_annual, qcd_eligible)
 
 		# Snapshot mutable balances (post-growth, post-RMD) for iterative solve
-		total_rmd_cash = rmd_p1 + rmd_p2 + inh_ira_distribution
+		total_rmd_cash = rmd_p1 + rmd_p2 + inh_ira_distribution - qcd_this_year
 		snap_balances = {
 			'stocks_mv': stocks_mv, 'bonds_mv': bonds_mv,
 			'stocks_basis': stocks_basis, 'bonds_basis': bonds_basis,
@@ -1357,10 +1543,12 @@ def simulate_withdrawals(start_age_primary: int,
 			'pension_nominal': pension_income, 'pension_real': pension_income_real,
 			'annuity_nominal': annuity_income_yr, 'annuity_real': annuity_income_real,
 			'other_income': other_income,
+			'earned_income': yr_inc['earned_income'],
 			'deduction': deduction,
 			'filing_status': filing_status_this_year,
 			'pending_roth_conversion': pending_roth_conversion,
 			'cap_loss_carryforward': cap_loss_carryforward,
+			'irmaa_surcharge': irmaa_surcharge,
 		}
 
 		# Binary search: find gross withdrawal that delivers the net spending target
@@ -1414,6 +1602,10 @@ def simulate_withdrawals(start_age_primary: int,
 		roth_bonds_mv = chosen['roth_bonds']
 		cap_loss_carryforward = chosen.get('cap_loss_carryforward_out', 0.0)
 
+		# Track MAGI for future IRMAA lookback
+		year_magi = chosen['taxable_ordinary'] + deduction + chosen['cap_gains_total']
+		magi_history.append(year_magi)
+
 		actual_portfolio_return = (investment_return_dollars / investable_start_total) if investable_start_total > 0 else 0.0
 		rows.append({
 			'year': y,
@@ -1449,6 +1641,9 @@ def simulate_withdrawals(start_age_primary: int,
 			'annuity_income_total': annuity_income_yr,
 			'annuity_income_real': annuity_income_real,
 			'other_income': other_income,
+			'earned_income': yr_inc['earned_income'],
+			'qcd_amount': qcd_this_year,
+			'irmaa_surcharge': irmaa_surcharge,
 			'roth_conversion': pending_roth_conversion,
 			'roth_conversion_tax': chosen['roth_conversion_tax_delta'],
 			'roth_conversion_tax_source': roth_conversion_tax_source,

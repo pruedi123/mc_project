@@ -9,6 +9,8 @@ from sim_engine import (
 	get_all_historical_windows, compute_summary_metrics, build_scenario_params,
 	auto_scenario_name, compute_scenario_summary, run_monte_carlo,
 	store_distribution_results, simulate_withdrawals, sample_lognormal_returns,
+	ss_adjustment_factor, ss_back_calculate_fra_benefit, ss_breakeven_table,
+	compute_ss_benefits,
 )
 from ui_inputs import render_sidebar, save_results_to_json, load_plan_results, get_plans_with_results
 
@@ -224,7 +226,8 @@ def main():
 		for key in ['scenario_summaries', 'last_summary', 'mc_percentile_rows', 'mc_all_yearly',
 					'mc_pct_non_positive', 'sim_df', 'sim_mode', 'mc_summaries', 'mc_percentiles',
 					'multi_scenario_results', 'selected_scenario_idx', 'num_sims',
-					'saved_plan_comparison']:
+					'saved_plan_comparison', 'ss_analysis_results',
+					'ss_analysis_grid', 'ss_analysis_meta']:
 			st.session_state.pop(key, None)
 		st.success('Saved scenarios cleared.')
 
@@ -258,6 +261,8 @@ def main():
 	ss_start_age_p1 = inputs['ss_start_age_p1']
 	ss_income_spouse_input = inputs['ss_income_spouse']
 	ss_start_age_p2 = inputs['ss_start_age_p2']
+	ss_fra_age_p1 = inputs['ss_fra_age_p1']
+	ss_fra_age_p2 = inputs['ss_fra_age_p2']
 	ss_cola = inputs['ss_cola']
 	pension_income_input = inputs['pension_income']
 	pension_cola_p1 = inputs['pension_cola_p1']
@@ -266,6 +271,9 @@ def main():
 	pension_cola_p2 = inputs['pension_cola_p2']
 	pension_survivor_pct_p2 = inputs['pension_survivor_pct_p2']
 	other_income_input = inputs['other_income']
+	earned_income_input = inputs['earned_income']
+	earned_income_years = inputs['earned_income_years']
+	qcd_annual = inputs['qcd_annual']
 	pension_buyout_enabled = inputs['pension_buyout_enabled']
 	pension_buyout_baseline = inputs['pension_buyout_baseline']
 	pension_buyout_person = inputs['pension_buyout_person']
@@ -284,6 +292,10 @@ def main():
 	inheritor_marginal_rate = inputs['inheritor_marginal_rate']
 	state_tax_rate = inputs['state_tax_rate']
 	state_exempt_retirement = inputs['state_exempt_retirement']
+	tcja_sunset = inputs['tcja_sunset']
+	tcja_sunset_year = inputs['tcja_sunset_year']
+	irmaa_enabled = inputs['irmaa_enabled']
+	prefer_tda_before_taxable = inputs['prefer_tda_before_taxable']
 	return_mode = inputs['return_mode']
 	stock_total_return = inputs['stock_total_return']
 	bond_return = inputs['bond_return']
@@ -388,6 +400,8 @@ def main():
 		roth_bracket_fill_rate=float(roth_bracket_fill_rate),
 		ss_start_age_p1=int(ss_start_age_p1),
 		ss_start_age_p2=int(ss_start_age_p2),
+		ss_fra_age_p1=int(ss_fra_age_p1),
+		ss_fra_age_p2=int(ss_fra_age_p2),
 		state_tax_rate=float(state_tax_rate),
 		state_exempt_retirement=bool(state_exempt_retirement),
 		life_expectancy_primary=int(life_expectancy_primary),
@@ -409,6 +423,13 @@ def main():
 		inheritance_year=int(inheritance_year),
 		inheritance_taxable_amount=float(inheritance_taxable_amount),
 		inheritance_ira_amount=float(inheritance_ira_amount),
+		tcja_sunset=bool(tcja_sunset),
+		tcja_sunset_year=int(tcja_sunset_year),
+		qcd_annual=float(qcd_annual),
+		earned_income_annual=float(earned_income_input),
+		earned_income_years=int(earned_income_years),
+		irmaa_enabled=bool(irmaa_enabled),
+		prefer_tda_before_taxable=bool(prefer_tda_before_taxable),
 	)
 
 	# Compute stock/bond return parameters (needed for guardrails and scenario comparison)
@@ -551,6 +572,11 @@ def main():
 
 	button_label = 'Run all scenarios' if num_scenarios > 1 else 'Run simulation'
 	if st.button(button_label):
+		# Clear stale SS claiming age analysis (depends on baseline plan inputs)
+		st.session_state.pop('ss_analysis_grid', None)
+		st.session_state.pop('ss_analysis_meta', None)
+		st.session_state.pop('ss_analysis_results', None)
+
 		sim_years = int(years)
 		is_historical = return_mode == 'Historical (master_global_factors)'
 
@@ -1272,6 +1298,415 @@ def main():
 		else:
 			if sim_mode is not None:
 				st.caption('No saved plans with simulation results yet. Run a simulation and click "Save Inputs" to save results.')
+
+	# ── SS Claiming Age Analysis ────────────────────────────────
+	if sim_mode is not None and 'mc_percentile_rows' in st.session_state:
+		st.markdown('---')
+		st.subheader('Social Security Claiming Age Analysis')
+
+		is_couple = (filing_status_key == 'married_filing_jointly')
+		has_p1_ss = float(ss_income_input) > 0
+		has_p2_ss = float(ss_income_spouse_input) > 0
+		_fra_p1 = int(ss_fra_age_p1)
+		_fra_p2 = int(ss_fra_age_p2)
+		p1_ages = list(range(max(62, int(start_age)), 71)) if has_p1_ss and int(start_age) <= 70 else []
+		p2_ages = list(range(max(62, int(start_age_spouse)), 71)) if has_p2_ss and int(start_age_spouse) <= 70 else []
+
+		if has_p1_ss and p1_ages:
+			_fra_benefit_p1 = ss_back_calculate_fra_benefit(float(ss_income_input), int(ss_start_age_p1), _fra_p1)
+		if has_p2_ss and p2_ages:
+			_fra_benefit_p2 = ss_back_calculate_fra_benefit(float(ss_income_spouse_input), int(ss_start_age_p2), _fra_p2)
+
+		def _ss_delta_fmt(v):
+			if abs(v) < 1:
+				return 'Baseline'
+			return f'+${v:,.0f}' if v > 0 else f'-${abs(v):,.0f}'
+
+		_run_grid = is_couple and len(p1_ages) > 0 and len(p2_ages) > 0
+
+		if not p1_ages and not p2_ages:
+			st.caption('No Social Security claiming ages to analyze (past age 70 or no SS benefit entered).')
+
+		elif _run_grid:
+			# ── Married: all P1 × P2 combinations ──
+			n_combos = len(p1_ages) * len(p2_ages)
+			st.markdown(
+				f"**Person 1:** FRA benefit ${_fra_benefit_p1:,.0f}/yr (ages {p1_ages[0]}\u2013{p1_ages[-1]}) &nbsp;|&nbsp; "
+				f"**Person 2:** FRA benefit ${_fra_benefit_p2:,.0f}/yr (ages {p2_ages[0]}\u2013{p2_ages[-1]})")
+			st.caption(f'{n_combos} combinations will be simulated. '
+				f'Baseline: Person 1 at {int(ss_start_age_p1)}, Person 2 at {int(ss_start_age_p2)}.')
+
+			with st.expander('Preview: benefits at each claiming age'):
+				_prev1, _prev2 = st.columns(2)
+				with _prev1:
+					st.markdown('**Person 1**')
+					_prev_rows_p1 = []
+					for ca in p1_ages:
+						_ssb = compute_ss_benefits(
+							_fra_benefit_p1 * ss_adjustment_factor(ca, _fra_p1), ca, _fra_p1,
+							float(ss_income_spouse_input), int(ss_start_age_p2), _fra_p2,
+							filing_status_key)
+						_own = _ssb['ss_own_p1']
+						_topup = _ssb['ss_spousal_topup_p1']
+						_prev_rows_p1.append({'Age': ca, 'Own': f'${_own:,.0f}',
+							'Spousal': f'${_topup:,.0f}' if _topup > 0 else '—',
+							'Total': f'${_own + _topup:,.0f}'})
+					st.table(pd.DataFrame(_prev_rows_p1).set_index('Age'))
+				with _prev2:
+					st.markdown('**Person 2**')
+					_prev_rows_p2 = []
+					for ca in p2_ages:
+						_ssb = compute_ss_benefits(
+							float(ss_income_input), int(ss_start_age_p1), _fra_p1,
+							_fra_benefit_p2 * ss_adjustment_factor(ca, _fra_p2), ca, _fra_p2,
+							filing_status_key)
+						_own = _ssb['ss_own_p2']
+						_topup = _ssb['ss_spousal_topup_p2']
+						_prev_rows_p2.append({'Age': ca, 'Own': f'${_own:,.0f}',
+							'Spousal': f'${_topup:,.0f}' if _topup > 0 else '—',
+							'Total': f'${_own + _topup:,.0f}'})
+					st.table(pd.DataFrame(_prev_rows_p2).set_index('Age'))
+				st.caption('Spousal top-up = max(0, 50% of other\'s PIA − own PIA), reduced for early claiming. '
+					'Shown with other person at their current claiming age.')
+
+			if st.button('Run Claiming Age Analysis', key='run_ss_analysis'):
+				sim_years = int(years)
+				is_historical = return_mode == 'Historical (master_global_factors)'
+				grid_results = []
+				st.session_state.pop('ss_analysis_results', None)
+
+				if is_historical:
+					all_hist_windows, _ = get_all_historical_windows(sim_years)
+					n_windows = len(all_hist_windows)
+					target_per = max(50, 20000 // n_combos)
+					stride = max(1, n_windows // target_per)
+					sampled_indices = list(range(0, n_windows, stride))
+				else:
+					mc_runs = max(25, min(200, 10000 // n_combos))
+
+				progress = st.progress(0, text='SS analysis: starting...')
+				combo_idx = 0
+				for p1_ca in p1_ages:
+					p1_adj = _fra_benefit_p1 * ss_adjustment_factor(p1_ca, _fra_p1)
+					for p2_ca in p2_ages:
+						progress.progress(combo_idx / n_combos,
+							text=f'P1={p1_ca}, P2={p2_ca} ({combo_idx+1}/{n_combos})')
+						p2_adj = _fra_benefit_p2 * ss_adjustment_factor(p2_ca, _fra_p2)
+
+						sp = dict(sim_params)
+						sp['ss_income_annual'] = p1_adj
+						sp['ss_start_age_p1'] = p1_ca
+						sp['ss_income_spouse_annual'] = p2_adj
+						sp['ss_start_age_p2'] = p2_ca
+
+						if is_historical:
+							results = []
+							_run_spending = []
+							for idx in sampled_indices:
+								stock_rets, bond_rets = all_hist_windows[idx]
+								run_pp = compute_run_pp_factors(idx, sim_years)
+								df_run = simulate_withdrawals(
+									years=sim_years, stock_return_series=stock_rets,
+									bond_return_series=bond_rets, pp_factors_run=run_pp, **sp)
+								df_run['total_portfolio'] = (df_run['end_taxable_total']
+									+ df_run['end_tda_total'] + df_run['end_roth'])
+								results.append(compute_summary_metrics(df_run, float(inheritor_marginal_rate)))
+								_run_spending.append(df_run['after_tax_spending'].mean())
+							mc_df = pd.DataFrame(results)
+							median_spending = float(np.median(_run_spending))
+						else:
+							results, _ay = run_monte_carlo(
+								num_runs=mc_runs, years=sim_years,
+								inheritor_rate=float(inheritor_marginal_rate),
+								taxable_log_drift=float(taxable_log_drift),
+								taxable_log_volatility=float(taxable_log_volatility),
+								bond_log_drift=float(bond_log_drift),
+								bond_log_volatility=float(bond_log_volatility),
+								**sp)
+							mc_df = pd.DataFrame(results)
+							median_spending = float(_ay.groupby('run')['after_tax_spending'].mean().median())
+							del _ay
+
+						grid_results.append({
+							'p1_age': p1_ca, 'p2_age': p2_ca,
+							'p1_benefit': p1_adj, 'p2_benefit': p2_adj,
+							'median_ending': float(np.percentile(mc_df['after_tax_end'], 50)),
+							'median_spending': median_spending,
+						})
+						combo_idx += 1
+
+				progress.progress(1.0, text='SS analysis: complete!')
+				st.session_state['ss_analysis_grid'] = grid_results
+				st.session_state['ss_analysis_meta'] = {
+					'p1_ages': p1_ages, 'p2_ages': p2_ages,
+					'fra_benefit_p1': _fra_benefit_p1, 'fra_benefit_p2': _fra_benefit_p2,
+					'fra_p1': _fra_p1, 'fra_p2': _fra_p2,
+					'baseline_p1': int(ss_start_age_p1), 'baseline_p2': int(ss_start_age_p2),
+				}
+
+			if 'ss_analysis_grid' in st.session_state:
+				grid = st.session_state['ss_analysis_grid']
+				meta = st.session_state['ss_analysis_meta']
+				grid_df = pd.DataFrame(grid)
+
+				# Find baseline — match current inputs, or closest combo
+				bl_p1, bl_p2 = meta['baseline_p1'], meta['baseline_p2']
+				bl_row = next((r for r in grid if r['p1_age'] == bl_p1 and r['p2_age'] == bl_p2), None)
+				if bl_row is None:
+					bl_row = min(grid, key=lambda r: abs(r['p1_age'] - bl_p1) + abs(r['p2_age'] - bl_p2))
+				bl_ending = bl_row['median_ending']
+				bl_spending = bl_row['median_spending']
+
+				grid_df['ending_delta'] = grid_df['median_ending'] - bl_ending
+				grid_df['spending_delta'] = grid_df['median_spending'] - bl_spending
+
+				def _ss_age_label(age, fra_b, fra_a):
+					return f"{age} (${fra_b * ss_adjustment_factor(age, fra_a):,.0f})"
+
+				p1_labels = [_ss_age_label(a, meta['fra_benefit_p1'], meta['fra_p1']) for a in meta['p1_ages']]
+				p2_labels = [_ss_age_label(a, meta['fra_benefit_p2'], meta['fra_p2']) for a in meta['p2_ages']]
+
+				# Ending balance grids: absolute values then delta
+				st.markdown('**Median Ending Balance**')
+				end_abs_pivot = grid_df.pivot(index='p1_age', columns='p2_age', values='median_ending')
+				end_abs_pivot.index = p1_labels
+				end_abs_pivot.columns = p2_labels
+				end_abs_pivot.index.name = 'Person 1 ↓  /  Person 2 →'
+				st.dataframe(end_abs_pivot.style.format('${:,.0f}')
+					.background_gradient(cmap='RdYlGn', axis=None))
+
+				st.markdown(f'**Median Ending Balance vs Baseline** (P1={bl_row["p1_age"]}, P2={bl_row["p2_age"]})')
+				end_pivot = grid_df.pivot(index='p1_age', columns='p2_age', values='ending_delta')
+				end_pivot.index = p1_labels
+				end_pivot.columns = p2_labels
+				end_pivot.index.name = 'Person 1 ↓  /  Person 2 →'
+				st.dataframe(end_pivot.style.format(_ss_delta_fmt)
+					.background_gradient(cmap='RdYlGn', axis=None))
+
+				# Spending grids: absolute values then delta
+				st.markdown('**Median Annual Spending**')
+				spend_abs_pivot = grid_df.pivot(index='p1_age', columns='p2_age', values='median_spending')
+				spend_abs_pivot.index = p1_labels
+				spend_abs_pivot.columns = p2_labels
+				spend_abs_pivot.index.name = 'Person 1 ↓  /  Person 2 →'
+				st.dataframe(spend_abs_pivot.style.format('${:,.0f}')
+					.background_gradient(cmap='RdYlGn', axis=None))
+
+				st.markdown(f'**Median Annual Spending vs Baseline** (P1={bl_row["p1_age"]}, P2={bl_row["p2_age"]})')
+				spend_pivot = grid_df.pivot(index='p1_age', columns='p2_age', values='spending_delta')
+				spend_pivot.index = p1_labels
+				spend_pivot.columns = p2_labels
+				spend_pivot.index.name = 'Person 1 ↓  /  Person 2 →'
+				st.dataframe(spend_pivot.style.format(_ss_delta_fmt)
+					.background_gradient(cmap='RdYlGn', axis=None))
+
+				# Best combination
+				best_end = grid_df.loc[grid_df['median_ending'].idxmax()]
+				best_spend = grid_df.loc[grid_df['median_spending'].idxmax()]
+				st.markdown(f"**Highest ending balance:** P1 at {int(best_end['p1_age'])}, "
+					f"P2 at {int(best_end['p2_age'])} "
+					f"({_ss_delta_fmt(best_end['ending_delta'])} vs baseline)")
+				st.markdown(f"**Highest spending:** P1 at {int(best_spend['p1_age'])}, "
+					f"P2 at {int(best_spend['p2_age'])} "
+					f"({_ss_delta_fmt(best_spend['spending_delta'])} vs baseline)")
+
+				# Breakeven tables side by side
+				st.subheader('Cumulative SS Benefits by Age')
+				_be1, _be2 = st.columns(2)
+				with _be1:
+					st.markdown('**Person 1**')
+					be1 = pd.DataFrame(ss_breakeven_table(meta['fra_benefit_p1'], meta['fra_p1'],
+						claiming_ages=meta['p1_ages'])).rename(columns={
+						'claiming_age': 'Claim Age', 'annual_benefit': 'Annual',
+						'cumulative_75': 'By 75', 'cumulative_80': 'By 80',
+						'cumulative_85': 'By 85', 'cumulative_90': 'By 90',
+						'cumulative_95': 'By 95'}).set_index('Claim Age')
+					st.dataframe(be1.style.format('${:,.0f}'))
+				with _be2:
+					st.markdown('**Person 2**')
+					be2 = pd.DataFrame(ss_breakeven_table(meta['fra_benefit_p2'], meta['fra_p2'],
+						claiming_ages=meta['p2_ages'])).rename(columns={
+						'claiming_age': 'Claim Age', 'annual_benefit': 'Annual',
+						'cumulative_75': 'By 75', 'cumulative_80': 'By 80',
+						'cumulative_85': 'By 85', 'cumulative_90': 'By 90',
+						'cumulative_95': 'By 95'}).set_index('Claim Age')
+					st.dataframe(be2.style.format('${:,.0f}'))
+
+		else:
+			# ── Single filer or only one person has SS ──
+			if p1_ages:
+				_person_label = 'Person 1'
+				_fra_benefit = _fra_benefit_p1
+				_claim_ages = p1_ages
+				_fra = _fra_p1
+				_ss_claim_age = int(ss_start_age_p1)
+				_ss_benefit = float(ss_income_input)
+			else:
+				_person_label = 'Person 2'
+				_fra_benefit = _fra_benefit_p2
+				_claim_ages = p2_ages
+				_fra = _fra_p2
+				_ss_claim_age = int(ss_start_age_p2)
+				_ss_benefit = float(ss_income_spouse_input)
+
+			st.markdown(f"**Current input:** ${_ss_benefit:,.0f}/yr at age {_ss_claim_age} &nbsp;|&nbsp; "
+				f"**Back-calculated FRA benefit (age {_fra}):** ${_fra_benefit:,.0f}/yr")
+
+			with st.expander('Preview: benefit at each claiming age'):
+				st.table(pd.DataFrame([
+					{'Claiming Age': ca, 'Adjustment': f'{ss_adjustment_factor(ca, _fra):.2%}',
+					 'Annual Benefit': f'${_fra_benefit * ss_adjustment_factor(ca, _fra):,.0f}'}
+					for ca in _claim_ages]).set_index('Claiming Age'))
+
+			if st.button('Run Claiming Age Analysis', key='run_ss_analysis'):
+				sim_years = int(years)
+				is_historical = return_mode == 'Historical (master_global_factors)'
+				ss_analysis_results = []
+				st.session_state.pop('ss_analysis_grid', None)
+				st.session_state.pop('ss_analysis_meta', None)
+
+				if is_historical:
+					hist_windows, _ = get_all_historical_windows(sim_years)
+
+				n_ages = len(_claim_ages)
+				progress_bar = st.progress(0, text='SS analysis: starting...')
+				for i, ca in enumerate(_claim_ages):
+					progress_bar.progress(i / n_ages, text=f'SS analysis: age {ca}...')
+					adj_benefit = _fra_benefit * ss_adjustment_factor(ca, _fra)
+					sp = dict(sim_params)
+					if _person_label == 'Person 1':
+						sp['ss_income_annual'] = adj_benefit
+						sp['ss_start_age_p1'] = ca
+					else:
+						sp['ss_income_spouse_annual'] = adj_benefit
+						sp['ss_start_age_p2'] = ca
+
+					if is_historical:
+						results = []
+						all_yearly = []
+						for run_idx, (stock_rets, bond_rets) in enumerate(hist_windows):
+							run_pp = compute_run_pp_factors(run_idx, sim_years)
+							df_run = simulate_withdrawals(
+								years=sim_years, stock_return_series=stock_rets,
+								bond_return_series=bond_rets, pp_factors_run=run_pp, **sp)
+							df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
+							results.append(compute_summary_metrics(df_run, float(inheritor_marginal_rate)))
+							df_run['run'] = run_idx
+							all_yearly.append(df_run)
+						all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+					else:
+						mc_runs = min(int(monte_carlo_runs), 200)
+						results, all_yearly_df = run_monte_carlo(
+							num_runs=mc_runs, years=sim_years,
+							inheritor_rate=float(inheritor_marginal_rate),
+							taxable_log_drift=float(taxable_log_drift),
+							taxable_log_volatility=float(taxable_log_volatility),
+							bond_log_drift=float(bond_log_drift),
+							bond_log_volatility=float(bond_log_volatility),
+							**sp)
+
+					summary = compute_scenario_summary(
+						f'Age {ca} (${adj_benefit:,.0f})', results, all_yearly_df,
+						float(inheritor_marginal_rate), float(ending_balance_goal))
+					# Store claiming age and benefit for display
+					summary['_claiming_age'] = ca
+					summary['_annual_benefit'] = adj_benefit
+					_ayd = summary['all_yearly_df']
+					_inh_rate = float(inheritor_marginal_rate)
+					_ayd['after_tax_portfolio'] = (_ayd['end_taxable_total'] + _ayd['end_roth']
+						+ _ayd['end_tda_total'] * max(0.0, 1.0 - _inh_rate))
+					median_by_year = _ayd.groupby('year')[['total_portfolio', 'after_tax_portfolio', 'after_tax_spending']].median()
+					summary['median_yearly_years'] = median_by_year.index.tolist()
+					summary['median_yearly_portfolio'] = median_by_year['total_portfolio'].tolist()
+					summary['median_yearly_portfolio_at'] = median_by_year['after_tax_portfolio'].tolist()
+					summary['median_yearly_spending'] = median_by_year['after_tax_spending'].tolist()
+					# Pre-tax ending: median of last-year total_portfolio across runs
+					_run_ends = _ayd.groupby('run')['total_portfolio'].last()
+					summary['_pretax_ending_p50'] = float(np.median(_run_ends))
+					del summary['all_yearly_df']
+					ss_analysis_results.append(summary)
+
+				progress_bar.progress(1.0, text='SS analysis: complete!')
+				st.session_state['ss_analysis_results'] = ss_analysis_results
+
+			if st.session_state.get('ss_analysis_results'):
+				sa = st.session_state['ss_analysis_results']
+				# Find baseline row matching current claiming age
+				bl_idx = next((i for i, r in enumerate(sa) if r['_claiming_age'] == _ss_claim_age),
+					min(range(len(sa)), key=lambda i: abs(sa[i]['_claiming_age'] - _ss_claim_age)))
+				bl = sa[bl_idx]
+				bl_ending_at = next(r for r in bl['percentile_rows'] if r['percentile'] == 50)['after_tax_end']
+				bl_ending_pt = bl.get('_pretax_ending_p50', bl_ending_at)
+				bl_spending = next(r for r in bl['spending_percentiles'] if r['percentile'] == 50)['avg_annual_after_tax_spending']
+
+				# Delta table
+				table_rows = []
+				for r in sa:
+					p50_end_at = next(row for row in r['percentile_rows'] if row['percentile'] == 50)['after_tax_end']
+					p50_end_pt = r.get('_pretax_ending_p50', p50_end_at)
+					p50_spend = next(row for row in r['spending_percentiles'] if row['percentile'] == 50)['avg_annual_after_tax_spending']
+					table_rows.append({
+						'Claiming Age': r['_claiming_age'],
+						'Annual Benefit': r['_annual_benefit'],
+						'Pre-Tax Ending': p50_end_pt,
+						'Pre-Tax \u0394': p50_end_pt - bl_ending_pt,
+						'After-Tax Ending': p50_end_at,
+						'After-Tax \u0394': p50_end_at - bl_ending_at,
+						'Annual Spending': p50_spend,
+						'Spending \u0394': p50_spend - bl_spending,
+						'% Below Goal': r['pct_non_positive'] * 100,
+					})
+				delta_df = pd.DataFrame(table_rows).set_index('Claiming Age')
+				def _delta_color(val):
+					if isinstance(val, (int, float)):
+						if val > 0: return 'color: green'
+						if val < 0: return 'color: red'
+					return ''
+				st.dataframe(delta_df.style.format({
+					'Annual Benefit': '${:,.0f}',
+					'Pre-Tax Ending': '${:,.0f}',
+					'Pre-Tax \u0394': _ss_delta_fmt,
+					'After-Tax Ending': '${:,.0f}',
+					'After-Tax \u0394': _ss_delta_fmt,
+					'Annual Spending': '${:,.0f}',
+					'Spending \u0394': _ss_delta_fmt,
+					'% Below Goal': '{:.1f}%',
+				}).map(_delta_color, subset=['Pre-Tax \u0394', 'After-Tax \u0394', 'Spending \u0394']))
+
+				# Portfolio overlay charts
+				st.subheader('Pre-Tax Portfolio Comparison (median)')
+				overlay = pd.DataFrame()
+				for r in sa:
+					overlay[r['name']] = pd.Series(r['median_yearly_portfolio'],
+						index=r['median_yearly_years'])
+				interactive_line_chart(overlay, y_title='Pre-Tax Portfolio (Median)', zero_base=False)
+
+				if all('median_yearly_portfolio_at' in r for r in sa):
+					st.subheader('After-Tax Portfolio Comparison (median)')
+					overlay_at = pd.DataFrame()
+					for r in sa:
+						overlay_at[r['name']] = pd.Series(r['median_yearly_portfolio_at'],
+							index=r['median_yearly_years'])
+					interactive_line_chart(overlay_at, y_title='After-Tax Portfolio (Median)', zero_base=False)
+
+				# Spending overlay chart
+				st.subheader('After-Tax Spending Comparison (median)')
+				spend_overlay = pd.DataFrame()
+				for r in sa:
+					spend_overlay[r['name']] = pd.Series(r['median_yearly_spending'],
+						index=r['median_yearly_years'])
+				interactive_line_chart(spend_overlay, y_title='After-Tax Spending (Median)', zero_base=False)
+
+				# Breakeven table
+				st.subheader('Cumulative SS Benefits by Age')
+				be_table = ss_breakeven_table(_fra_benefit, _fra, claiming_ages=_claim_ages)
+				be_df = pd.DataFrame(be_table).rename(columns={
+					'claiming_age': 'Claim Age', 'annual_benefit': 'Annual Benefit',
+					'cumulative_75': 'By Age 75', 'cumulative_80': 'By Age 80',
+					'cumulative_85': 'By Age 85', 'cumulative_90': 'By Age 90',
+					'cumulative_95': 'By Age 95',
+				}).set_index('Claim Age')
+				st.dataframe(be_df.style.format('${:,.0f}'))
 
 	# ── Client PDF Report ────────────────────────────────────────
 	if sim_mode is not None and 'mc_percentile_rows' in st.session_state:
