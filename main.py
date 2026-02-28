@@ -1345,7 +1345,8 @@ def main():
 						_ssb = compute_ss_benefits(
 							_fra_benefit_p1 * ss_adjustment_factor(ca, _fra_p1), ca, _fra_p1,
 							float(ss_income_spouse_input), int(ss_start_age_p2), _fra_p2,
-							filing_status_key)
+							filing_status_key,
+							sim_start_age_p1=int(start_age), sim_start_age_p2=int(start_age_spouse))
 						_own = _ssb['ss_own_p1']
 						_topup = _ssb['ss_spousal_topup_p1']
 						_prev_rows_p1.append({'Age': ca, 'Own': f'${_own:,.0f}',
@@ -1359,7 +1360,8 @@ def main():
 						_ssb = compute_ss_benefits(
 							float(ss_income_input), int(ss_start_age_p1), _fra_p1,
 							_fra_benefit_p2 * ss_adjustment_factor(ca, _fra_p2), ca, _fra_p2,
-							filing_status_key)
+							filing_status_key,
+							sim_start_age_p1=int(start_age), sim_start_age_p2=int(start_age_spouse))
 						_own = _ssb['ss_own_p2']
 						_topup = _ssb['ss_spousal_topup_p2']
 						_prev_rows_p2.append({'Age': ca, 'Own': f'${_own:,.0f}',

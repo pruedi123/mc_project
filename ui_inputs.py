@@ -116,7 +116,8 @@ def _save_inputs_to_json(client: str, name: str):
 							'annuity_chk', 'ann_purchase',
 							'ann_income', 'ann_cola', 'ann_person', 'ann_surv', 'ann_start',
 							'buyout_chk', 'buyout_choice', 'buyout_person', 'buyout_lump',
-							'buyout_income', 'buyout_cola', 'buyout_surv']:
+							'buyout_income', 'buyout_cola', 'buyout_surv',
+							'le_chk', 'le_p1', 'le_p2']:
 				key = f'sc_{suffix}_{s_idx}'
 				if key in st.session_state:
 					sc_data[key] = st.session_state[key]
@@ -462,6 +463,17 @@ def _render_scenario_section():
 						value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_buyout_surv_{i}',
 						help='Fraction of annuity paid to survivor. 1.0 = full benefit continues. 0 = stops at death.')
 					sc_overrides['buyout_choice'] = buyout_choice
+				le_chk = st.checkbox(f'S{i} override life expectancy', key=f'sc_le_chk_{i}',
+					help='Test early death scenarios. Overrides life expectancy for one or both people.')
+				if le_chk:
+					sc_overrides['life_expectancy_primary'] = int(st.number_input(
+						f'S{i} Person 1 life expectancy', value=84, min_value=18, max_value=120,
+						step=1, key=f'sc_le_p1_{i}',
+						help='Last age P1 lives through in this scenario.'))
+					sc_overrides['life_expectancy_spouse'] = int(st.number_input(
+						f'S{i} Person 2 life expectancy', value=89, min_value=18, max_value=120,
+						step=1, key=f'sc_le_p2_{i}',
+						help='Last age P2 lives through in this scenario.'))
 				scenario_overrides_ui[i] = sc_overrides
 		else:
 			scenario_overrides_ui = {}

@@ -82,8 +82,12 @@ def sample_lognormal_returns(years: int, drift: float, volatility: float, rng: n
 
 # ── Income computation (shared by guardrail, bracket-fill, main loop) ──
 
-def compute_year_income(y, age_p1, age_p2, p1_alive, p2_alive, pp_factor, income_cfg):
+def compute_year_income(y, age_p1, age_p2, p1_alive, p2_alive, pp_factor, income_cfg,
+						p1_death_age=None, p2_death_age=None):
 	"""Compute all income streams for a single simulation year.
+
+	p1_death_age/p2_death_age: life expectancy (last age lived through) — used to determine
+	whether the deceased died before their SS claiming age, which affects survivor benefits.
 
 	Returns dict with ss_income, pension_nominal, pension_real,
 	annuity_nominal, annuity_real, other_income, total_real_income.
@@ -104,13 +108,17 @@ def compute_year_income(y, age_p1, age_p2, p1_alive, p2_alive, pp_factor, income
 	elif p1_alive:
 		# P1 survived, P2 died — P1 gets max(own + spousal, survivor from P2)
 		own = (cfg['ss_own_p1'] + cfg['ss_spousal_topup_p1']) if age_p1 >= cfg['ss_start_age_p1'] else 0.0
-		surv_full = cfg['ss_survivor_from_p2']
+		# If P2 died before their claiming age, use PIA-based survivor (before_claim)
+		p2_died_before_claim = (p2_death_age is not None and p2_death_age < cfg['ss_start_age_p2'])
+		surv_full = cfg['ss_survivor_from_p2_before_claim'] if p2_died_before_claim else cfg['ss_survivor_from_p2']
 		surv = surv_full * ss_survivor_reduction_factor(age_p1, cfg['ss_fra_age_p1']) if age_p1 < cfg['ss_fra_age_p1'] else surv_full
 		ss_income = max(own, surv if age_p1 >= 60 else 0.0) * cola_factor
 	elif p2_alive:
 		# P2 survived, P1 died — P2 gets max(own + spousal, survivor from P1)
 		own = (cfg['ss_own_p2'] + cfg['ss_spousal_topup_p2']) if age_p2 >= cfg['ss_start_age_p2'] else 0.0
-		surv_full = cfg['ss_survivor_from_p1']
+		# If P1 died before their claiming age, use PIA-based survivor (before_claim)
+		p1_died_before_claim = (p1_death_age is not None and p1_death_age < cfg['ss_start_age_p1'])
+		surv_full = cfg['ss_survivor_from_p1_before_claim'] if p1_died_before_claim else cfg['ss_survivor_from_p1']
 		surv = surv_full * ss_survivor_reduction_factor(age_p2, cfg['ss_fra_age_p2']) if age_p2 < cfg['ss_fra_age_p2'] else surv_full
 		ss_income = max(own, surv if age_p2 >= 60 else 0.0) * cola_factor
 	else:
@@ -232,10 +240,13 @@ def ss_survivor_reduction_factor(survivor_age: int, survivor_fra: int) -> float:
 
 def compute_ss_benefits(ss_income_p1: float, start_age_p1: int, fra_age_p1: int,
 						ss_income_p2: float, start_age_p2: int, fra_age_p2: int,
-						filing_status: str) -> dict:
+						filing_status: str,
+						sim_start_age_p1: int = None, sim_start_age_p2: int = None) -> dict:
 	"""Pre-compute all SS benefit components (own, spousal, survivor) once per run.
 
 	Parameters are the entered benefit amounts (at claimed age) and claiming/FRA ages.
+	sim_start_age_p1/p2: ages at simulation start — used to compute when spousal benefits
+	actually begin (when BOTH spouses have filed), which determines the correct reduction age.
 	Returns dict with keys for own benefits, spousal top-ups, survivor benefits, and FRA ages.
 	"""
 	# Back-calculate PIAs (benefit at FRA)
@@ -246,13 +257,25 @@ def compute_ss_benefits(ss_income_p1: float, start_age_p1: int, fra_age_p1: int,
 	own_p1 = ss_income_p1
 	own_p2 = ss_income_p2
 
-	# Spousal top-up (MFJ only): excess of 50% of other's PIA over own PIA, reduced for early claiming
+	# Spousal top-up (MFJ only): excess of 50% of other's PIA over own PIA, reduced for early claiming.
+	# The reduction is based on the age when spousal benefits actually begin, which is the later of
+	# when each spouse files — because spousal requires the OTHER person to have filed too.
 	is_mfj = (filing_status == 'married_filing_jointly')
 	if is_mfj:
 		excess_p1 = max(0.0, 0.5 * pia_p2 - pia_p1)  # P1 gets spousal from P2's record
 		excess_p2 = max(0.0, 0.5 * pia_p1 - pia_p2)  # P2 gets spousal from P1's record
-		topup_p1 = excess_p1 * ss_spousal_reduction_factor(start_age_p1, fra_age_p1)
-		topup_p2 = excess_p2 * ss_spousal_reduction_factor(start_age_p2, fra_age_p2)
+		# Compute age when each person's spousal benefit actually begins
+		if sim_start_age_p1 is not None and sim_start_age_p2 is not None:
+			age_gap = sim_start_age_p1 - sim_start_age_p2  # positive if P1 is older
+			# P1's spousal starts when P2 files (P1 must also have filed)
+			p1_spousal_start = max(start_age_p1, start_age_p2 + age_gap)
+			# P2's spousal starts when P1 files (P2 must also have filed)
+			p2_spousal_start = max(start_age_p2, start_age_p1 - age_gap)
+		else:
+			p1_spousal_start = start_age_p1
+			p2_spousal_start = start_age_p2
+		topup_p1 = excess_p1 * ss_spousal_reduction_factor(p1_spousal_start, fra_age_p1)
+		topup_p2 = excess_p2 * ss_spousal_reduction_factor(p2_spousal_start, fra_age_p2)
 	else:
 		topup_p1 = 0.0
 		topup_p2 = 0.0
@@ -261,11 +284,17 @@ def compute_ss_benefits(ss_income_p1: float, start_age_p1: int, fra_age_p1: int,
 	# Survivor gets the higher of: (a) what the deceased was actually receiving, or
 	# (b) 82.5% of the deceased's PIA (floor for survivors)
 	if is_mfj:
-		survivor_from_p1 = max(own_p1, 0.825 * pia_p1)  # what P2 gets if P1 dies
-		survivor_from_p2 = max(own_p2, 0.825 * pia_p2)  # what P1 gets if P2 dies
+		survivor_from_p1 = max(own_p1, 0.825 * pia_p1)  # what P2 gets if P1 dies after claiming
+		survivor_from_p2 = max(own_p2, 0.825 * pia_p2)  # what P1 gets if P2 dies after claiming
+		# If the deceased dies before ever claiming, they never received a benefit —
+		# the survivor gets 100% of the deceased's PIA (no early/delayed adjustment)
+		survivor_from_p1_before_claim = pia_p1  # what P2 gets if P1 dies before claiming
+		survivor_from_p2_before_claim = pia_p2  # what P1 gets if P2 dies before claiming
 	else:
 		survivor_from_p1 = 0.0
 		survivor_from_p2 = 0.0
+		survivor_from_p1_before_claim = 0.0
+		survivor_from_p2_before_claim = 0.0
 
 	return {
 		'ss_pia_p1': pia_p1,
@@ -276,6 +305,8 @@ def compute_ss_benefits(ss_income_p1: float, start_age_p1: int, fra_age_p1: int,
 		'ss_spousal_topup_p2': topup_p2,
 		'ss_survivor_from_p1': survivor_from_p1,
 		'ss_survivor_from_p2': survivor_from_p2,
+		'ss_survivor_from_p1_before_claim': survivor_from_p1_before_claim,
+		'ss_survivor_from_p2_before_claim': survivor_from_p2_before_claim,
 		'ss_fra_age_p1': fra_age_p1,
 		'ss_fra_age_p2': fra_age_p2,
 	}
@@ -654,6 +685,11 @@ def build_scenario_params(base_params: dict, overrides: dict, stock_mu: float = 
 				'annuity_survivor_pct_p1', 'annuity_survivor_pct_p2', 'annuity_start_year']:
 		if key in overrides:
 			params[key] = overrides[key]
+	# Life expectancy overrides (early death stress test)
+	if 'life_expectancy_primary' in overrides:
+		params['life_expectancy_primary'] = overrides['life_expectancy_primary']
+	if 'life_expectancy_spouse' in overrides:
+		params['life_expectancy_spouse'] = overrides['life_expectancy_spouse']
 	return params
 
 def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) -> str:
@@ -698,6 +734,10 @@ def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) ->
 	if 'tda_delta_p1' in overrides or 'tda_delta_p2' in overrides:
 		ann = overrides.get('annuity_income_p1', overrides.get('annuity_income_p2', 0))
 		parts.append(f"Take Annuity ${ann / 1000:.0f}k/yr")
+	if 'life_expectancy_primary' in overrides or 'life_expectancy_spouse' in overrides:
+		le_p1 = overrides.get('life_expectancy_primary', base_params.get('life_expectancy_primary', '?'))
+		le_p2 = overrides.get('life_expectancy_spouse', base_params.get('life_expectancy_spouse', '?'))
+		parts.append(f"LE P1:{le_p1} P2:{le_p2}")
 	return " | ".join(parts) if parts else f"Scenario {scenario_idx}"
 
 def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFrame,
@@ -1182,7 +1222,8 @@ def simulate_withdrawals(start_age_primary: int,
 	ss_benefits = compute_ss_benefits(
 		ss_income_annual, ss_start_age_p1, ss_fra_age_p1,
 		ss_income_spouse_annual, ss_start_age_p2, ss_fra_age_p2,
-		filing_status)
+		filing_status,
+		sim_start_age_p1=start_age_primary, sim_start_age_p2=start_age_spouse)
 	income_cfg.update(ss_benefits)
 
 	# assume taxable holds 50% stocks / 50% bonds
@@ -1223,7 +1264,8 @@ def simulate_withdrawals(start_age_primary: int,
 		p1_alive = age_p1 <= life_expectancy_primary
 		p2_alive = age_p2 <= life_expectancy_spouse
 		pp = pp_factors[y - 1] if pp_factors and y <= len(pp_factors) else 1.0
-		yr_inc = compute_year_income(y, age_p1, age_p2, p1_alive, p2_alive, pp, income_cfg)
+		yr_inc = compute_year_income(y, age_p1, age_p2, p1_alive, p2_alive, pp, income_cfg,
+			p1_death_age=life_expectancy_primary, p2_death_age=life_expectancy_spouse)
 		income_schedule.append(yr_inc['total_real_income'])
 
 	# Guardrail: compute initial scaling factor via binary search
@@ -1390,7 +1432,8 @@ def simulate_withdrawals(start_age_primary: int,
 					else:
 						est_filing = 'single'
 				# Estimate SS/pension/annuity for bracket-fill (nominal values, pp irrelevant)
-				est_inc = compute_year_income(y, age_p1, age_p2, primary_alive, spouse_alive, 1.0, income_cfg)
+				est_inc = compute_year_income(y, age_p1, age_p2, primary_alive, spouse_alive, 1.0, income_cfg,
+					p1_death_age=life_expectancy_primary, p2_death_age=life_expectancy_spouse)
 				est_ss_taxable = est_inc['ss_income'] * 0.85
 				est_ordinary = est_rmd + est_ss_taxable + est_inc['pension_nominal'] + est_inc['annuity_nominal'] + est_inc['other_income']
 				est_deduction = itemized_deduction_amount if use_itemized_deductions else get_standard_deduction(est_filing, tax_law)
@@ -1497,7 +1540,8 @@ def simulate_withdrawals(start_age_primary: int,
 		# Compute all income streams for this year
 		run_pp = pp_factors_run if pp_factors_run is not None else pp_factors
 		pp_yr = run_pp[y - 1] if run_pp and y <= len(run_pp) else 1.0
-		yr_inc = compute_year_income(y, age_p1, age_p2, primary_alive, spouse_alive, pp_yr, income_cfg)
+		yr_inc = compute_year_income(y, age_p1, age_p2, primary_alive, spouse_alive, pp_yr, income_cfg,
+			p1_death_age=life_expectancy_primary, p2_death_age=life_expectancy_spouse)
 		ss_income = yr_inc['ss_income']
 		pension_income = yr_inc['pension_nominal']
 		pension_income_real = yr_inc['pension_real']
