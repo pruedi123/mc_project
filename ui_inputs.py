@@ -466,12 +466,16 @@ def _render_scenario_section():
 				le_chk = st.checkbox(f'S{i} override life expectancy', key=f'sc_le_chk_{i}',
 					help='Test early death scenarios. Overrides life expectancy for one or both people.')
 				if le_chk:
+					_le_min_p1 = int(st.session_state.get('start_age', 65))
+					_le_min_p2 = int(st.session_state.get('start_age_spouse', 60))
 					sc_overrides['life_expectancy_primary'] = int(st.number_input(
-						f'S{i} Person 1 life expectancy', value=84, min_value=18, max_value=120,
+						f'S{i} Person 1 life expectancy', value=84,
+						min_value=_le_min_p1, max_value=120,
 						step=1, key=f'sc_le_p1_{i}',
 						help='Last age P1 lives through in this scenario.'))
 					sc_overrides['life_expectancy_spouse'] = int(st.number_input(
-						f'S{i} Person 2 life expectancy', value=89, min_value=18, max_value=120,
+						f'S{i} Person 2 life expectancy', value=89,
+						min_value=_le_min_p2, max_value=120,
 						step=1, key=f'sc_le_p2_{i}',
 						help='Last age P2 lives through in this scenario.'))
 				scenario_overrides_ui[i] = sc_overrides
