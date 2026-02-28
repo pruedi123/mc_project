@@ -103,6 +103,11 @@ def _save_inputs_to_json(client: str, name: str):
 			'end': st.session_state.get(f'add_goal_end_{g}', 1),
 			'priority': st.session_state.get(f'add_goal_priority_{g}', 'Need'),
 			'cap': st.session_state.get(f'add_goal_cap_{g}', -1.0),
+			'fund_sep': st.session_state.get(f'add_goal_fund_sep_{g}', False),
+			'fund_taxable': st.session_state.get(f'add_goal_fund_taxable_{g}', 0.0),
+			'fund_tda1': st.session_state.get(f'add_goal_fund_tda1_{g}', 0.0),
+			'fund_tda2': st.session_state.get(f'add_goal_fund_tda2_{g}', 0.0),
+			'fund_stock_pct': st.session_state.get(f'add_goal_fund_stock_pct_{g}', 60),
 		})
 	data['add_goals'] = add_goals
 	# Save scenario override UI keys (dynamic)
@@ -199,6 +204,11 @@ def _load_inputs_from_json(client: str, name: str):
 			elif raw_priority == 'Want': raw_priority = 'Flexible'
 			st.session_state[f'add_goal_priority_{g}'] = raw_priority
 			st.session_state[f'add_goal_cap_{g}'] = goal.get('cap', -1.0)
+			st.session_state[f'add_goal_fund_sep_{g}'] = goal.get('fund_sep', False)
+			st.session_state[f'add_goal_fund_taxable_{g}'] = goal.get('fund_taxable', 0.0)
+			st.session_state[f'add_goal_fund_tda1_{g}'] = goal.get('fund_tda1', 0.0)
+			st.session_state[f'add_goal_fund_tda2_{g}'] = goal.get('fund_tda2', 0.0)
+			st.session_state[f'add_goal_fund_stock_pct_{g}'] = goal.get('fund_stock_pct', 60)
 	# Restore scenario overrides
 	if 'scenario_overrides' in data:
 		for s_idx_str, sc_data in data['scenario_overrides'].items():
@@ -616,7 +626,7 @@ def _render_withdrawal_section(horizon):
 			period_start = int(period_end) + 1
 		rmd_start_age = st.number_input('RMD start age (person 1)', min_value=65, max_value=89, value=73, key='rmd_start_age')
 		rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73, key='rmd_start_age_spouse')
-		ending_balance_goal = st.number_input('Ending balance goal (legacy target)', value=1000000.0, min_value=0.0, step=50000.0, key='ending_balance_goal',
+		ending_balance_goal = st.number_input('Ending balance goal (legacy target)', value=0.0, min_value=0.0, step=50000.0, key='ending_balance_goal',
 			help='Success = ending portfolio ≥ this amount. Use this as your legacy target — money left in the portfolio avoids the tax drag of withdrawing and re-gifting. $1 = simply not depleted.')
 	return {
 		'withdrawal_schedule_inputs': withdrawal_schedule_inputs,
@@ -650,7 +660,30 @@ def _render_add_goals_section(horizon):
 				value=gd['cap'], min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
 				help='Cap how much this goal can increase in good markets. 0 = never exceed target. 50 = up to 150% of target. -1 = no cap (unlimited).',
 				key=f'add_goal_cap_{g}')
-			add_goal_inputs.append((g_label, float(g_amount), int(g_begin), int(g_end), g_priority, float(g_cap)))
+			g_fund_sep = st.checkbox(f'Fund separately', value=False, key=f'add_goal_fund_sep_{g}',
+				help='Set aside money today to fully fund this goal. Removes it from the withdrawal plan and tracks it in shadow accounts.')
+			g_fund_taxable = 0.0
+			g_fund_tda1 = 0.0
+			g_fund_tda2 = 0.0
+			g_fund_stock_pct = 60
+			if g_fund_sep:
+				g_fund_stock_pct = st.slider(f'Goal {g+1} stock allocation %', 0, 100, 60, 5,
+					key=f'add_goal_fund_stock_pct_{g}',
+					help='Stock/bond allocation for the separately funded goal account. '
+					'Lower allocations reduce worst-case growth, increasing the set-aside cost.')
+				st.caption('Source of funds (leave all at 0 to auto-fill from taxable when sim runs)')
+				fc1, fc2, fc3 = st.columns(3)
+				with fc1:
+					g_fund_taxable = st.number_input(f'From Taxable', value=0.0, min_value=0.0,
+						step=5000.0, key=f'add_goal_fund_taxable_{g}')
+				with fc2:
+					g_fund_tda1 = st.number_input(f'From TDA P1', value=0.0, min_value=0.0,
+						step=5000.0, key=f'add_goal_fund_tda1_{g}')
+				with fc3:
+					g_fund_tda2 = st.number_input(f'From TDA P2', value=0.0, min_value=0.0,
+						step=5000.0, key=f'add_goal_fund_tda2_{g}')
+			add_goal_inputs.append((g_label, float(g_amount), int(g_begin), int(g_end), g_priority, float(g_cap),
+				bool(g_fund_sep), float(g_fund_taxable), float(g_fund_tda1), float(g_fund_tda2), int(g_fund_stock_pct)))
 	return add_goal_inputs
 
 def _render_income_section():

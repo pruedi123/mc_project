@@ -1190,7 +1190,12 @@ def simulate_withdrawals(start_age_primary: int,
 						 earned_income_annual: float = 0.0,
 						 earned_income_years: int = 0,
 						 irmaa_enabled: bool = False,
-						 prefer_tda_before_taxable: bool = False):
+						 prefer_tda_before_taxable: bool = False,
+						 goal_taxable_start: float = 0.0,
+						 goal_tda_start: float = 0.0,
+						 goal_tda_p1_fraction: float = 0.0,
+						 goal_liquidation_schedule: Optional[Sequence[float]] = None,
+						 goal_stock_pct: float = 0.5):
 	table = get_uniform_lifetime_table()
 
 	# Income config dict (shared across all years — constant per run)
@@ -1253,6 +1258,15 @@ def simulate_withdrawals(start_age_primary: int,
 		raise ValueError('stock_return_series must have at least `years` entries')
 	if bond_return_series is not None and len(bond_return_series) < years:
 		raise ValueError('bond_return_series must have at least `years` entries')
+
+	# Shadow goal accounts — separately funded goals
+	has_goal_accounts = (goal_taxable_start > 0 or goal_tda_start > 0)
+	goal_stocks_mv = goal_taxable_start * goal_stock_pct
+	goal_bonds_mv = goal_taxable_start * (1 - goal_stock_pct)
+	goal_stocks_basis = goal_stocks_mv * taxable_stock_basis_pct
+	goal_bonds_basis = goal_bonds_mv * taxable_bond_basis_pct
+	goal_tda_stocks_mv = goal_tda_start * goal_stock_pct
+	goal_tda_bonds_mv = goal_tda_start * (1 - goal_stock_pct)
 
 	rows = []
 
@@ -1356,6 +1370,27 @@ def simulate_withdrawals(start_age_primary: int,
 			tda2_stocks_mv + tda2_bonds_mv,
 			roth_stocks_mv + roth_bonds_mv
 		)
+		# Rebalance shadow goal accounts to goal allocation
+		if has_goal_accounts:
+			goal_tax_total = goal_stocks_mv + goal_bonds_mv
+			if goal_tax_total > 0:
+				goal_target_stocks = goal_tax_total * goal_stock_pct
+				goal_sell_stocks = goal_stocks_mv - goal_target_stocks
+				if goal_sell_stocks > 0:
+					ratio = goal_stocks_basis / goal_stocks_mv if goal_stocks_mv > 0 else 1.0
+					goal_stocks_basis -= goal_sell_stocks * ratio
+					goal_bonds_basis += goal_sell_stocks  # reinvest at market = basis
+				elif goal_sell_stocks < 0:
+					ratio = goal_bonds_basis / goal_bonds_mv if goal_bonds_mv > 0 else 1.0
+					goal_bonds_basis += goal_sell_stocks * ratio  # negative = subtract
+					goal_stocks_basis -= goal_sell_stocks  # reinvest at market
+				goal_stocks_mv = goal_target_stocks
+				goal_bonds_mv = goal_tax_total - goal_target_stocks
+			goal_tda_total = goal_tda_stocks_mv + goal_tda_bonds_mv
+			if goal_tda_total > 0:
+				goal_tda_stocks_mv = goal_tda_total * goal_stock_pct
+				goal_tda_bonds_mv = goal_tda_total - goal_tda_stocks_mv
+
 		# Guardrail check: after rebalance, before growth (skip year 1 — already solved)
 		if guardrails_enabled and y > 1:
 			total_portfolio_now = (stocks_mv + bonds_mv +
@@ -1459,8 +1494,10 @@ def simulate_withdrawals(start_age_primary: int,
 			pending_roth_conversion = 0.0
 
 		# Capture pre-growth TDA balances for RMD computation (prior year-end basis)
-		rmd_base_p1 = tda1_stocks_mv + tda1_bonds_mv
-		rmd_base_p2 = tda2_stocks_mv + tda2_bonds_mv
+		# Goal TDA inflates the RMD base but is withdrawn from primary TDA only
+		goal_tda_total_for_rmd = goal_tda_stocks_mv + goal_tda_bonds_mv if has_goal_accounts else 0.0
+		rmd_base_p1 = tda1_stocks_mv + tda1_bonds_mv + goal_tda_total_for_rmd * goal_tda_p1_fraction
+		rmd_base_p2 = tda2_stocks_mv + tda2_bonds_mv + goal_tda_total_for_rmd * (1 - goal_tda_p1_fraction)
 
 		stock_return_year = stock_return_series[y-1] if stock_return_series is not None else stock_total_return
 		bond_return_year = bond_return_series[y-1] if bond_return_series is not None else bond_return
@@ -1507,6 +1544,28 @@ def simulate_withdrawals(start_age_primary: int,
 			inh_ira_distribution = inh_ira_balance / max(1, inh_ira_years_remaining)
 			inh_ira_balance -= inh_ira_distribution
 			inh_ira_years_remaining -= 1
+
+		# Grow shadow goal accounts
+		goal_div = 0.0
+		goal_interest = 0.0
+		goal_turnover_gain = 0.0
+		if has_goal_accounts:
+			# Goal TDA growth
+			goal_tda_stocks_mv *= (1 + stock_return_year)
+			goal_tda_bonds_mv *= (1 + bond_return_year)
+			# Goal taxable: split return into price + dividend (same as primary taxable)
+			goal_stocks_mv *= (1 + price_return)
+			goal_div = goal_stocks_mv * stock_dividend_yield
+			goal_stocks_mv += goal_div
+			goal_stocks_basis += goal_div
+			goal_interest = goal_bonds_mv * bond_return_year
+			goal_bonds_mv += goal_interest
+			goal_bonds_basis += goal_interest
+			# Goal taxable turnover
+			g_turnover_sale = goal_stocks_mv * stock_turnover
+			g_turnover_basis_sold = goal_stocks_basis * stock_turnover
+			goal_turnover_gain = max(0.0, g_turnover_sale - g_turnover_basis_sold)
+			goal_stocks_basis = goal_stocks_basis - g_turnover_basis_sold + g_turnover_sale
 
 		# capture portfolio growth before any withdrawals/RMDs/taxes
 		start_total_balance = start_stocks_mv + start_bonds_mv + start_tda + start_tda_spouse + start_roth
@@ -1579,9 +1638,23 @@ def simulate_withdrawals(start_age_primary: int,
 			'roth_stocks': roth_stocks_mv, 'roth_bonds': roth_bonds_mv,
 			'total_rmd_cash': total_rmd_cash,
 		}
+		# Estimate goal liquidation cap gains for this year (predictable from schedule)
+		goal_liquidation_cap_gain_est = 0.0
+		goal_spending_yr = 0.0
+		if has_goal_accounts and goal_liquidation_schedule and y <= len(goal_liquidation_schedule):
+			goal_spending_yr = goal_liquidation_schedule[y - 1]
+			if goal_spending_yr > 0:
+				# Estimate: liquidate from goal taxable first, pro-rata basis
+				goal_tax_total_now = goal_stocks_mv + goal_bonds_mv
+				goal_tax_basis_now = goal_stocks_basis + goal_bonds_basis
+				liq_from_taxable = min(goal_spending_yr, goal_tax_total_now)
+				if liq_from_taxable > 0 and goal_tax_total_now > 0:
+					basis_ratio = goal_tax_basis_now / goal_tax_total_now
+					goal_liquidation_cap_gain_est = max(0.0, liq_from_taxable * (1 - basis_ratio))
+
 		year_income = {
-			'interest': interest, 'div': div,
-			'turnover_realized_gain': turnover_realized_gain,
+			'interest': interest + goal_interest, 'div': div + goal_div,
+			'turnover_realized_gain': turnover_realized_gain + goal_turnover_gain + goal_liquidation_cap_gain_est,
 			'rebalance_realized_gain': rebalance_realized_gain,
 			'ss_income': ss_income,
 			'pension_nominal': pension_income, 'pension_real': pension_income_real,
@@ -1645,6 +1718,36 @@ def simulate_withdrawals(start_age_primary: int,
 		roth_stocks_mv = chosen['roth_stocks']
 		roth_bonds_mv = chosen['roth_bonds']
 		cap_loss_carryforward = chosen.get('cap_loss_carryforward_out', 0.0)
+
+		# Goal liquidation: draw down shadow accounts in goal years
+		goal_liq_actual = 0.0
+		if has_goal_accounts and goal_spending_yr > 0:
+			remaining = goal_spending_yr
+			# Liquidate from goal taxable first (bonds, then stocks)
+			if remaining > 0 and goal_bonds_mv > 0:
+				sell_bonds = min(remaining, goal_bonds_mv)
+				goal_bonds_mv -= sell_bonds
+				goal_bonds_basis = max(0.0, goal_bonds_basis - sell_bonds)
+				remaining -= sell_bonds
+				goal_liq_actual += sell_bonds
+			if remaining > 0 and goal_stocks_mv > 0:
+				sell_stocks = min(remaining, goal_stocks_mv)
+				basis_sold = goal_stocks_basis * (sell_stocks / goal_stocks_mv) if goal_stocks_mv > 0 else 0.0
+				goal_stocks_mv -= sell_stocks
+				goal_stocks_basis -= basis_sold
+				remaining -= sell_stocks
+				goal_liq_actual += sell_stocks
+			# Then from goal TDA (bonds, then stocks)
+			if remaining > 0 and goal_tda_bonds_mv > 0:
+				sell_tda_bonds = min(remaining, goal_tda_bonds_mv)
+				goal_tda_bonds_mv -= sell_tda_bonds
+				remaining -= sell_tda_bonds
+				goal_liq_actual += sell_tda_bonds
+			if remaining > 0 and goal_tda_stocks_mv > 0:
+				sell_tda_stocks = min(remaining, goal_tda_stocks_mv)
+				goal_tda_stocks_mv -= sell_tda_stocks
+				remaining -= sell_tda_stocks
+				goal_liq_actual += sell_tda_stocks
 
 		# Track MAGI for future IRMAA lookback
 		year_magi = chosen['taxable_ordinary'] + deduction + chosen['cap_gains_total']
@@ -1714,6 +1817,9 @@ def simulate_withdrawals(start_age_primary: int,
 			'withdrawal_used': chosen['gross_target'],
 			'net_spending_target': net_target,
 			'after_tax_spending': chosen['net_spending'],
+			'goal_taxable_balance': goal_stocks_mv + goal_bonds_mv if has_goal_accounts else 0.0,
+			'goal_tda_balance': goal_tda_stocks_mv + goal_tda_bonds_mv if has_goal_accounts else 0.0,
+			'goal_liquidation': goal_liq_actual if has_goal_accounts else 0.0,
 		})
 
 	df = pd.DataFrame(rows)
