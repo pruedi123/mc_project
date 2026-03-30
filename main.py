@@ -171,7 +171,8 @@ def _render_client_view(success_rate, spending_pct_rows, percentile_rows,
 
 	# ── Section 1: The Verdict ──
 	pct = success_rate * 100
-	successes = int(round(pct))
+	num_sims = st.session_state.get('num_sims', 0)
+	successes = int(round(success_rate * num_sims))
 	if pct >= 90:
 		color, bg = '#16a34a', '#f0fdf4'
 		interp = 'Your plan is well-funded across a wide range of market conditions.'
@@ -185,7 +186,7 @@ def _render_client_view(success_rate, spending_pct_rows, percentile_rows,
 		f'<div style="border:2px solid {color}; border-radius:12px; padding:24px 28px; '
 		f'background:{bg}; text-align:center; max-width:60%; margin-bottom:20px;">'
 		f'<div style="font-size:1.8em; font-weight:700; color:{color}; margin-bottom:6px;">'
-		f'Your plan succeeds in {successes} out of 100 simulations</div>'
+		f'Your plan succeeds in {successes:,} out of {num_sims:,} simulations</div>'
 		f'<div style="color:#374151; font-size:1.05em;">{interp}</div></div>',
 		unsafe_allow_html=True,
 	)
