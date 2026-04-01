@@ -375,6 +375,39 @@ def _render_save_load_section():
 			else:
 				st.caption('No saved plans for this client yet.')
 
+		# Upload plan JSON file
+		st.divider()
+		uploaded = st.file_uploader('Upload a plan JSON file', type=['json'], key='upload_plan_file')
+		if uploaded is not None:
+			import json as _json
+			try:
+				data = _json.load(uploaded)
+				# Load into session state
+				for k in _SAVEABLE_KEYS:
+					if k in data:
+						st.session_state[k] = data[k]
+				if 'periods' in data:
+					for i, p in enumerate(data['periods']):
+						if 'amount' in p and p['amount'] is not None:
+							st.session_state[f'wd_amount_{i}'] = p['amount']
+						if 'end_year' in p:
+							st.session_state[f'wd_end_{i}'] = p['end_year']
+				if 'add_goals' in data:
+					for g, goal in enumerate(data['add_goals']):
+						st.session_state[f'add_goal_label_{g}'] = goal.get('label', '')
+						st.session_state[f'add_goal_amount_{g}'] = goal.get('amount', 0.0)
+						st.session_state[f'add_goal_begin_{g}'] = goal.get('begin', 1)
+						st.session_state[f'add_goal_end_{g}'] = goal.get('end', 1)
+						raw_priority = goal.get('priority', 'Essential')
+						if raw_priority == 'Need': raw_priority = 'Essential'
+						elif raw_priority == 'Want': raw_priority = 'Flexible'
+						st.session_state[f'add_goal_priority_{g}'] = raw_priority
+						st.session_state[f'add_goal_cap_{g}'] = goal.get('cap', -1.0)
+				st.success(f'Plan loaded from uploaded file')
+				st.rerun()
+			except Exception as e:
+				st.error(f'Error loading plan: {e}')
+
 def _render_scenario_section():
 	"""Render Scenario Comparison expander. Returns (num_scenarios, scenario_overrides_ui)."""
 	with st.expander('Scenario Comparison'):
