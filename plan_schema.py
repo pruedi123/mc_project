@@ -39,8 +39,8 @@ PLAN_DEFAULTS = {
 
     # Social Security
     "social_security": {
-        "person1": {"benefit": 25000, "start_age": 67, "fra": 67},
-        "person2": {"benefit": 20000, "start_age": 65, "fra": 67},
+        "person1": {"benefit": 0, "start_age": 67, "fra": 67},
+        "person2": {"benefit": 0, "start_age": 67, "fra": 67},
         "cola": 0.0,
     },
 

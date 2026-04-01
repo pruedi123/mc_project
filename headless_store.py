@@ -165,16 +165,7 @@ def save_plan(plan: dict, pdf_bytes: bytes = None) -> dict:
     os.makedirs(cdir, exist_ok=True)
 
     stem = _plan_stem(client)
-
-    # Find next available name
-    existing = [f for f in os.listdir(cdir) if f.endswith('.json') and not f.endswith('_results.json')]
-    if f'{stem}.json' not in existing:
-        name = stem
-    else:
-        n = 2
-        while f'{stem}_{n}.json' in existing:
-            n += 1
-        name = f'{stem}_{n}'
+    name = stem  # always overwrite the same file
 
     # Convert to Streamlit format
     streamlit_data = _plan_to_streamlit_format(plan)
@@ -226,23 +217,13 @@ def update_plan(plan: dict, json_path: str, pdf_bytes: bytes = None) -> dict:
 def load_plan(client_name: str, plan_name: str = None) -> dict:
     """Load a saved plan in clean format. If plan_name is None, load the most recent.
 
-    Prefers _plan.json (clean format) over .json (Streamlit format).
+    Loads the Streamlit-format .json (authoritative) and converts to clean format.
     """
     cdir = _client_dir(client_name)
     if not os.path.isdir(cdir):
         raise FileNotFoundError(f'No client folder: {cdir}')
 
-    # Look for clean plan files first
-    plan_jsons = sorted([f for f in os.listdir(cdir)
-                         if f.endswith('_plan.json')],
-                        key=lambda f: os.path.getmtime(os.path.join(cdir, f)))
-
-    if plan_jsons:
-        fname = plan_jsons[-1]  # most recent
-        with open(os.path.join(cdir, fname)) as f:
-            return json.load(f)
-
-    # Fall back to Streamlit format files
+    # Load Streamlit format files (authoritative)
     jsons = sorted([f for f in os.listdir(cdir)
                     if f.endswith('.json') and not f.endswith('_results.json')
                     and not f.endswith('_plan.json')],
@@ -254,6 +235,10 @@ def load_plan(client_name: str, plan_name: str = None) -> dict:
     fname = jsons[-1]
     with open(os.path.join(cdir, fname)) as f:
         data = json.load(f)
+
+    # If it's already clean format (has 'person1' dict), return as-is
+    if isinstance(data.get('person1'), dict):
+        return data
 
     # Convert Streamlit format to clean format
     return _streamlit_to_plan_format(data, client_name)

@@ -274,23 +274,84 @@ def _process_message(text, channel, thread_ts, say_fn, slack_client):
             spending = plan.get('spending', {})
             alloc = plan.get('allocation', {})
 
+            pensions = plan.get('pensions', {})
+            annuities = plan.get('annuities', {})
+            tax = plan.get('tax', {})
+            gr = plan.get('guardrails', {})
+            ret = plan.get('returns', {})
+            goals = plan.get('goals') or []
+            earned = plan.get('earned_income', {})
+
             lines = [
                 f"*{matches[0]}*",
                 "",
-                f"Person 1: age {p1.get('age', '?')}, life expectancy {p1.get('life_expectancy', '?')}",
-                f"Person 2: age {p2.get('age', '?')}, life expectancy {p2.get('life_expectancy', '?')}",
+                "*Demographics:*",
+                f"  Person 1: age {p1.get('age', '?')}, life expectancy {p1.get('life_expectancy', '?')}",
+                f"  Person 2: age {p2.get('age', '?')}, life expectancy {p2.get('life_expectancy', '?')}",
                 "",
-                f"Taxable: ${accts.get('taxable', 0):,.0f}",
-                f"TDA P1: ${accts.get('tda_p1', 0):,.0f}",
-                f"TDA P2: ${accts.get('tda_p2', 0):,.0f}",
-                f"Roth: ${accts.get('roth', 0):,.0f}",
+                "*Accounts:*",
+                f"  Taxable: ${accts.get('taxable', 0):,.0f} (basis: {accts.get('taxable_stock_basis_pct', 50)}% stock, {accts.get('taxable_bond_basis_pct', 100)}% bond)",
+                f"  TDA P1: ${accts.get('tda_p1', 0):,.0f}",
+                f"  TDA P2: ${accts.get('tda_p2', 0):,.0f}",
+                f"  Roth: ${accts.get('roth', 0):,.0f}",
                 "",
-                f"SS P1: ${ss.get('person1', {}).get('benefit', 0):,.0f}/yr at age {ss.get('person1', {}).get('start_age', '?')}",
-                f"SS P2: ${ss.get('person2', {}).get('benefit', 0):,.0f}/yr at age {ss.get('person2', {}).get('start_age', '?')}",
-                "",
-                f"Spending: ${spending.get('annual', 0):,.0f}/yr",
-                f"Allocation: {alloc.get('stock_pct', 60)}% stocks",
+                "*Income:*",
+                f"  SS P1: ${ss.get('person1', {}).get('benefit', 0):,.0f}/yr at age {ss.get('person1', {}).get('start_age', '?')} (FRA {ss.get('person1', {}).get('fra', 67)})",
+                f"  SS P2: ${ss.get('person2', {}).get('benefit', 0):,.0f}/yr at age {ss.get('person2', {}).get('start_age', '?')} (FRA {ss.get('person2', {}).get('fra', 67)})",
+                f"  SS COLA: {ss.get('cola', 0):.1%}" if ss.get('cola', 0) > 0 else None,
             ]
+            pen1 = pensions.get('person1', {}).get('income', 0)
+            pen2 = pensions.get('person2', {}).get('income', 0)
+            if pen1 > 0:
+                lines.append(f"  Pension P1: ${pen1:,.0f}/yr (COLA {pensions['person1'].get('cola', 0):.1%}, survivor {pensions['person1'].get('survivor_pct', 0):.0%})")
+            if pen2 > 0:
+                lines.append(f"  Pension P2: ${pen2:,.0f}/yr (COLA {pensions['person2'].get('cola', 0):.1%}, survivor {pensions['person2'].get('survivor_pct', 0):.0%})")
+            ann1 = annuities.get('person1', {}).get('income', 0)
+            ann2 = annuities.get('person2', {}).get('income', 0)
+            if ann1 > 0:
+                lines.append(f"  Annuity P1: ${ann1:,.0f}/yr (COLA {annuities['person1'].get('cola', 0):.1%}, survivor {annuities['person1'].get('survivor_pct', 0):.0%})")
+            if ann2 > 0:
+                lines.append(f"  Annuity P2: ${ann2:,.0f}/yr (COLA {annuities['person2'].get('cola', 0):.1%}, survivor {annuities['person2'].get('survivor_pct', 0):.0%})")
+            other = plan.get('other_income', 0)
+            if other > 0:
+                lines.append(f"  Other income: ${other:,.0f}/yr")
+            earned_amt = earned.get('annual', 0) if isinstance(earned, dict) else 0
+            if earned_amt > 0:
+                lines.append(f"  Earned income: ${earned_amt:,.0f}/yr for {earned.get('years', 0)} years")
+
+            lines.extend([
+                "",
+                "*Spending & Allocation:*",
+                f"  Spending: ${spending.get('annual', 0):,.0f}/yr",
+                f"  Allocation: {alloc.get('stock_pct', 60)}% stocks / {100 - alloc.get('stock_pct', 60)}% bonds",
+            ])
+
+            if goals:
+                lines.append("")
+                lines.append("*Additional Goals:*")
+                for g in goals:
+                    lines.append(f"  {g.get('label', '?')}: ${g.get('amount', 0):,.0f}/yr, years {g.get('begin', '?')}-{g.get('end', '?')} ({g.get('priority', '?')})")
+
+            filing = tax.get('filing_status', 'mfj')
+            filing_display = 'Married Filing Jointly' if filing == 'mfj' else 'Single'
+            lines.extend([
+                "",
+                "*Tax:*",
+                f"  Filing: {filing_display}",
+                f"  State tax: {tax.get('state_tax_rate', 0.05):.1%}",
+                f"  Retirement income exempt: {'Yes' if tax.get('state_exempt_retirement', True) else 'No'}",
+                f"  Inheritor marginal rate: {tax.get('inheritor_marginal_rate', 0.35):.0%}",
+                "",
+                "*Guardrails:*",
+                f"  Enabled: {'Yes' if gr.get('enabled', True) else 'No'}",
+                f"  Lower/Upper/Target: {gr.get('lower', 0.75):.0%} / {gr.get('upper', 0.90):.0%} / {gr.get('target', 0.85):.0%}",
+                f"  Spending cap: {gr.get('max_spending_pct', 50):.0f}% above base",
+                "",
+                "*Returns:*",
+                f"  Mode: {'Historical' if ret.get('mode', 'historical') == 'historical' else 'Lognormal (Monte Carlo)'}",
+                f"  Investment fees: {ret.get('investment_fee_bps', 0):.0f} bps",
+            ])
+            lines = [l for l in lines if l is not None]
             slack_client.chat_postMessage(channel=channel, text="\n".join(lines), thread_ts=thread_ts)
             return
 

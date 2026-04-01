@@ -12,6 +12,10 @@ from datetime import datetime
 
 SAVES_DIR = os.path.expanduser('~/RWM/Current Client Plans')
 
+def _is_cloud() -> bool:
+	"""Detect if running on Streamlit Cloud (no local client plans folder)."""
+	return not os.path.exists(SAVES_DIR)
+
 # Keys that map directly to session_state widget keys for save/load
 _SAVEABLE_KEYS = [
 	'start_age', 'start_age_spouse', 'life_expectancy_primary', 'life_expectancy_spouse',
@@ -176,6 +180,57 @@ def _save_inputs_to_json(client: str, name: str):
 
 	return path
 
+
+def _collect_inputs_as_json() -> str:
+	"""Collect current widget values from session_state and return as JSON string (for download on cloud)."""
+	data = {}
+	for k in _SAVEABLE_KEYS:
+		if k in st.session_state:
+			data[k] = st.session_state[k]
+	n_periods = int(st.session_state.get('num_withdrawal_periods', 1))
+	periods = []
+	for i in range(n_periods):
+		p = {'amount': st.session_state.get(f'wd_amount_{i}')}
+		if f'wd_end_{i}' in st.session_state:
+			p['end_year'] = st.session_state[f'wd_end_{i}']
+		periods.append(p)
+	data['periods'] = periods
+	n_goals = int(st.session_state.get('num_add_goals', 0))
+	add_goals = []
+	for g in range(n_goals):
+		add_goals.append({
+			'label': st.session_state.get(f'add_goal_label_{g}', ''),
+			'amount': st.session_state.get(f'add_goal_amount_{g}', 0.0),
+			'begin': st.session_state.get(f'add_goal_begin_{g}', 1),
+			'end': st.session_state.get(f'add_goal_end_{g}', 1),
+			'priority': st.session_state.get(f'add_goal_priority_{g}', 'Need'),
+			'cap': st.session_state.get(f'add_goal_cap_{g}', -1.0),
+			'fund_sep': st.session_state.get(f'add_goal_fund_sep_{g}', False),
+			'fund_taxable': st.session_state.get(f'add_goal_fund_taxable_{g}', 0.0),
+			'fund_tda1': st.session_state.get(f'add_goal_fund_tda1_{g}', 0.0),
+			'fund_tda2': st.session_state.get(f'add_goal_fund_tda2_{g}', 0.0),
+			'fund_stock_pct': st.session_state.get(f'add_goal_fund_stock_pct_{g}', 60),
+		})
+	data['add_goals'] = add_goals
+	n_sc = int(st.session_state.get('num_scenarios', 1))
+	if n_sc > 1:
+		sc_overrides = {}
+		for s_idx in range(2, n_sc + 1):
+			sc_data = {}
+			for suffix in ['spend_mode', 'spend_scale', 'spend_flat', 'stock_chk', 'stock',
+							'roth_chk', 'roth_mode', 'roth_amt', 'roth_yrs', 'roth_bracket',
+							'annuity_chk', 'ann_purchase',
+							'ann_income', 'ann_cola', 'ann_person', 'ann_surv', 'ann_start',
+							'buyout_chk', 'buyout_choice', 'buyout_person', 'buyout_lump',
+							'buyout_income', 'buyout_cola', 'buyout_surv',
+							'le_chk', 'le_p1', 'le_p2']:
+				key = f'sc_{suffix}_{s_idx}'
+				if key in st.session_state:
+					sc_data[key] = st.session_state[key]
+			sc_overrides[str(s_idx)] = sc_data
+		data['scenario_overrides'] = sc_overrides
+	return json.dumps(data, indent=2, default=str)
+
 def _load_inputs_from_json(client: str, name: str):
 	"""Read Current Client Plans/{client}/{name}.json and set values into session_state."""
 	path = os.path.join(SAVES_DIR, client, f'{name}.json')
@@ -334,79 +389,76 @@ def _render_save_load_section():
 					st.warning('Last and first name are required.')
 
 		if client:
-			saved_files = _get_saved_files(client)
-			# Handle pending load (set before widgets render)
-			if st.session_state.get('_pending_load'):
-				load_client, load_name = st.session_state.pop('_pending_load')
-				_load_inputs_from_json(load_client, load_name)
-				st.session_state['save_file_name'] = load_name
-			# Auto-generate default plan name from client name
-			default_plan = _default_plan_name(last_s, first_s, id_s, saved_files) if last_s and first_s else 'my_plan'
-			save_name = st.text_input('Plan name', value=default_plan, key='save_file_name')
-			if st.button('Save Inputs'):
-				if save_name.strip():
-					path = _save_inputs_to_json(client, save_name.strip())
-					results_path = save_results_to_json(client, save_name.strip())
-					if results_path:
-						st.success(f'Saved inputs + results to {client}/{save_name.strip()}')
-					else:
-						st.success(f'Saved inputs to {client}/{os.path.basename(path)} (no simulation results yet)')
-				else:
-					st.warning('Enter a plan name.')
-			if saved_files:
-				load_choice = st.selectbox('Load saved plan', saved_files, key='load_file_choice')
-				col_load, col_del = st.columns(2)
-				with col_load:
-					if st.button('Load'):
-						st.session_state['_pending_load'] = (client, load_choice)
-						st.rerun()
-				with col_del:
-					if st.button('Delete'):
-						os.remove(os.path.join(SAVES_DIR, client, f'{load_choice}.json'))
-						# Also remove companion results file if it exists
-						results_path = os.path.join(SAVES_DIR, client, f'{load_choice}_results.json')
-						if os.path.exists(results_path):
-							os.remove(results_path)
-						# Remove client folder if empty
-						client_dir = os.path.join(SAVES_DIR, client)
-						if not os.listdir(client_dir):
-							os.rmdir(client_dir)
-						st.rerun()
+			if _is_cloud():
+				# ── Cloud mode: download instead of save to disk ──
+				default_plan = _default_plan_name(last_s, first_s, id_s, []) if last_s and first_s else 'my_plan'
+				save_name = st.text_input('Plan name', value=default_plan, key='save_file_name')
+				json_str = _collect_inputs_as_json()
+				st.download_button(
+					'Download Plan JSON',
+					data=json_str,
+					file_name=f'{save_name.strip() or default_plan}.json',
+					mime='application/json',
+				)
+				st.caption('Save this file to iCloud Drive > RWM > Current Client Plans > (client folder) to sync with your Mac.')
 			else:
-				st.caption('No saved plans for this client yet.')
+				# ── Local mode: save to disk ──
+				saved_files = _get_saved_files(client)
+				# Handle pending load (set before widgets render)
+				if st.session_state.get('_pending_load'):
+					load_client, load_name = st.session_state.pop('_pending_load')
+					_load_inputs_from_json(load_client, load_name)
+					st.session_state['save_file_name'] = load_name
+				# Auto-generate default plan name from client name
+				default_plan = _default_plan_name(last_s, first_s, id_s, saved_files) if last_s and first_s else 'my_plan'
+				save_name = st.text_input('Plan name', value=default_plan, key='save_file_name')
+				if st.button('Save Inputs'):
+					if save_name.strip():
+						path = _save_inputs_to_json(client, save_name.strip())
+						results_path = save_results_to_json(client, save_name.strip())
+						if results_path:
+							st.success(f'Saved inputs + results to {client}/{save_name.strip()}')
+						else:
+							st.success(f'Saved inputs to {client}/{os.path.basename(path)} (no simulation results yet)')
+					else:
+						st.warning('Enter a plan name.')
+				if saved_files:
+					load_choice = st.selectbox('Load saved plan', saved_files, key='load_file_choice')
+					col_load, col_del = st.columns(2)
+					with col_load:
+						if st.button('Load'):
+							st.session_state['_pending_load'] = (client, load_choice)
+							st.rerun()
+					with col_del:
+						if st.button('Delete'):
+							os.remove(os.path.join(SAVES_DIR, client, f'{load_choice}.json'))
+							# Also remove companion results file if it exists
+							results_path = os.path.join(SAVES_DIR, client, f'{load_choice}_results.json')
+							if os.path.exists(results_path):
+								os.remove(results_path)
+							# Remove client folder if empty
+							client_dir = os.path.join(SAVES_DIR, client)
+							if not os.listdir(client_dir):
+								os.rmdir(client_dir)
+							st.rerun()
+				else:
+					st.caption('No saved plans for this client yet.')
 
 		# Upload plan JSON file
 		st.divider()
 		uploaded = st.file_uploader('Upload a plan JSON file', type=['json'], key='upload_plan_file')
-		if uploaded is not None:
+		if uploaded is not None and not st.session_state.get('_upload_processed'):
 			import json as _json
 			try:
 				data = _json.load(uploaded)
-				# Load into session state
-				for k in _SAVEABLE_KEYS:
-					if k in data:
-						st.session_state[k] = data[k]
-				if 'periods' in data:
-					for i, p in enumerate(data['periods']):
-						if 'amount' in p and p['amount'] is not None:
-							st.session_state[f'wd_amount_{i}'] = p['amount']
-						if 'end_year' in p:
-							st.session_state[f'wd_end_{i}'] = p['end_year']
-				if 'add_goals' in data:
-					for g, goal in enumerate(data['add_goals']):
-						st.session_state[f'add_goal_label_{g}'] = goal.get('label', '')
-						st.session_state[f'add_goal_amount_{g}'] = goal.get('amount', 0.0)
-						st.session_state[f'add_goal_begin_{g}'] = goal.get('begin', 1)
-						st.session_state[f'add_goal_end_{g}'] = goal.get('end', 1)
-						raw_priority = goal.get('priority', 'Essential')
-						if raw_priority == 'Need': raw_priority = 'Essential'
-						elif raw_priority == 'Want': raw_priority = 'Flexible'
-						st.session_state[f'add_goal_priority_{g}'] = raw_priority
-						st.session_state[f'add_goal_cap_{g}'] = goal.get('cap', -1.0)
-				st.success(f'Plan loaded from uploaded file')
+				st.session_state['_pending_upload'] = data
+				st.session_state['_upload_processed'] = True
 				st.rerun()
 			except Exception as e:
 				st.error(f'Error loading plan: {e}')
+		# Reset upload processed flag when file uploader is cleared
+		if uploaded is None:
+			st.session_state.pop('_upload_processed', None)
 
 def _render_scenario_section():
 	"""Render Scenario Comparison expander. Returns (num_scenarios, scenario_overrides_ui)."""
@@ -726,11 +778,11 @@ def _render_add_goals_section(horizon):
 def _render_income_section():
 	"""Render Other Income expander. Returns dict of income values."""
 	with st.expander('Other Income'):
-		ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=25000.0, step=1000.0, key='ss_income')
+		ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=0.0, step=1000.0, key='ss_income')
 		ss_start_age_p1 = st.number_input('SS start age - person 1', min_value=60, max_value=90, value=67, step=1, key='ss_start_age_p1')
 		ss_fra_age_p1 = st.selectbox('SS full retirement age - person 1', [66, 67], index=1, key='ss_fra_age_p1')
-		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=20000.0, step=1000.0, key='ss_income_spouse')
-		ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=65, step=1, key='ss_start_age_p2')
+		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=0.0, step=1000.0, key='ss_income_spouse')
+		ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=67, step=1, key='ss_start_age_p2')
 		ss_fra_age_p2 = st.selectbox('SS full retirement age - person 2', [66, 67], index=1, key='ss_fra_age_p2')
 		ss_cola = st.number_input('Social Security COLA', value=0.0, format="%.4f", key='ss_cola')
 		st.caption('Enter each person\'s own worker benefit from their SSA statement. '
@@ -962,8 +1014,45 @@ def _render_sim_settings():
 		'monte_carlo_runs': monte_carlo_runs,
 	}
 
+def _apply_pending_upload():
+	"""If a JSON was uploaded, apply its values to session state before widgets render."""
+	data = st.session_state.pop('_pending_upload', None)
+	if data is None:
+		return
+	for k in _SAVEABLE_KEYS:
+		if k in data:
+			st.session_state[k] = data[k]
+	if 'periods' in data:
+		for i, p in enumerate(data['periods']):
+			if 'amount' in p and p['amount'] is not None:
+				st.session_state[f'wd_amount_{i}'] = p['amount']
+			if 'end_year' in p:
+				st.session_state[f'wd_end_{i}'] = p['end_year']
+	if 'add_goals' in data:
+		for g, goal in enumerate(data['add_goals']):
+			st.session_state[f'add_goal_label_{g}'] = goal.get('label', '')
+			st.session_state[f'add_goal_amount_{g}'] = goal.get('amount', 0.0)
+			st.session_state[f'add_goal_begin_{g}'] = goal.get('begin', 1)
+			st.session_state[f'add_goal_end_{g}'] = goal.get('end', 1)
+			raw_priority = goal.get('priority', 'Essential')
+			if raw_priority == 'Need': raw_priority = 'Essential'
+			elif raw_priority == 'Want': raw_priority = 'Flexible'
+			st.session_state[f'add_goal_priority_{g}'] = raw_priority
+			st.session_state[f'add_goal_cap_{g}'] = goal.get('cap', -1.0)
+			st.session_state[f'add_goal_fund_sep_{g}'] = goal.get('fund_sep', False)
+			st.session_state[f'add_goal_fund_taxable_{g}'] = goal.get('fund_taxable', 0.0)
+			st.session_state[f'add_goal_fund_tda1_{g}'] = goal.get('fund_tda1', 0.0)
+			st.session_state[f'add_goal_fund_tda2_{g}'] = goal.get('fund_tda2', 0.0)
+			st.session_state[f'add_goal_fund_stock_pct_{g}'] = goal.get('fund_stock_pct', 60)
+	if 'scenario_overrides' in data:
+		for s_idx_str, sc_data in data['scenario_overrides'].items():
+			for key, val in sc_data.items():
+				st.session_state[key] = val
+
+
 def render_sidebar():
 	"""Render all sidebar inputs. Returns structured dict of all values."""
+	_apply_pending_upload()
 	with st.sidebar:
 		st.header('Inputs')
 		_render_save_load_section()
