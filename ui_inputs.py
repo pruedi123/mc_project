@@ -13,8 +13,8 @@ from datetime import datetime
 SAVES_DIR = os.path.expanduser('~/RWM/Current Client Plans')
 
 def _is_cloud() -> bool:
-	"""Detect if running on Streamlit Cloud (no local client plans folder)."""
-	return not os.path.exists(SAVES_DIR)
+	"""Detect if running on Streamlit Cloud (home dir is /home/appuser on cloud, not /Users/... on Mac)."""
+	return not os.path.expanduser('~').startswith('/Users')
 
 # Keys that map directly to session_state widget keys for save/load
 _SAVEABLE_KEYS = [
@@ -459,6 +459,9 @@ def _render_save_load_section():
 		# Reset upload processed flag when file uploader is cleared
 		if uploaded is None:
 			st.session_state.pop('_upload_processed', None)
+		# Show success message after upload is applied
+		if st.session_state.pop('_upload_success', False):
+			st.success('Plan loaded from uploaded file')
 
 def _render_scenario_section():
 	"""Render Scenario Comparison expander. Returns (num_scenarios, scenario_overrides_ui)."""
@@ -1048,6 +1051,7 @@ def _apply_pending_upload():
 		for s_idx_str, sc_data in data['scenario_overrides'].items():
 			for key, val in sc_data.items():
 				st.session_state[key] = val
+	st.session_state['_upload_success'] = True
 
 
 def render_sidebar():
