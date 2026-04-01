@@ -1017,6 +1017,36 @@ def _render_sim_settings():
 		'monte_carlo_runs': monte_carlo_runs,
 	}
 
+_FLOAT_KEYS = {
+	'taxable_start', 'taxable_stock_basis_pct', 'taxable_bond_basis_pct',
+	'roth_start', 'tda_start', 'tda_spouse_start',
+	'ss_income', 'ss_income_spouse', 'ss_cola',
+	'pension_income', 'pension_cola_p1', 'pension_survivor_pct_p1',
+	'pension_income_spouse', 'pension_cola_p2', 'pension_survivor_pct_p2',
+	'other_income', 'earned_income', 'qcd_annual',
+	'inheritor_marginal_rate', 'state_tax_rate',
+	'itemized_deduction', 'roth_conversion_amount',
+	'taxable_log_drift', 'taxable_log_volatility',
+	'bond_log_drift', 'bond_log_volatility',
+	'stock_dividend_yield', 'stock_turnover', 'investment_fee_bps',
+	'guardrail_lower', 'guardrail_upper', 'guardrail_target',
+	'guardrail_max_spending_pct', 'flex_goal_min_pct',
+	'ending_balance_goal',
+	'pension_buyout_income', 'pension_buyout_cola', 'pension_buyout_survivor',
+	'pension_buyout_lump',
+	'inheritance_taxable_amount', 'inheritance_ira_amount',
+	'roth_bracket_fill_rate',
+}
+_INT_KEYS = {
+	'start_age', 'start_age_spouse', 'life_expectancy_primary', 'life_expectancy_spouse',
+	'target_stock_pct', 'num_withdrawal_periods', 'num_add_goals', 'num_scenarios',
+	'ss_start_age_p1', 'ss_start_age_p2', 'ss_fra_age_p1', 'ss_fra_age_p2',
+	'rmd_start_age', 'rmd_start_age_spouse',
+	'earned_income_years', 'roth_conversion_years',
+	'guardrail_inner_sims', 'monte_carlo_runs', 'random_seed',
+	'display_decimals', 'inheritance_year', 'tcja_sunset_year',
+}
+
 def _apply_pending_upload():
 	"""If a JSON was uploaded, apply its values to session state before widgets render."""
 	data = st.session_state.pop('_pending_upload', None)
@@ -1024,7 +1054,12 @@ def _apply_pending_upload():
 		return
 	for k in _SAVEABLE_KEYS:
 		if k in data:
-			st.session_state[k] = data[k]
+			v = data[k]
+			if k in _FLOAT_KEYS and isinstance(v, (int, str)):
+				v = float(v)
+			elif k in _INT_KEYS and isinstance(v, (float, str)):
+				v = int(v)
+			st.session_state[k] = v
 	if 'periods' in data:
 		for i, p in enumerate(data['periods']):
 			if 'amount' in p and p['amount'] is not None:
