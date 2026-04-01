@@ -640,7 +640,14 @@ def build_scenario_params(base_params: dict, overrides: dict, stock_mu: float = 
 	if 'roth_conversion_years' in overrides:
 		params['roth_conversion_years'] = overrides['roth_conversion_years']
 	if 'annuity_purchase' in overrides:
-		params['taxable_start'] = params['taxable_start'] - overrides['annuity_purchase']
+		purchase = overrides['annuity_purchase']
+		fund_source = overrides.get('annuity_fund_source', 'Taxable')
+		if fund_source == 'TDA Person 1':
+			params['tda_start'] = params.get('tda_start', 0.0) - purchase
+		elif fund_source == 'TDA Person 2':
+			params['tda_spouse_start'] = params.get('tda_spouse_start', 0.0) - purchase
+		else:
+			params['taxable_start'] = params['taxable_start'] - purchase
 		income = overrides.get('annuity_annual_income', 0.0)
 		cola = overrides.get('annuity_cola', 0.0)
 		surv = overrides.get('annuity_survivor_pct', 0.0)
@@ -710,7 +717,7 @@ def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) ->
 			parts.append("No Roth conv")
 		elif mode == 'Fill to bracket':
 			rate = overrides.get('roth_bracket_fill_rate', base_params.get('roth_bracket_fill_rate', 0.22))
-			parts.append(f"Roth fill\u2192{rate*100:.0f}% x {yrs}yr")
+			parts.append(f"Roth fill->{rate*100:.0f}% x {yrs}yr")
 		else:
 			amt = overrides.get('roth_conversion_amount', base_params.get('roth_conversion_amount', 0))
 			if amt == 0:
@@ -720,7 +727,9 @@ def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) ->
 	if 'annuity_purchase' in overrides:
 		purchase = overrides['annuity_purchase']
 		income = overrides.get('annuity_annual_income', 0)
-		parts.append(f"Annuity ${purchase / 1000:.0f}k → ${income / 1000:.0f}k/yr")
+		source = overrides.get('annuity_fund_source', 'Taxable')
+		source_tag = {'Taxable': 'Tax', 'TDA Person 1': 'TDA1', 'TDA Person 2': 'TDA2'}.get(source, source)
+		parts.append(f"Annuity ${purchase / 1000:.0f}k({source_tag}) = ${income / 1000:.0f}k/yr")
 	if 'buyout_choice' in overrides:
 		choice = overrides['buyout_choice']
 		person = overrides.get('buyout_person', 'Person 1')
@@ -759,13 +768,24 @@ def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFra
 		years_in_run=('year', 'count'),
 	)
 	run_spending['avg_annual_after_tax_spending'] = run_spending['total_after_tax_spending'] / run_spending['years_in_run']
+	# Base vs goal spending breakdown
+	has_goal_col = 'goal_spending' in all_yearly_df.columns
+	if has_goal_col:
+		run_base = all_yearly_df.groupby('run')['base_spending'].sum()
+		run_goal = all_yearly_df.groupby('run')['goal_spending'].sum()
+		run_spending['avg_base_spending'] = run_base / run_spending['years_in_run']
+		run_spending['avg_goal_spending'] = run_goal / run_spending['years_in_run']
 	spending_pct_rows = []
 	for p in percentiles_list:
-		spending_pct_rows.append({
+		row = {
 			'percentile': p,
 			'avg_annual_after_tax_spending': np.percentile(run_spending['avg_annual_after_tax_spending'], p),
 			'total_lifetime_after_tax_spending': np.percentile(run_spending['total_after_tax_spending'], p),
-		})
+		}
+		if has_goal_col:
+			row['avg_base_spending'] = np.percentile(run_spending['avg_base_spending'], p)
+			row['avg_goal_spending'] = np.percentile(run_spending['avg_goal_spending'], p)
+		spending_pct_rows.append(row)
 	return {
 		'name': name,
 		'percentile_rows': pct_rows,
@@ -1679,6 +1699,9 @@ def simulate_withdrawals(start_age_primary: int,
 		net_target = compute_prioritized_target(current_scale_factor, base_this_year, flex_this_year,
 			essential_this_year, flex_goal_min_pct, base_is_essential,
 			flex_capped_base=fcb_this_year, flex_cap_max=fcm_this_year)
+		# Track base vs goal spending for reporting
+		base_spending_target = base_this_year * current_scale_factor if current_scale_factor >= 1.0 else base_this_year * current_scale_factor
+		goal_spending_target = net_target - base_spending_target
 
 		base_net, base_result = try_gross_withdrawal(0.0, snap_balances, year_income, tax_cfg)
 
@@ -1816,6 +1839,8 @@ def simulate_withdrawals(start_age_primary: int,
 			'end_roth': roth_stocks_mv + roth_bonds_mv,
 			'withdrawal_used': chosen['gross_target'],
 			'net_spending_target': net_target,
+			'base_spending': base_spending_target,
+			'goal_spending': goal_spending_target,
 			'after_tax_spending': chosen['net_spending'],
 			'goal_taxable_balance': goal_stocks_mv + goal_bonds_mv if has_goal_accounts else 0.0,
 			'goal_tda_balance': goal_tda_stocks_mv + goal_tda_bonds_mv if has_goal_accounts else 0.0,

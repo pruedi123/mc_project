@@ -420,7 +420,18 @@ def _display_comparison(scenarios, currency_fmt, key_suffix=''):
 			'Spend Delta': sc_spend['avg_annual_after_tax_spending'] - baseline_spend['avg_annual_after_tax_spending'],
 			'% Below Goal': sc['pct_non_positive'] * 100,
 		})
-	comp_df = pd.DataFrame(comparison_rows).set_index('Scenario')
+	comp_df = pd.DataFrame(comparison_rows)
+	# Ensure unique scenario names for Styler compatibility
+	name_counts = {}
+	unique_names = []
+	for name in comp_df['Scenario']:
+		name_counts[name] = name_counts.get(name, 0) + 1
+		if name_counts[name] > 1:
+			unique_names.append(f"{name} ({name_counts[name]})")
+		else:
+			unique_names.append(name)
+	comp_df['Scenario'] = unique_names
+	comp_df = comp_df.set_index('Scenario')
 	def _color_deltas(df):
 		delta_cols = {'vs Baseline', 'Tax Delta', 'Spend Delta'}
 		styles = pd.DataFrame('', index=df.index, columns=df.columns)
@@ -2306,6 +2317,13 @@ def main():
 				st.session_state['_pdf_report_bytes'] = pdf_report.generate_report(dict(st.session_state))
 
 		if '_pdf_report_bytes' in st.session_state:
+			import base64
+			b64 = base64.b64encode(st.session_state['_pdf_report_bytes']).decode()
+			st.markdown(
+				f'<iframe src="data:application/pdf;base64,{b64}" '
+				f'width="100%" height="800" type="application/pdf"></iframe>',
+				unsafe_allow_html=True,
+			)
 			client = st.session_state.get('client_select', 'client')
 			plan = st.session_state.get('save_file_name', 'report')
 			filename = f"{client}_{plan}_report.pdf".replace(' ', '_').replace(',', '')

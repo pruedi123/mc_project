@@ -430,15 +430,19 @@ def _render_scenario_section():
 							help='Number of years to perform conversions, starting from year 1 of the simulation.'))
 					else:
 						sc_overrides['roth_conversion_years'] = 0
-				annuity_chk = st.checkbox(f'S{i} buy annuity (from taxable)', key=f'sc_annuity_chk_{i}',
-					help='Purchase an annuity using money from the taxable account. '
-					'Reduces taxable balance and adds an income stream.')
+				annuity_chk = st.checkbox(f'S{i} buy annuity', key=f'sc_annuity_chk_{i}',
+					help='Purchase an annuity using money from one of your accounts. '
+					'Reduces that account balance and adds an income stream.')
 				if annuity_chk:
-					sc_overrides['annuity_purchase'] = st.number_input(f'S{i} annuity purchase price (from taxable)',
-						value=200000.0, step=10000.0, key=f'sc_ann_purchase_{i}',
-						help='Amount taken from taxable account to buy the annuity.')
+					sc_overrides['annuity_purchase'] = st.number_input(f'S{i} annuity purchase price',
+						value=500000.0, step=10000.0, key=f'sc_ann_purchase_{i}',
+						help='Amount taken from the selected account to buy the annuity.')
+					sc_overrides['annuity_fund_source'] = st.radio(f'S{i} fund from',
+						['Taxable', 'TDA Person 1', 'TDA Person 2'],
+						horizontal=True, key=f'sc_ann_source_{i}', index=1,
+						help='Which account the purchase price is deducted from.')
 					sc_overrides['annuity_annual_income'] = st.number_input(f'S{i} annuity annual income',
-						value=12000.0, step=1000.0, key=f'sc_ann_income_{i}',
+						value=36000.0, step=1000.0, key=f'sc_ann_income_{i}',
 						help='Annual income received from the annuity.')
 					sc_overrides['annuity_cola'] = st.number_input(f'S{i} annuity COLA',
 						value=0.0, format="%.4f", key=f'sc_ann_cola_{i}',
@@ -446,7 +450,7 @@ def _render_scenario_section():
 					sc_overrides['annuity_person'] = st.radio(f'S{i} annuity owner',
 						['Person 1', 'Person 2'], horizontal=True, key=f'sc_ann_person_{i}')
 					sc_overrides['annuity_survivor_pct'] = st.number_input(f'S{i} annuity survivor %',
-						value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_ann_surv_{i}',
+						value=1.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_ann_surv_{i}',
 						help='Fraction of annuity paid to survivor after owner dies. 1.0 = full benefit continues. 0 = payments stop at death.')
 					sc_overrides['annuity_start_year'] = int(st.number_input(f'S{i} annuity income starts (year)',
 						value=1, min_value=1, max_value=40, key=f'sc_ann_start_{i}',
@@ -514,8 +518,8 @@ def _render_accounts_section():
 		taxable_stock_basis_pct = st.number_input('Taxable stock basis % of market value', value=50.0, min_value=0.0, max_value=100.0, step=1.0, key='taxable_stock_basis_pct') / 100.0
 		taxable_bond_basis_pct = st.number_input('Taxable bond basis % of market value', value=100.0, min_value=0.0, max_value=100.0, step=1.0, key='taxable_bond_basis_pct') / 100.0
 		roth_start = st.number_input('Roth account starting balance', value=0.0, step=1000.0, key='roth_start')
-		tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=700000.0, step=1000.0, key='tda_start')
-		tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=0.0, step=1000.0, key='tda_spouse_start')
+		tda_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 1', value=400000.0, step=1000.0, key='tda_start')
+		tda_spouse_start = st.number_input('Tax-deferred account starting balance (IRA/401k) - person 2', value=300000.0, step=1000.0, key='tda_spouse_start')
 	return {
 		'taxable_start': taxable_start,
 		'taxable_stock_basis_pct': taxable_stock_basis_pct,
@@ -613,7 +617,7 @@ def _render_withdrawal_section(horizon):
 			if is_last:
 				period_end = horizon
 				st.markdown(f'**Period {i+1}:** years {period_start}–{period_end}')
-				period_amount = st.number_input(f'Period {i+1} annual After-Tax Spending Goal', value=80000.0, step=1000.0, key=f'wd_amount_{i}')
+				period_amount = st.number_input(f'Period {i+1} annual After-Tax Spending Goal', value=60000.0, step=1000.0, key=f'wd_amount_{i}')
 			else:
 				max_end = horizon - (int(num_withdrawal_periods) - 1 - i)
 				default_end = min(period_start + 4, max_end)
@@ -639,7 +643,7 @@ def _render_add_goals_section(horizon):
 	"""Render Additional Spending Goals expander. Returns list of (label, amount, begin, end, priority)."""
 	with st.expander('Additional Spending Goals'):
 		st.caption('Extra spending layered on top of base withdrawals (e.g. long-term care, travel, home repair)')
-		num_add_goals = st.number_input('Number of additional goals', value=1, min_value=0, max_value=10, step=1, key='num_add_goals')
+		num_add_goals = st.number_input('Number of additional goals', value=0, min_value=0, max_value=10, step=1, key='num_add_goals')
 		add_goal_inputs = []
 		# Defaults for goal 0: Long-term care in last 3 years; goal 1: Legacy in final year
 		_ltc_default_begin = max(1, horizon - 2)
@@ -702,7 +706,7 @@ def _render_income_section():
 		pension_cola_p1 = st.number_input('Pension COLA - person 1', value=0.00, format="%.4f", key='pension_cola_p1')
 		pension_survivor_pct_p1 = st.number_input('Pension survivor % - person 1', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
 			help='Fraction of person 1 pension paid to survivor after person 1 dies', key='pension_survivor_pct_p1')
-		pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=20000.0, step=1000.0, key='pension_income_spouse')
+		pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=0.0, step=1000.0, key='pension_income_spouse')
 		pension_cola_p2 = st.number_input('Pension COLA - person 2', value=0.00, format="%.4f", key='pension_cola_p2')
 		pension_survivor_pct_p2 = st.number_input('Pension survivor % - person 2', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
 			help='Fraction of person 2 pension paid to survivor after person 2 dies', key='pension_survivor_pct_p2')

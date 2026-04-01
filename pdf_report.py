@@ -105,6 +105,7 @@ def _gather_report_data(ss: dict) -> dict:
 
     # Multi-scenario
     data['multi_results'] = ss.get('multi_scenario_results', None)
+    data['scenario_input_diffs'] = ss.get('scenario_input_diffs', {})
 
     return data
 
@@ -328,25 +329,57 @@ def _build_page_1(pdf: RetirementReportPDF, data: dict):
     pdf.cell(0, 8, data['date'], align='C', new_x='LMARGIN', new_y='NEXT')
     pdf.ln(8)
 
-    # Success rate highlight box
-    success_rate = (1 - data['pct_non_positive']) * 100
-    pdf.set_fill_color(234, 250, 241) if success_rate >= 80 else pdf.set_fill_color(253, 237, 236)
-    box_y = pdf.get_y()
-    pdf.rect(30, box_y, 150, 28, style='F')
-    pdf.set_draw_color(39, 174, 96) if success_rate >= 80 else pdf.set_draw_color(203, 67, 53)
-    pdf.rect(30, box_y, 150, 28, style='D')
-
-    pdf.set_xy(30, box_y + 4)
-    pdf.set_font('Helvetica', 'B', 18)
-    pdf.set_text_color(39, 174, 96) if success_rate >= 80 else pdf.set_text_color(203, 67, 53)
-    pdf.cell(150, 10, f"{success_rate:.0f}% Success Rate", align='C', new_x='LMARGIN', new_y='NEXT')
-    pdf.set_xy(30, box_y + 16)
-    pdf.set_font('Helvetica', '', 9)
-    pdf.set_text_color(80, 80, 80)
+    # Success rate highlight box(es)
+    multi = data.get('multi_results')
     mode_label = 'historical periods' if 'Historical' in data.get('return_mode', '') else 'simulations'
-    pdf.cell(150, 6, f"Your portfolio lasted the full plan in {success_rate:.0f}% of {data['num_sims']:,} {mode_label}",
-             align='C')
-    pdf.ln(18)
+
+    if multi and len(multi) >= 2:
+        # Show one box per scenario side by side
+        n_sc = len(multi)
+        box_w = min(70, 150 / n_sc - 2)
+        total_w = n_sc * box_w + (n_sc - 1) * 4
+        start_x = (210 - total_w) / 2
+        box_y = pdf.get_y()
+        for idx, sc in enumerate(multi):
+            sr = (1 - sc['pct_non_positive']) * 100
+            x = start_x + idx * (box_w + 4)
+            if sr >= 80:
+                pdf.set_fill_color(234, 250, 241)
+                pdf.set_draw_color(39, 174, 96)
+            else:
+                pdf.set_fill_color(253, 237, 236)
+                pdf.set_draw_color(203, 67, 53)
+            pdf.rect(x, box_y, box_w, 30, style='FD')
+            pdf.set_xy(x, box_y + 2)
+            pdf.set_font('Helvetica', '', 7)
+            pdf.set_text_color(80, 80, 80)
+            pdf.cell(box_w, 5, sc['name'], align='C')
+            pdf.set_xy(x, box_y + 9)
+            pdf.set_font('Helvetica', 'B', 16)
+            pdf.set_text_color(39, 174, 96) if sr >= 80 else pdf.set_text_color(203, 67, 53)
+            pdf.cell(box_w, 10, f"{sr:.0f}%", align='C')
+            pdf.set_xy(x, box_y + 21)
+            pdf.set_font('Helvetica', '', 7)
+            pdf.set_text_color(80, 80, 80)
+            pdf.cell(box_w, 5, f"{sc['num_sims']:,} {mode_label}", align='C')
+        pdf.set_y(box_y + 36)
+    else:
+        success_rate = (1 - data['pct_non_positive']) * 100
+        pdf.set_fill_color(234, 250, 241) if success_rate >= 80 else pdf.set_fill_color(253, 237, 236)
+        box_y = pdf.get_y()
+        pdf.rect(30, box_y, 150, 28, style='F')
+        pdf.set_draw_color(39, 174, 96) if success_rate >= 80 else pdf.set_draw_color(203, 67, 53)
+        pdf.rect(30, box_y, 150, 28, style='D')
+        pdf.set_xy(30, box_y + 4)
+        pdf.set_font('Helvetica', 'B', 18)
+        pdf.set_text_color(39, 174, 96) if success_rate >= 80 else pdf.set_text_color(203, 67, 53)
+        pdf.cell(150, 10, f"{success_rate:.0f}% Success Rate", align='C', new_x='LMARGIN', new_y='NEXT')
+        pdf.set_xy(30, box_y + 16)
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(80, 80, 80)
+        pdf.cell(150, 6, f"Your portfolio lasted the full plan in {success_rate:.0f}% of {data['num_sims']:,} {mode_label}",
+                 align='C')
+        pdf.ln(18)
 
     # Key assumptions section
     pdf.section_title('Your Plan at a Glance')
@@ -421,10 +454,11 @@ def _build_page_1(pdf: RetirementReportPDF, data: dict):
                    'This analysis is based on simulated market returns and is not a guarantee of future results.')
 
 
-def _build_page_2(pdf: RetirementReportPDF, data: dict):
-    """Page 2: Range of Outcomes - 10th/50th/90th table + portfolio bands chart."""
+def _build_range_of_outcomes_page(pdf: RetirementReportPDF, pct_rows, spend_rows, all_yearly,
+                                  title='Range of Outcomes', baseline_pct_rows=None):
+    """Single Range of Outcomes page with table + portfolio bands chart."""
     pdf.add_page()
-    pdf.section_title('Range of Outcomes')
+    pdf.section_title(title)
     pdf.body_text(
         'No one can predict exactly what will happen with investments. The table below shows '
         'three possible outcomes based on our simulations: a bad scenario (10th percentile - only '
@@ -432,12 +466,14 @@ def _build_page_2(pdf: RetirementReportPDF, data: dict):
         'scenario (90th percentile - only 10% did better).'
     )
 
-    pct_rows = data['pct_rows']
-    spend_rows = data['spending_pct_rows']
-
     # Build 3-row table: Bad / Typical / Good
-    headers = ['Outcome', 'Ending Portfolio', 'Total Taxes', 'Eff. Tax Rate', 'Avg Annual Spending']
-    col_widths = [30, 40, 35, 30, 55]
+    show_delta = baseline_pct_rows is not None
+    if show_delta:
+        headers = ['Outcome', 'Ending Portfolio', 'vs Baseline', 'Total Taxes', 'Eff. Tax Rate', 'Avg Spending']
+        col_widths = [28, 34, 28, 30, 26, 44]
+    else:
+        headers = ['Outcome', 'Ending Portfolio', 'Total Taxes', 'Eff. Tax Rate', 'Avg Annual Spending']
+        col_widths = [30, 40, 35, 30, 55]
     rows = []
     label_map = {10: 'Bad (10th)', 50: 'Typical (50th)', 90: 'Good (90th)'}
 
@@ -446,19 +482,29 @@ def _build_page_2(pdf: RetirementReportPDF, data: dict):
         srow = next((r for r in spend_rows if r['percentile'] == pctile), None)
         if prow:
             avg_spend = _fmt_dollar(srow.get('avg_annual_after_tax_spending', 0)) if srow else '-'
-            rows.append([
+            end_val = prow['after_tax_end']
+            row = [
                 label_map.get(pctile, f'{pctile}th'),
-                _fmt_dollar(prow['after_tax_end']),
+                _fmt_dollar(end_val),
+            ]
+            if show_delta:
+                base_row = next((r for r in baseline_pct_rows if r['percentile'] == pctile), None)
+                base_end = base_row['after_tax_end'] if base_row else 0
+                delta = end_val - base_end
+                sign = '+' if delta > 0 else ''
+                row.append(f"{sign}{_fmt_dollar(delta)}" if delta != 0 else '-')
+            row.extend([
                 _fmt_dollar(prow['total_taxes']),
                 _fmt_pct(prow['effective_tax_rate']),
                 avg_spend,
             ])
+            rows.append(row)
 
     pdf.simple_table(headers, rows, col_widths)
 
     # Portfolio bands chart
-    if data['all_yearly'] is not None and len(data['all_yearly']) > 0:
-        chart_buf = _chart_portfolio_bands(data['all_yearly'])
+    if all_yearly is not None and len(all_yearly) > 0:
+        chart_buf = _chart_portfolio_bands(all_yearly)
         pdf.image(chart_buf, x=15, w=180)
 
     pdf.ln(3)
@@ -468,22 +514,43 @@ def _build_page_2(pdf: RetirementReportPDF, data: dict):
                    'percentiles. The blue line shows the typical (median) path.')
 
 
-def _build_page_3(pdf: RetirementReportPDF, data: dict):
-    """Page 3: Where Your Money Comes From - median year-by-year table + chart."""
+def _build_page_2(pdf: RetirementReportPDF, data: dict):
+    """Page 2+: Range of Outcomes — one page per scenario if multi, otherwise single page."""
+    multi = data.get('multi_results')
+    if multi and len(multi) >= 2:
+        baseline_pct_rows = multi[0]['percentile_rows']
+        for idx, sc in enumerate(multi):
+            _build_range_of_outcomes_page(
+                pdf,
+                pct_rows=sc['percentile_rows'],
+                spend_rows=sc['spending_percentiles'],
+                all_yearly=sc['all_yearly_df'],
+                title=f"Range of Outcomes: {sc['name']}",
+                baseline_pct_rows=baseline_pct_rows if idx > 0 else None,
+            )
+    else:
+        _build_range_of_outcomes_page(
+            pdf,
+            pct_rows=data['pct_rows'],
+            spend_rows=data['spending_pct_rows'],
+            all_yearly=data['all_yearly'],
+        )
+
+
+def _build_income_sources_page(pdf: RetirementReportPDF, all_yearly, title='Where Your Money Comes From'):
+    """Single income sources page: year-by-year table + stacked chart."""
     pdf.add_page()
-    pdf.section_title('Where Your Money Comes From')
+    pdf.section_title(title)
     pdf.body_text(
         'This shows the typical (median) path for your retirement income. Each row represents '
         'a year, showing how much comes from Social Security, pensions, portfolio withdrawals, '
         'and how much you have remaining.'
     )
 
-    all_yearly = data['all_yearly']
-    sim_df = data['sim_df']
-
     if all_yearly is not None and len(all_yearly) > 0:
         # Build median year-by-year from all runs
-        median_by_year = all_yearly.groupby('year').agg({
+        has_annuity = 'annuity_income_real' in all_yearly.columns and all_yearly['annuity_income_real'].sum() > 0
+        agg_dict = {
             'age_p1': 'first',
             'ss_income_total': 'median',
             'pension_income_real': 'median' if 'pension_income_real' in all_yearly.columns else 'first',
@@ -491,7 +558,22 @@ def _build_page_3(pdf: RetirementReportPDF, data: dict):
             'total_portfolio': 'median',
             'withdrawal_used': 'median',
             'total_taxes': 'median',
-        }).reset_index()
+        }
+        if has_annuity:
+            agg_dict['annuity_income_real'] = 'median'
+        has_other = 'other_income' in all_yearly.columns and all_yearly['other_income'].sum() > 0
+        if has_other:
+            agg_dict['other_income'] = 'median'
+        median_by_year = all_yearly.groupby('year').agg(agg_dict).reset_index()
+
+        # Compute net portfolio withdrawal = spending - income sources
+        median_by_year['net_withdrawal'] = (
+            median_by_year['after_tax_spending']
+            - median_by_year['ss_income_total']
+            - median_by_year.get('pension_income_real', 0)
+            - (median_by_year['annuity_income_real'] if has_annuity else 0)
+            - (median_by_year['other_income'] if has_other else 0)
+        ).clip(lower=0)
 
         # Determine row skip to fit on page (aim for ~20 rows max)
         n_years = len(median_by_year)
@@ -502,32 +584,48 @@ def _build_page_3(pdf: RetirementReportPDF, data: dict):
         else:
             step = 1
 
-        headers = ['Year', 'Age', 'Soc Sec', 'Pension', 'Spending', 'Taxes', 'Portfolio']
-        col_widths = [18, 16, 28, 28, 30, 28, 42]
+        if has_annuity:
+            headers = ['Year', 'Age', 'Soc Sec', 'Pension', 'Annuity', 'From Port.', 'Spending', 'Taxes', 'Portfolio']
+            col_widths = [14, 13, 22, 22, 22, 22, 24, 22, 31]
+        else:
+            headers = ['Year', 'Age', 'Soc Sec', 'Pension', 'From Port.', 'Spending', 'Taxes', 'Portfolio']
+            col_widths = [16, 14, 26, 26, 26, 28, 26, 30]
         rows = []
         for i in range(0, n_years, step):
             r = median_by_year.iloc[i]
-            rows.append([
+            row = [
                 str(int(r['year'])),
                 str(int(r['age_p1'])),
                 _fmt_dollar(r['ss_income_total']),
                 _fmt_dollar(r.get('pension_income_real', 0)),
+            ]
+            if has_annuity:
+                row.append(_fmt_dollar(r['annuity_income_real']))
+            row.extend([
+                _fmt_dollar(r['net_withdrawal']),
                 _fmt_dollar(r['after_tax_spending']),
                 _fmt_dollar(r['total_taxes']),
                 _fmt_dollar(r['total_portfolio']),
             ])
+            rows.append(row)
         # Always include last year
         if n_years > 1 and (n_years - 1) % step != 0:
             r = median_by_year.iloc[-1]
-            rows.append([
+            row = [
                 str(int(r['year'])),
                 str(int(r['age_p1'])),
                 _fmt_dollar(r['ss_income_total']),
                 _fmt_dollar(r.get('pension_income_real', 0)),
+            ]
+            if has_annuity:
+                row.append(_fmt_dollar(r['annuity_income_real']))
+            row.extend([
+                _fmt_dollar(r['net_withdrawal']),
                 _fmt_dollar(r['after_tax_spending']),
                 _fmt_dollar(r['total_taxes']),
                 _fmt_dollar(r['total_portfolio']),
             ])
+            rows.append(row)
 
         pdf.simple_table(headers, rows, col_widths)
 
@@ -538,14 +636,29 @@ def _build_page_3(pdf: RetirementReportPDF, data: dict):
                      new_x='LMARGIN', new_y='NEXT')
             pdf.ln(3)
 
-    # Income sources chart (from median single run)
-    if sim_df is not None and len(sim_df) > 0:
-        chart_buf = _chart_spending_sources(sim_df)
-        pdf.image(chart_buf, x=15, w=180)
+        # Income sources chart from median single run of this scenario
+        run_ends = all_yearly.groupby('run')['total_portfolio'].last()
+        median_val = run_ends.median()
+        median_run_idx = int((run_ends - median_val).abs().idxmin())
+        median_df = all_yearly[all_yearly['run'] == median_run_idx].copy()
+        if len(median_df) > 0:
+            chart_buf = _chart_spending_sources(median_df)
+            pdf.image(chart_buf, x=15, w=180)
+
+
+def _build_page_3(pdf: RetirementReportPDF, data: dict):
+    """Page 3+: Where Your Money Comes From - one page per scenario if multi."""
+    multi = data.get('multi_results')
+    if multi and len(multi) >= 2:
+        for sc in multi:
+            _build_income_sources_page(pdf, sc['all_yearly_df'],
+                title=f"Where Your Money Comes From: {sc['name']}")
+    else:
+        _build_income_sources_page(pdf, data['all_yearly'])
 
 
 def _build_page_4(pdf: RetirementReportPDF, data: dict):
-    """Page 4: Scenario Comparison (only if multiple scenarios)."""
+    """Page 4: Scenario Comparison with deltas vs baseline (only if multiple scenarios)."""
     multi = data.get('multi_results')
     if not multi or len(multi) < 2:
         return
@@ -557,17 +670,57 @@ def _build_page_4(pdf: RetirementReportPDF, data: dict):
         'Here\'s how each scenario compares.'
     )
 
-    headers = ['Scenario', 'Success Rate', 'Ending Portfolio', 'Avg Spending', 'Total Taxes']
-    col_widths = [50, 28, 38, 38, 36]
+    # Show input differences for each scenario
+    input_diffs = data.get('scenario_input_diffs', {})
+    if input_diffs:
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_text_color(40, 40, 40)
+        pdf.cell(0, 7, 'What changed in each scenario:', new_x='LMARGIN', new_y='NEXT')
+        pdf.set_font('Helvetica', '', 9)
+        for sc_name, diffs in input_diffs.items():
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.cell(0, 5.5, f'{sc_name}:', new_x='LMARGIN', new_y='NEXT')
+            pdf.set_font('Helvetica', '', 9)
+            for d in diffs:
+                pdf.cell(10, 5, '')
+                pdf.cell(0, 5, f'- {d}', new_x='LMARGIN', new_y='NEXT')
+        pdf.ln(4)
+
+    # Extract baseline values
+    base = multi[0]
+    base_row50 = next((r for r in base['percentile_rows'] if r['percentile'] == 50), None)
+    base_spend50 = next((r for r in base['spending_percentiles'] if r['percentile'] == 50), None)
+    base_end = base_row50['after_tax_end'] if base_row50 else 0
+    base_taxes = base_row50['total_taxes'] if base_row50 else 0
+    base_spend = base_spend50.get('avg_annual_after_tax_spending', 0) if base_spend50 else 0
+
+    headers = ['Scenario', 'Success', 'Ending', 'Delta', 'Spending', 'Delta', 'Taxes', 'Delta']
+    col_widths = [36, 16, 28, 22, 26, 22, 24, 16]
     rows = []
     for sc in multi:
         success = f"{(1 - sc['pct_non_positive']) * 100:.0f}%"
         row50 = next((r for r in sc['percentile_rows'] if r['percentile'] == 50), None)
-        end_val = _fmt_dollar(row50['after_tax_end']) if row50 else '-'
-        taxes = _fmt_dollar(row50['total_taxes']) if row50 else '-'
+        end_val = row50['after_tax_end'] if row50 else 0
+        taxes = row50['total_taxes'] if row50 else 0
         spend50 = next((r for r in sc['spending_percentiles'] if r['percentile'] == 50), None)
-        avg_spend = _fmt_dollar(spend50.get('avg_annual_after_tax_spending', 0)) if spend50 else '-'
-        rows.append([sc['name'], success, end_val, avg_spend, taxes])
+        avg_spend = spend50.get('avg_annual_after_tax_spending', 0) if spend50 else 0
+
+        end_delta = end_val - base_end
+        spend_delta = avg_spend - base_spend
+        tax_delta = taxes - base_taxes
+
+        def _fmt_delta(v):
+            if v == 0:
+                return '-'
+            sign = '+' if v > 0 else ''
+            return f"{sign}{_fmt_dollar(v)}"
+
+        rows.append([
+            sc['name'], success,
+            _fmt_dollar(end_val), _fmt_delta(end_delta),
+            _fmt_dollar(avg_spend), _fmt_delta(spend_delta),
+            _fmt_dollar(taxes), _fmt_delta(tax_delta),
+        ])
 
     pdf.simple_table(headers, rows, col_widths)
 

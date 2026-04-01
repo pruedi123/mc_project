@@ -2,7 +2,20 @@
 
 ## Project Overview
 
-Monte Carlo retirement withdrawal simulator built with Streamlit + Python. Simulates multi-account (taxable, TDA, Roth) withdrawals with full tax modeling, RMDs, dynamic guardrails, and scenario comparison.
+Monte Carlo retirement withdrawal simulator built with Streamlit + Python. Simulates multi-account (taxable, TDA, Roth) withdrawals with full tax modeling, RMDs, dynamic guardrails, and scenario comparison. The main app is run with `streamlit run main.py`. When asked to run the app, use `streamlit run main.py` immediately.
+
+## Problem Solving
+
+When fixing bugs or implementing features, prefer the simplest approach using existing data/functions before creating new logic. Do not overcomplicate solutions with new abstractions when existing values can be used directly.
+
+## UI & Visual Work
+
+- Always ask clarifying questions before starting implementation when the request involves UI layout, visual design, or chart styling. Confirm the specific look/behavior expected rather than guessing.
+- Do not remove existing working UI elements unless explicitly asked to. When refactoring or adding features, preserve all current outputs (cards, tables, charts) by default.
+
+## Workflow
+
+When a session starts or after /clear, read the project structure first before asking the user which files to look at. Key files are in the project root directory.
 
 ## Key Design Decisions
 
