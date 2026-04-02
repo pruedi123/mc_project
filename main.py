@@ -1013,6 +1013,14 @@ def main():
 				st.session_state['window_start_dates'] = {i: d.strftime('%Y-%m') for i, d in enumerate(window_start_dates)}
 			st.session_state.pop('multi_scenario_results', None)
 
+		# Store sim config for spending finder
+		st.session_state['_sim_params'] = sim_params
+		st.session_state['_sim_years'] = sim_years
+		st.session_state['_is_historical'] = is_historical
+		st.session_state['_monte_carlo_runs'] = int(monte_carlo_runs)
+		st.session_state['_inheritor_marginal_rate'] = float(inheritor_marginal_rate)
+		st.session_state['_ending_balance_goal'] = float(ending_balance_goal)
+
 	# ── Multi-scenario comparison ────────────────────────────────
 	if 'multi_scenario_results' in st.session_state:
 		multi_results = st.session_state['multi_scenario_results']
@@ -2325,6 +2333,136 @@ def main():
 					'Set Aside Today': '${:,.0f}',
 				}))
 				st.metric('Total Set Aside Today', f'${total:,.0f}')
+
+	# ── Spending Finder ─────────────────────────────────────────
+	if sim_mode is not None and '_sim_params' in st.session_state:
+		st.markdown('---')
+		with st.expander('Spending Finder'):
+			st.caption('Find the spending level that gives you a target probability of meeting your spending goal.')
+			col_target, col_guess, col_tol = st.columns(3)
+			with col_target:
+				spend_find_target = st.number_input('Target spending success %', min_value=50, max_value=99,
+					value=90, step=1, key='spend_find_target')
+			with col_guess:
+				_base_sched_default = st.session_state.get('_base_withdrawal_schedule', [])
+				_default_guess = _base_sched_default[0] if _base_sched_default else 60000.0
+				spend_find_guess = st.number_input('Starting guess ($)', min_value=0.0,
+					value=_default_guess, step=5000.0, key='spend_find_guess')
+			with col_tol:
+				spend_find_tol = st.number_input('Tolerance ($)', min_value=500, max_value=10000,
+					value=1000, step=500, key='spend_find_tol')
+
+			if st.button('Find Spending Level', key='run_spend_finder'):
+				stored_params = st.session_state['_sim_params']
+				sim_years = st.session_state['_sim_years']
+				is_hist = st.session_state['_is_historical']
+				mc_runs = st.session_state['_monte_carlo_runs']
+				inheritor_rate = st.session_state['_inheritor_marginal_rate']
+				base_sched = st.session_state.get('_base_withdrawal_schedule', [])
+				original_spending = base_sched[0] if base_sched else 0.0
+				target_pct = spend_find_target / 100.0
+				tol = float(spend_find_tol)
+
+				if original_spending <= 0:
+					st.warning('No spending target found. Run a simulation first.')
+				else:
+					def _run_with_spending(spend_amt):
+						"""Run simulation with a scaled withdrawal schedule and return spending success rate."""
+						test_params = dict(stored_params)
+						orig_sched = list(test_params['withdrawal_schedule'])
+						scale = spend_amt / original_spending if original_spending > 0 else 1.0
+						test_params['withdrawal_schedule'] = [v * scale for v in orig_sched]
+						if is_hist:
+							windows, _ = get_all_historical_windows(sim_years)
+							results = []
+							all_yearly = []
+							for run_idx, (stock_rets, bond_rets) in enumerate(windows):
+								run_pp = compute_run_pp_factors(run_idx, sim_years)
+								df_run = simulate_withdrawals(
+									years=sim_years, stock_return_series=stock_rets,
+									bond_return_series=bond_rets, pp_factors_run=run_pp, **test_params)
+								df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
+								metrics = compute_summary_metrics(df_run, inheritor_rate)
+								results.append(metrics)
+								df_run['run'] = run_idx
+								all_yearly.append(df_run)
+							all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+						else:
+							results, all_yearly_df = run_monte_carlo(
+								num_runs=mc_runs, years=sim_years, **test_params)
+						run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
+						return float((run_avg >= spend_amt).mean())
+
+					# Test the user's guess first
+					guess = float(spend_find_guess) if spend_find_guess > 0 else original_spending
+					progress = st.progress(0, text=f'Testing guess ${guess:,.0f}...')
+					guess_rate = _run_with_spending(guess)
+					iterations = [{'Iteration': 0, 'Spending': f'${guess:,.0f}',
+						'Success Rate': f'{guess_rate*100:.1f}%', 'Range': 'initial guess'}]
+
+					if abs(guess_rate - target_pct) <= 0.01:
+						progress.progress(1.0, text='Complete')
+						st.success(f'Your guess of {guess:,.0f} achieves '
+							f'{guess_rate*100:.0f}% spending success (target: {spend_find_target}%).')
+					else:
+						has_guess = spend_find_guess > 0 and spend_find_guess != original_spending
+						# Set search bounds based on guess result
+						if guess_rate >= target_pct:
+							# Guess is too conservative — search upward
+							lo = guess
+							if has_guess:
+								# Tight bounds: +20% above guess
+								hi = guess * 1.2
+							else:
+								hi = guess * 2.0
+							# Expand hi until success drops below target
+							for _ in range(5):
+								r = _run_with_spending(hi)
+								if r < target_pct:
+									break
+								hi = lo + (hi - lo) * 1.5 if has_guess else hi * 1.5
+						else:
+							# Guess is too aggressive — search downward
+							if has_guess:
+								# Tight bounds: -20% below guess
+								lo = guess * 0.8
+							else:
+								lo = 0.0
+							hi = guess
+							# Shrink lo until success exceeds target
+							if has_guess:
+								for _ in range(5):
+									r = _run_with_spending(lo)
+									if r >= target_pct:
+										break
+									lo = hi - (hi - lo) * 1.5
+
+						max_iter = 15
+						for i in range(max_iter):
+							mid = (lo + hi) / 2.0
+							progress.progress((i + 1) / max_iter, text=f'Iteration {i+1}: trying ${mid:,.0f}...')
+							rate = _run_with_spending(mid)
+							iterations.append({'Iteration': i + 1, 'Spending': f'${mid:,.0f}',
+								'Success Rate': f'{rate*100:.1f}%', 'Range': f'${lo:,.0f} – ${hi:,.0f}'})
+							if rate >= target_pct:
+								lo = mid
+							else:
+								hi = mid
+							if hi - lo < tol:
+								break
+
+						progress.progress(1.0, text='Complete')
+						result_spending = round((lo + hi) / 2.0 / 1000) * 1000
+						diff = result_spending - original_spending
+
+						if diff > 0:
+							st.success(f'You can increase spending to {result_spending:,.0f} '
+								f'(+{diff:,.0f}/yr) and still achieve a {spend_find_target}% spending success rate.')
+						else:
+							st.warning(f'To achieve a {spend_find_target}% spending success rate, '
+								f'reduce spending to {result_spending:,.0f} ({abs(diff):,.0f}/yr less).')
+						st.caption(f'Original spending: {original_spending:,.0f}')
+						st.dataframe(pd.DataFrame(iterations), use_container_width=True, hide_index=True)
 
 	# ── Client PDF Report ────────────────────────────────────────
 	if sim_mode is not None and 'mc_percentile_rows' in st.session_state:
