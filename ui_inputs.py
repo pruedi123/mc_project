@@ -801,7 +801,7 @@ def _render_income_section():
 		other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0, key='other_income')
 		st.markdown('---')
 		st.caption('**Earned Income** (part-time work in early retirement)')
-		earned_income_input = st.number_input('Annual earned income', value=0.0, step=1000.0, key='earned_income',
+		earned_income_input = st.number_input('Annual earned income', value=0.0, min_value=0.0, step=1000.0, key='earned_income',
 			help='Annual earned income (W-2 or self-employment) included as ordinary taxable income. '
 			'FICA taxes are not modeled separately.')
 		earned_income_years = st.number_input('Years of earned income', value=0, min_value=0, max_value=40, step=1,
@@ -1055,9 +1055,11 @@ def _apply_pending_upload():
 	for k in _SAVEABLE_KEYS:
 		if k in data:
 			v = data[k]
-			if k in _FLOAT_KEYS and isinstance(v, (int, str)):
+			if v is None:
+				continue
+			if k in _FLOAT_KEYS:
 				v = float(v)
-			elif k in _INT_KEYS and isinstance(v, (float, str)):
+			elif k in _INT_KEYS and not isinstance(v, bool):
 				v = int(v)
 			st.session_state[k] = v
 	if 'periods' in data:
