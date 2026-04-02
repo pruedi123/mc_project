@@ -87,8 +87,15 @@ Return the full plan JSON with client name and all specified fields.
   {"client": "Thompson, Mike & Linda", "person1": {"age": 63}, ...}
 
 FOR SCENARIO REQUESTS:
-If the user wants to compare options, add a scenarios list:
-  {"_action": "update", "_client": "Jones", "scenarios": [{"name": "80% Stocks", "stock_pct": 80}]}
+If the user wants to compare options, add a scenarios list.
+Scenario overrides must use the SAME nested structure as the main plan.
+Examples:
+  To compare allocations:
+  {"_action": "update", "_client": "Jones", "scenarios": [{"name": "40% Stocks", "allocation": {"stock_pct": 40}}, {"name": "80% Stocks", "allocation": {"stock_pct": 80}}]}
+  To compare spending levels:
+  {"_action": "update", "_client": "Jones", "scenarios": [{"name": "Higher Spending", "spending": {"annual": 80000}}]}
+  To compare multiple changes:
+  {"_action": "update", "_client": "Jones", "scenarios": [{"name": "Conservative", "allocation": {"stock_pct": 40}, "spending": {"annual": 50000}}]}
 
 FOR LOADING/VIEWING existing plans:
 If the user says "show me the Thompson plan", "load Kranks", "get Thompson results", "what does the Jones plan look like", etc.:

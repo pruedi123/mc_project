@@ -191,6 +191,19 @@ def _render_client_view(success_rate, spending_pct_rows, percentile_rows,
 		unsafe_allow_html=True,
 	)
 
+	# Spending success rate
+	spending_success = st.session_state.get('mc_spending_success_rate')
+	spending_target = st.session_state.get('mc_spending_target', 0)
+	if spending_success is not None and spending_target > 0:
+		spend_pct = spending_success * 100
+		spend_count = int(round(spending_success * num_sims))
+		st.markdown(
+			f'<div style="color:#374151; font-size:0.95em; text-align:center; max-width:60%; margin-bottom:16px;">'
+			f'{spend_count:,} of {num_sims:,} simulations ({spend_pct:.0f}%) maintained average annual spending '
+			f'at or above the ${spending_target:,.0f} target</div>',
+			unsafe_allow_html=True,
+		)
+
 	# ── Section 2: Your Spending (separated by goal when applicable) ──
 	st.caption('All spending figures are after taxes.')
 	if has_goal_breakdown and active_goals:
@@ -972,8 +985,11 @@ def main():
 					stock_mu=stock_mu, stock_sigma=stock_sigma,
 					bond_mu=bond_mu, bond_sigma=bond_sigma)
 				results, all_yearly_df = run_one_scenario(s_params, s_name, run_bar)
+				_base_sched_ms = st.session_state.get('_base_withdrawal_schedule', [])
+				_spend_target_ms = _base_sched_ms[0] if _base_sched_ms else 0.0
 				summary = compute_scenario_summary(s_name, results, all_yearly_df,
-					float(inheritor_marginal_rate), float(ending_balance_goal))
+					float(inheritor_marginal_rate), float(ending_balance_goal),
+					spending_target=_spend_target_ms)
 				multi_results.append(summary)
 			scenario_bar.progress(1.0, text='All scenarios complete!')
 			st.session_state['multi_scenario_results'] = multi_results
@@ -987,8 +1003,10 @@ def main():
 			run_bar = st.progress(0, text='Running...')
 			results, all_yearly_df = run_one_scenario(sim_params, 'Baseline', run_bar)
 			sim_mode_label = 'historical_dist' if is_historical else 'simulated'
+			_base_sched = st.session_state.get('_base_withdrawal_schedule', [])
+			_spending_target = _base_sched[0] if _base_sched else 0.0
 			dist_results = store_distribution_results(results, all_yearly_df, sim_mode_label,
-				float(ending_balance_goal))
+				float(ending_balance_goal), spending_target=_spending_target)
 			for k, v in dist_results.items():
 				st.session_state[k] = v
 			if is_historical:
@@ -2086,9 +2104,12 @@ def main():
 							bond_log_volatility=float(bond_log_volatility),
 							**sp)
 
+					_base_sched_ss = st.session_state.get('_base_withdrawal_schedule', [])
+					_spend_target_ss = _base_sched_ss[0] if _base_sched_ss else 0.0
 					summary = compute_scenario_summary(
 						f'Age {ca} (${adj_benefit:,.0f})', results, all_yearly_df,
-						float(inheritor_marginal_rate), float(ending_balance_goal))
+						float(inheritor_marginal_rate), float(ending_balance_goal),
+						spending_target=_spend_target_ss)
 					# Store claiming age and benefit for display
 					summary['_claiming_age'] = ca
 					summary['_annual_benefit'] = adj_benefit

@@ -553,9 +553,11 @@ def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, ble
 
 # ── Result processing ───────────────────────────────────────────
 
-def store_distribution_results(results, all_yearly_df, sim_mode_label, ending_balance_goal=1.0):
+def store_distribution_results(results, all_yearly_df, sim_mode_label, ending_balance_goal=1.0,
+							   spending_target=0.0):
 	"""Process MC or historical distribution results.
-	Returns a dict of results to be written into session state by the caller."""
+	Returns a dict of results to be written into session state by the caller.
+	spending_target: the original annual spending goal (before guardrail adjustments)."""
 	mc_df = pd.DataFrame(results)
 	percentiles_list = [0, 10, 25, 50, 75, 90]
 	summary_cols = ['after_tax_end', 'total_taxes', 'effective_tax_rate', 'portfolio_cagr', 'roth_cagr']
@@ -571,6 +573,11 @@ def store_distribution_results(results, all_yearly_df, sim_mode_label, ending_ba
 	median_val = run_ends.median()
 	median_run_idx = int((run_ends - median_val).abs().idxmin())
 	median_df = all_yearly_df[all_yearly_df['run'] == median_run_idx].drop(columns=['run', 'total_portfolio']).reset_index(drop=True)
+	# Spending success rate: % of simulations where avg annual spending >= target
+	spending_success_rate = None
+	if spending_target > 0:
+		run_spending = all_yearly_df.groupby('run')['after_tax_spending'].mean()
+		spending_success_rate = float((run_spending >= spending_target).mean())
 	return {
 		'mc_percentile_rows': pct_rows,
 		'mc_pct_non_positive': pct_non_positive,
@@ -578,6 +585,8 @@ def store_distribution_results(results, all_yearly_df, sim_mode_label, ending_ba
 		'num_sims': len(results),
 		'sim_df': median_df,
 		'sim_mode': sim_mode_label,
+		'mc_spending_success_rate': spending_success_rate,
+		'mc_spending_target': spending_target,
 	}
 
 def compute_summary_metrics(df: pd.DataFrame, inheritor_rate: float) -> Dict[str, float]:
@@ -750,7 +759,8 @@ def auto_scenario_name(scenario_idx: int, overrides: dict, base_params: dict) ->
 	return " | ".join(parts) if parts else f"Scenario {scenario_idx}"
 
 def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFrame,
-							 inheritor_rate: float, ending_balance_goal: float = 1.0) -> dict:
+							 inheritor_rate: float, ending_balance_goal: float = 1.0,
+							 spending_target: float = 0.0) -> dict:
 	"""Compute percentile summary for one scenario run. Returns a summary dict."""
 	mc_df = pd.DataFrame(results)
 	percentiles_list = [0, 10, 25, 50, 75, 90]
@@ -786,6 +796,11 @@ def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFra
 			row['avg_base_spending'] = np.percentile(run_spending['avg_base_spending'], p)
 			row['avg_goal_spending'] = np.percentile(run_spending['avg_goal_spending'], p)
 		spending_pct_rows.append(row)
+	# Spending success rate
+	spending_success_rate = None
+	if spending_target > 0:
+		run_avg_spending = run_spending['avg_annual_after_tax_spending']
+		spending_success_rate = float((run_avg_spending >= spending_target).mean())
 	return {
 		'name': name,
 		'percentile_rows': pct_rows,
@@ -793,6 +808,8 @@ def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFra
 		'spending_percentiles': spending_pct_rows,
 		'all_yearly_df': all_yearly_df,
 		'num_sims': len(results),
+		'spending_success_rate': spending_success_rate,
+		'spending_target': spending_target,
 	}
 
 # ── Monte Carlo runner ──────────────────────────────────────────
