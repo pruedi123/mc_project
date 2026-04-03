@@ -113,38 +113,51 @@ def _spending_outcomes_chart(data_series, target=None, currency_fmt='${:,.0f}'):
 	st.pyplot(fig, use_container_width=False)
 	plt.close(fig)
 
-def _three_card_summary(data_series, target, currency_fmt='${:,.0f}'):
-	"""3-card layout: Income Floor / Likely Lifestyle / Strong Markets with styled cards."""
+def _three_card_summary(data_series, target, currency_fmt='${:,.0f}', essential_spending=0.0):
+	"""Card layout: Essential Need (if set) / Income Floor / Likely Lifestyle / Strong Markets."""
 	floor_val = float(np.percentile(data_series, 0))
 	typical_val = float(np.percentile(data_series, 50))
 	strong_val = float(np.percentile(data_series, 90))
 
-	def _pct_vs_target(val):
-		if target and target > 0:
-			diff = (val / target - 1) * 100
+	def _pct_vs(val, ref, label='target'):
+		if ref and ref > 0:
+			diff = (val / ref - 1) * 100
 			if diff >= 0:
-				return f'<span style="color:#16a34a;font-size:0.85em;">+{diff:.0f}% vs target</span>'
+				return f'<span style="color:#16a34a;font-size:0.85em;">+{diff:.0f}% vs {label}</span>'
 			else:
-				return f'<span style="color:#dc2626;font-size:0.85em;">{diff:.0f}% vs target</span>'
+				return f'<span style="color:#dc2626;font-size:0.85em;">{diff:.0f}% vs {label}</span>'
 		return ''
 
-	def _card_colors(val):
-		if target and target > 0 and val >= target:
-			return '#b8860b', '#fdf6e3'  # warm beige: at/above target
-		return '#ef4444', '#fef2f2'      # red/pink: below target
+	def _card_colors(val, ref):
+		if ref and ref > 0 and val >= ref:
+			return '#b8860b', '#fdf6e3'  # warm beige: at/above
+		return '#ef4444', '#fef2f2'      # red/pink: below
 
-	cards = [
+	cards = []
+	if essential_spending > 0:
+		cards.append({'icon': '\U0001f3e0', 'title': 'Essential Need',
+			'val': floor_val, 'ref': essential_spending, 'label': 'essential',
+			'sub': 'Worst case vs essential floor',
+			'border': _card_colors(floor_val, essential_spending)[0],
+			'bg': _card_colors(floor_val, essential_spending)[1]})
+	cards.extend([
 		{'icon': '\U0001f6e1\ufe0f', 'title': 'Income Floor', 'val': floor_val,
-		 'sub': 'Worst case across all runs', 'border': _card_colors(floor_val)[0], 'bg': _card_colors(floor_val)[1]},
+		 'ref': target, 'label': 'target',
+		 'sub': 'Worst case across all runs',
+		 'border': _card_colors(floor_val, target)[0], 'bg': _card_colors(floor_val, target)[1]},
 		{'icon': '\U0001f3af', 'title': 'Likely Lifestyle', 'val': typical_val,
-		 'sub': 'Median outcome', 'border': _card_colors(typical_val)[0], 'bg': _card_colors(typical_val)[1]},
+		 'ref': target, 'label': 'target',
+		 'sub': 'Median outcome',
+		 'border': _card_colors(typical_val, target)[0], 'bg': _card_colors(typical_val, target)[1]},
 		{'icon': '\U0001f680', 'title': 'Strong Markets', 'val': strong_val,
-		 'sub': '90th percentile upside', 'border': _card_colors(strong_val)[0], 'bg': _card_colors(strong_val)[1]},
-	]
+		 'ref': target, 'label': 'target',
+		 'sub': '90th percentile upside',
+		 'border': _card_colors(strong_val, target)[0], 'bg': _card_colors(strong_val, target)[1]},
+	])
 
 	card_htmls = []
 	for card in cards:
-		pct_line = _pct_vs_target(card['val'])
+		pct_line = _pct_vs(card['val'], card['ref'], card['label'])
 		card_htmls.append(
 			f'<div style="flex:1; border:1px solid {card["border"]}; border-left:4px solid {card["border"]}; '
 			f'border-radius:8px; padding:16px 14px; background:{card["bg"]}; text-align:center;">'
@@ -155,8 +168,9 @@ def _three_card_summary(data_series, target, currency_fmt='${:,.0f}'):
 			f'<div style="color:#6b7280; font-size:0.82em; margin-top:4px;">{card["sub"]}</div>'
 			f'</div>'
 		)
+	max_width = '65%' if essential_spending > 0 else '50%'
 	st.markdown(
-		f'<div style="display:flex; gap:12px; align-items:stretch; max-width:50%;">{"".join(card_htmls)}</div>',
+		f'<div style="display:flex; gap:12px; align-items:stretch; max-width:{max_width};">{"".join(card_htmls)}</div>',
 		unsafe_allow_html=True,
 	)
 
@@ -191,16 +205,26 @@ def _render_client_view(success_rate, spending_pct_rows, percentile_rows,
 		unsafe_allow_html=True,
 	)
 
-	# Spending success rate
+	# Spending success rates
 	spending_success = st.session_state.get('mc_spending_success_rate')
 	spending_target = st.session_state.get('mc_spending_target', 0)
+	essential_success = st.session_state.get('mc_essential_success_rate')
+	essential_amt = st.session_state.get('mc_essential_spending', 0)
+	success_lines = []
+	if essential_success is not None and essential_amt > 0:
+		ess_pct = essential_success * 100
+		ess_count = int(round(essential_success * num_sims))
+		success_lines.append(
+			f'{ess_count:,} of {num_sims:,} ({ess_pct:.0f}%) met essential spending floor of ${essential_amt:,.0f}')
 	if spending_success is not None and spending_target > 0:
 		spend_pct = spending_success * 100
 		spend_count = int(round(spending_success * num_sims))
+		success_lines.append(
+			f'{spend_count:,} of {num_sims:,} ({spend_pct:.0f}%) met ideal spending target of ${spending_target:,.0f}')
+	if success_lines:
 		st.markdown(
-			f'<div style="color:#374151; font-size:0.95em; text-align:center; max-width:60%; margin-bottom:16px;">'
-			f'{spend_count:,} of {num_sims:,} simulations ({spend_pct:.0f}%) maintained average annual spending '
-			f'at or above the ${spending_target:,.0f} target</div>',
+			'<div style="color:#374151; font-size:0.95em; text-align:center; max-width:60%; margin-bottom:16px;">'
+			+ '<br>'.join(success_lines) + '</div>',
 			unsafe_allow_html=True,
 		)
 
@@ -481,6 +505,10 @@ def _display_comparison(scenarios, currency_fmt, key_suffix=''):
 	interactive_line_chart(spend_overlay, y_title='After-Tax Spending (Median)', zero_base=False)
 
 def main():
+	# Apply pending spend finder result before widgets render
+	if '_pending_spend_finder' in st.session_state:
+		st.session_state['wd_amount_0'] = st.session_state.pop('_pending_spend_finder')
+
 	st.title('Withdrawal + RMD Simulator (30-year)')
 
 	if st.button('Reset saved scenarios'):
@@ -517,6 +545,7 @@ def main():
 	rmd_start_age = inputs['rmd_start_age']
 	rmd_start_age_spouse = inputs['rmd_start_age_spouse']
 	ending_balance_goal = inputs['ending_balance_goal']
+	essential_spending = inputs.get('essential_spending', 0.0)
 	add_goal_inputs = inputs['add_goal_inputs']
 	ss_income_input = inputs['ss_income']
 	ss_start_age_p1 = inputs['ss_start_age_p1']
@@ -1006,7 +1035,8 @@ def main():
 			_base_sched = st.session_state.get('_base_withdrawal_schedule', [])
 			_spending_target = _base_sched[0] if _base_sched else 0.0
 			dist_results = store_distribution_results(results, all_yearly_df, sim_mode_label,
-				float(ending_balance_goal), spending_target=_spending_target)
+				float(ending_balance_goal), spending_target=_spending_target,
+				essential_spending=float(essential_spending))
 			for k, v in dist_results.items():
 				st.session_state[k] = v
 			if is_historical:
@@ -1172,7 +1202,8 @@ def main():
 				st.markdown(f'#### Base spending — {base_target_str}/yr target')
 			else:
 				st.markdown('#### Base spending')
-			_three_card_summary(base_spending_series, base_sched_avg, currency_fmt)
+			_three_card_summary(base_spending_series, base_sched_avg, currency_fmt,
+				essential_spending=essential_spending)
 			if st.checkbox('Show detailed table', value=False, key='show_base_table'):
 				if has_goal_breakdown:
 					base_pct_rows = []
@@ -2337,7 +2368,7 @@ def main():
 	# ── Spending Finder ─────────────────────────────────────────
 	if sim_mode is not None and '_sim_params' in st.session_state:
 		st.markdown('---')
-		with st.expander('Spending Finder'):
+		if st.checkbox('Spending Finder', key='_show_spending_finder'):
 			st.caption('Find the spending level that gives you a target probability of meeting your spending goal.')
 			col_target, col_guess, col_tol = st.columns(3)
 			with col_target:
@@ -2463,6 +2494,435 @@ def main():
 								f'reduce spending to {result_spending:,.0f} ({abs(diff):,.0f}/yr less).')
 						st.caption(f'Original spending: {original_spending:,.0f}')
 						st.dataframe(pd.DataFrame(iterations), use_container_width=True, hide_index=True)
+						st.session_state['_spend_finder_result'] = result_spending
+
+			# Show "Use this value" button if a result exists
+			if '_spend_finder_result' in st.session_state:
+				found_val = st.session_state['_spend_finder_result']
+				if st.button(f'Use {found_val:,.0f} as spending and re-run', key='use_spend_finder'):
+					st.session_state['_pending_spend_finder'] = found_val
+					st.session_state.pop('_spend_finder_result', None)
+					st.rerun()
+
+	# ── Balance Decline Finder ──────────────────────────────────
+	if sim_mode is not None and '_sim_params' in st.session_state:
+		if st.checkbox('Balance Decline Finder', key='_show_bd_finder'):
+			st.caption('Find the portfolio decline that would drop your spending success rate to a target threshold.')
+			col_thr, col_guess, col_tol, col_months = st.columns(4)
+			with col_thr:
+				bd_target_pct = st.number_input('Target success %', min_value=50, max_value=99,
+					value=75, step=1, key='bd_target_pct')
+			with col_guess:
+				bd_guess = st.number_input('Starting guess (% decline)', min_value=1.0, max_value=80.0,
+					value=20.0, step=5.0, key='bd_guess')
+			with col_tol:
+				bd_tol = st.number_input('Tolerance (%)', min_value=0.5, max_value=5.0,
+					value=1.0, step=0.5, key='bd_tol')
+			with col_months:
+				bd_months = st.number_input('Horizon (months)', min_value=1, max_value=36,
+					value=3, step=1, key='bd_months')
+
+			if st.button('Find Balance Decline', key='run_balance_decline_finder'):
+				stored_params = st.session_state['_sim_params']
+				sim_years = st.session_state['_sim_years']
+				is_hist = st.session_state['_is_historical']
+				mc_runs = st.session_state['_monte_carlo_runs']
+				base_sched = st.session_state.get('_base_withdrawal_schedule', [])
+				spending_target = base_sched[0] if base_sched else 0.0
+				target_rate = bd_target_pct / 100.0
+
+				# Balance keys to scale uniformly
+				_balance_keys = ['taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start',
+					'goal_taxable_start', 'goal_tda_start']
+
+				# Capture original balances
+				orig_balances = {k: stored_params.get(k, 0.0) for k in _balance_keys}
+				orig_total = sum(orig_balances.values())
+
+				if spending_target <= 0:
+					st.warning('No spending target found. Run a simulation first.')
+				elif orig_total <= 0:
+					st.warning('No starting balances found.')
+				else:
+					def _run_with_haircut(pct_decline):
+						"""Run simulation with all balances reduced by pct_decline% and return spending success rate."""
+						factor = 1.0 - pct_decline / 100.0
+						test_params = dict(stored_params)
+						for k in _balance_keys:
+							if k in test_params:
+								test_params[k] = stored_params[k] * factor
+						if is_hist:
+							windows, _ = get_all_historical_windows(sim_years)
+							all_yearly = []
+							for run_idx, (stock_rets, bond_rets) in enumerate(windows):
+								run_pp = compute_run_pp_factors(run_idx, sim_years)
+								df_run = simulate_withdrawals(
+									years=sim_years, stock_return_series=stock_rets,
+									bond_return_series=bond_rets, pp_factors_run=run_pp, **test_params)
+								df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
+								df_run['run'] = run_idx
+								all_yearly.append(df_run)
+							all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+						else:
+							_, all_yearly_df = run_monte_carlo(
+								num_runs=mc_runs, years=sim_years, **test_params)
+						run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
+						return float((run_avg >= spending_target).mean())
+
+					guess_decline = float(bd_guess)
+					tol = float(bd_tol)
+					progress = st.progress(0, text=f'Testing {guess_decline:.1f}% decline...')
+					guess_rate = _run_with_haircut(guess_decline)
+					iterations = [{'Iteration': 0, 'Decline %': f'{guess_decline:.1f}%',
+						'Success Rate': f'{guess_rate*100:.1f}%', 'Range': 'initial guess'}]
+
+					result_decline = guess_decline  # default; updated by binary search if needed
+					if abs(guess_rate - target_rate) <= 0.01:
+						progress.progress(1.0, text='Complete')
+						st.success(f'A {guess_decline:.1f}% decline achieves {guess_rate*100:.0f}% spending success '
+							f'(target: {bd_target_pct}%).')
+					else:
+						# Set search bounds
+						if guess_rate > target_rate:
+							# Need more decline — search higher
+							lo = guess_decline
+							hi = min(guess_decline * 1.5, 90.0)
+							for _ in range(5):
+								r = _run_with_haircut(hi)
+								if r <= target_rate:
+									break
+								hi = min(lo + (hi - lo) * 1.5, 95.0)
+						else:
+							# Need less decline — search lower
+							hi = guess_decline
+							lo = max(guess_decline * 0.5, 0.0)
+							for _ in range(5):
+								r = _run_with_haircut(lo)
+								if r > target_rate:
+									break
+								lo = max(hi - (hi - lo) * 1.5, 0.0)
+
+						max_iter = 15
+						for i in range(max_iter):
+							mid = (lo + hi) / 2.0
+							progress.progress((i + 1) / max_iter, text=f'Iteration {i+1}: trying {mid:.1f}% decline...')
+							rate = _run_with_haircut(mid)
+							iterations.append({'Iteration': i + 1, 'Decline %': f'{mid:.1f}%',
+								'Success Rate': f'{rate*100:.1f}%', 'Range': f'{lo:.1f}% – {hi:.1f}%'})
+							if rate > target_rate:
+								lo = mid
+							else:
+								hi = mid
+							if hi - lo < tol:
+								break
+
+						progress.progress(1.0, text='Complete')
+						result_decline = round((lo + hi) / 2.0, 1)
+						factor = 1.0 - result_decline / 100.0
+						reduced_total = orig_total * factor
+						dollar_drop = orig_total - reduced_total
+
+						st.warning(f'A **{result_decline:.1f}%** decline in portfolio balances would reduce '
+							f'spending success to ≈{bd_target_pct}%.')
+						st.markdown(f'**Total portfolio:** ${orig_total:,.0f} → ${reduced_total:,.0f} '
+							f'(−${dollar_drop:,.0f})')
+
+						# Per-account breakdown
+						breakdown_rows = []
+						for k in _balance_keys:
+							orig_val = orig_balances[k]
+							if orig_val > 0:
+								label = k.replace('_start', '').replace('_', ' ').title()
+								breakdown_rows.append({
+									'Account': label,
+									'Original': f'${orig_val:,.0f}',
+									'After Decline': f'${orig_val * factor:,.0f}',
+									'Reduction': f'${orig_val * (1 - factor):,.0f}',
+								})
+						if breakdown_rows:
+							st.dataframe(pd.DataFrame(breakdown_rows), use_container_width=True, hide_index=True)
+
+					st.dataframe(pd.DataFrame(iterations), use_container_width=True, hide_index=True)
+
+					# Probability of this decline over the selected horizon
+					import math as _math
+					def _norm_cdf(x):
+						return 0.5 * (1.0 + _math.erf(x / _math.sqrt(2.0)))
+
+					_stock_pct = stored_params.get('target_stock_pct', 0.6)
+					mg_df = load_master_global()
+					stock_f = mg_df['LBM 100E'].dropna().values
+					bond_f = mg_df['LBM 100 F'].dropna().values
+					n_f = min(len(stock_f), len(bond_f))
+					stock_f = stock_f[:n_f]
+					bond_f = bond_f[:n_f]
+					horizon_months = int(bd_months)
+					decline_used = result_decline
+
+					# ── Empirical: extract monthly returns, blend, compute rolling N-month returns ──
+					def _extract_monthly(factors_12mo):
+						"""Recover monthly growth factors from rolling 12-month growth factors."""
+						n = len(factors_12mo)
+						monthly = np.zeros(n + 11)
+						# Seed first 12 months uniformly from the first annual factor
+						seed = factors_12mo[0] ** (1.0 / 12.0)
+						for k in range(12):
+							monthly[k] = seed
+						# Chain forward: m(t+12) = m(t) * F(t+1) / F(t)
+						for t in range(n - 1):
+							monthly[t + 12] = monthly[t] * factors_12mo[t + 1] / factors_12mo[t]
+						return monthly
+
+					stock_monthly = _extract_monthly(stock_f)
+					bond_monthly = _extract_monthly(bond_f)
+					n_months = min(len(stock_monthly), len(bond_monthly))
+					blended_monthly = _stock_pct * stock_monthly[:n_months] + (1 - _stock_pct) * bond_monthly[:n_months]
+					# Cumulative wealth index (prepend 1.0 as starting value)
+					wealth = np.concatenate([[1.0], np.cumprod(blended_monthly)])
+					# Skip first 12 months (seeded approximation) for cleaner empirical data
+					skip = 12
+					if horizon_months < n_months - skip:
+						w = wealth[skip:]
+						rolling_rets = w[horizon_months:] / w[:len(w) - horizon_months] - 1.0
+						n_periods = len(rolling_rets)
+						n_declines = int(np.sum(rolling_rets <= -(decline_used / 100.0)))
+						empirical_prob = n_declines / n_periods
+					else:
+						empirical_prob = None
+						n_periods = 0
+						n_declines = 0
+
+					# ── Simulated (parametric lognormal) ──
+					blended_annual = _stock_pct * stock_f + (1 - _stock_pct) * bond_f
+					annual_log_rets = np.log(blended_annual)
+					mu_annual = float(np.mean(annual_log_rets))
+					sigma_annual = float(np.std(annual_log_rets))
+					frac = horizon_months / 12.0
+					mu_h = mu_annual * frac
+					sigma_h = sigma_annual * np.sqrt(frac)
+					log_threshold = np.log(1.0 - decline_used / 100.0)
+					simulated_prob = _norm_cdf((log_threshold - mu_h) / sigma_h)
+
+					# ── Display ──
+					month_label = f'{horizon_months} month{"s" if horizon_months != 1 else ""}'
+					st.markdown(f'**Probability of a ≥{decline_used:.1f}% decline over {month_label}:**')
+					col_emp, col_sim = st.columns(2)
+					with col_emp:
+						if empirical_prob is not None:
+							st.metric('Historical (empirical)', f'{empirical_prob*100:.1f}%')
+							st.caption(f'{n_declines} of {n_periods:,} rolling {month_label} periods (1927–2024)')
+						else:
+							st.caption('Not enough data for this horizon.')
+					with col_sim:
+						st.metric('Simulated (lognormal)', f'{simulated_prob*100:.1f}%')
+						st.caption(f'Parametric model scaled to {month_label}')
+					st.caption(f'{_stock_pct*100:.0f}/{(1-_stock_pct)*100:.0f} stock/bond blend.')
+
+	# ── Balance Increase Finder ─────────────────────────────────
+	if sim_mode is not None and '_sim_params' in st.session_state:
+		if st.checkbox('Balance Increase Finder', key='_show_bi_finder'):
+			st.caption('Find the portfolio increase needed to raise your spending success rate to a target threshold.')
+			col_thr, col_guess, col_tol, col_months = st.columns(4)
+			with col_thr:
+				bi_target_pct = st.number_input('Target success %', min_value=50, max_value=99,
+					value=90, step=1, key='bi_target_pct')
+			with col_guess:
+				bi_guess = st.number_input('Starting guess (% increase)', min_value=1.0, max_value=200.0,
+					value=20.0, step=5.0, key='bi_guess')
+			with col_tol:
+				bi_tol = st.number_input('Tolerance (%)', min_value=0.5, max_value=5.0,
+					value=1.0, step=0.5, key='bi_tol')
+			with col_months:
+				bi_months = st.number_input('Horizon (months)', min_value=1, max_value=36,
+					value=3, step=1, key='bi_months')
+
+			if st.button('Find Balance Increase', key='run_balance_increase_finder'):
+				stored_params = st.session_state['_sim_params']
+				sim_years = st.session_state['_sim_years']
+				is_hist = st.session_state['_is_historical']
+				mc_runs = st.session_state['_monte_carlo_runs']
+				base_sched = st.session_state.get('_base_withdrawal_schedule', [])
+				spending_target = base_sched[0] if base_sched else 0.0
+				target_rate = bi_target_pct / 100.0
+
+				_balance_keys = ['taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start',
+					'goal_taxable_start', 'goal_tda_start']
+				orig_balances = {k: stored_params.get(k, 0.0) for k in _balance_keys}
+				orig_total = sum(orig_balances.values())
+
+				if spending_target <= 0:
+					st.warning('No spending target found. Run a simulation first.')
+				elif orig_total <= 0:
+					st.warning('No starting balances found.')
+				else:
+					def _run_with_boost(pct_increase):
+						"""Run simulation with all balances increased by pct_increase% and return spending success rate."""
+						factor = 1.0 + pct_increase / 100.0
+						test_params = dict(stored_params)
+						for k in _balance_keys:
+							if k in test_params:
+								test_params[k] = stored_params[k] * factor
+						if is_hist:
+							windows, _ = get_all_historical_windows(sim_years)
+							all_yearly = []
+							for run_idx, (stock_rets, bond_rets) in enumerate(windows):
+								run_pp = compute_run_pp_factors(run_idx, sim_years)
+								df_run = simulate_withdrawals(
+									years=sim_years, stock_return_series=stock_rets,
+									bond_return_series=bond_rets, pp_factors_run=run_pp, **test_params)
+								df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
+								df_run['run'] = run_idx
+								all_yearly.append(df_run)
+							all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+						else:
+							_, all_yearly_df = run_monte_carlo(
+								num_runs=mc_runs, years=sim_years, **test_params)
+						run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
+						return float((run_avg >= spending_target).mean())
+
+					guess_increase = float(bi_guess)
+					tol = float(bi_tol)
+					progress = st.progress(0, text=f'Testing {guess_increase:.1f}% increase...')
+					guess_rate = _run_with_boost(guess_increase)
+					iterations = [{'Iteration': 0, 'Increase %': f'{guess_increase:.1f}%',
+						'Success Rate': f'{guess_rate*100:.1f}%', 'Range': 'initial guess'}]
+
+					result_increase = guess_increase
+					if abs(guess_rate - target_rate) <= 0.01:
+						progress.progress(1.0, text='Complete')
+						st.success(f'A {guess_increase:.1f}% increase achieves {guess_rate*100:.0f}% spending success '
+							f'(target: {bi_target_pct}%).')
+					else:
+						# Set search bounds
+						if guess_rate < target_rate:
+							# Need more increase — search higher
+							lo = guess_increase
+							hi = guess_increase * 2.0
+							for _ in range(5):
+								r = _run_with_boost(hi)
+								if r >= target_rate:
+									break
+								hi = lo + (hi - lo) * 1.5
+						else:
+							# Need less increase — search lower
+							hi = guess_increase
+							lo = max(guess_increase * 0.5, 0.0)
+							for _ in range(5):
+								r = _run_with_boost(lo)
+								if r < target_rate:
+									break
+								lo = max(hi - (hi - lo) * 1.5, 0.0)
+
+						max_iter = 15
+						for i in range(max_iter):
+							mid = (lo + hi) / 2.0
+							progress.progress((i + 1) / max_iter, text=f'Iteration {i+1}: trying {mid:.1f}% increase...')
+							rate = _run_with_boost(mid)
+							iterations.append({'Iteration': i + 1, 'Increase %': f'{mid:.1f}%',
+								'Success Rate': f'{rate*100:.1f}%', 'Range': f'{lo:.1f}% – {hi:.1f}%'})
+							if rate < target_rate:
+								lo = mid
+							else:
+								hi = mid
+							if hi - lo < tol:
+								break
+
+						progress.progress(1.0, text='Complete')
+						result_increase = round((lo + hi) / 2.0, 1)
+						factor = 1.0 + result_increase / 100.0
+						increased_total = orig_total * factor
+						dollar_gain = increased_total - orig_total
+
+						st.success(f'A **{result_increase:.1f}%** increase in portfolio balances would raise '
+							f'spending success to ≈{bi_target_pct}%.')
+						st.markdown(f'**Total portfolio:** ${orig_total:,.0f} → ${increased_total:,.0f} '
+							f'(+${dollar_gain:,.0f})')
+
+						# Per-account breakdown
+						breakdown_rows = []
+						for k in _balance_keys:
+							orig_val = orig_balances[k]
+							if orig_val > 0:
+								label = k.replace('_start', '').replace('_', ' ').title()
+								breakdown_rows.append({
+									'Account': label,
+									'Original': f'${orig_val:,.0f}',
+									'After Increase': f'${orig_val * factor:,.0f}',
+									'Increase': f'${orig_val * (result_increase / 100.0):,.0f}',
+								})
+						if breakdown_rows:
+							st.dataframe(pd.DataFrame(breakdown_rows), use_container_width=True, hide_index=True)
+
+					st.dataframe(pd.DataFrame(iterations), use_container_width=True, hide_index=True)
+
+					# Probability of this increase over the selected horizon
+					import math as _math
+					def _norm_cdf(x):
+						return 0.5 * (1.0 + _math.erf(x / _math.sqrt(2.0)))
+
+					_stock_pct = stored_params.get('target_stock_pct', 0.6)
+					mg_df = load_master_global()
+					stock_f = mg_df['LBM 100E'].dropna().values
+					bond_f = mg_df['LBM 100 F'].dropna().values
+					n_f = min(len(stock_f), len(bond_f))
+					stock_f = stock_f[:n_f]
+					bond_f = bond_f[:n_f]
+					horizon_months = int(bi_months)
+					increase_used = result_increase
+
+					# ── Empirical: extract monthly returns, blend, compute rolling N-month returns ──
+					def _extract_monthly(factors_12mo):
+						n = len(factors_12mo)
+						monthly = np.zeros(n + 11)
+						seed = factors_12mo[0] ** (1.0 / 12.0)
+						for k in range(12):
+							monthly[k] = seed
+						for t in range(n - 1):
+							monthly[t + 12] = monthly[t] * factors_12mo[t + 1] / factors_12mo[t]
+						return monthly
+
+					stock_monthly = _extract_monthly(stock_f)
+					bond_monthly = _extract_monthly(bond_f)
+					n_months = min(len(stock_monthly), len(bond_monthly))
+					blended_monthly = _stock_pct * stock_monthly[:n_months] + (1 - _stock_pct) * bond_monthly[:n_months]
+					wealth = np.concatenate([[1.0], np.cumprod(blended_monthly)])
+					skip = 12
+					if horizon_months < n_months - skip:
+						w = wealth[skip:]
+						rolling_rets = w[horizon_months:] / w[:len(w) - horizon_months] - 1.0
+						n_periods = len(rolling_rets)
+						n_gains = int(np.sum(rolling_rets >= (increase_used / 100.0)))
+						empirical_prob = n_gains / n_periods
+					else:
+						empirical_prob = None
+						n_periods = 0
+						n_gains = 0
+
+					# ── Simulated (parametric lognormal) ──
+					blended_annual = _stock_pct * stock_f + (1 - _stock_pct) * bond_f
+					annual_log_rets = np.log(blended_annual)
+					mu_annual = float(np.mean(annual_log_rets))
+					sigma_annual = float(np.std(annual_log_rets))
+					frac = horizon_months / 12.0
+					mu_h = mu_annual * frac
+					sigma_h = sigma_annual * np.sqrt(frac)
+					log_threshold = np.log(1.0 + increase_used / 100.0)
+					simulated_prob = 1.0 - _norm_cdf((log_threshold - mu_h) / sigma_h)
+
+					# ── Display ──
+					month_label = f'{horizon_months} month{"s" if horizon_months != 1 else ""}'
+					st.markdown(f'**Probability of a ≥{increase_used:.1f}% gain over {month_label}:**')
+					col_emp, col_sim = st.columns(2)
+					with col_emp:
+						if empirical_prob is not None:
+							st.metric('Historical (empirical)', f'{empirical_prob*100:.1f}%')
+							st.caption(f'{n_gains} of {n_periods:,} rolling {month_label} periods (1927–2024)')
+						else:
+							st.caption('Not enough data for this horizon.')
+					with col_sim:
+						st.metric('Simulated (lognormal)', f'{simulated_prob*100:.1f}%')
+						st.caption(f'Parametric model scaled to {month_label}')
+					st.caption(f'{_stock_pct*100:.0f}/{(1-_stock_pct)*100:.0f} stock/bond blend.')
 
 	# ── Client PDF Report ────────────────────────────────────────
 	if sim_mode is not None and 'mc_percentile_rows' in st.session_state:

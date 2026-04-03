@@ -43,6 +43,7 @@ _SAVEABLE_KEYS = [
 	'tcja_sunset', 'tcja_sunset_year',
 	'qcd_annual', 'earned_income', 'earned_income_years',
 	'irmaa_enabled', 'prefer_tda_before_taxable',
+	'essential_spending',
 	'display_decimals', 'monte_carlo_runs',
 	'num_scenarios',
 ]
@@ -716,6 +717,8 @@ def _render_withdrawal_section(horizon):
 			num_years = int(period_end) - period_start + 1
 			withdrawal_schedule_inputs.append((num_years, float(period_amount)))
 			period_start = int(period_end) + 1
+		essential_spending = st.number_input('Essential spending floor (display only)', value=0.0, min_value=0.0, step=1000.0, key='essential_spending',
+			help='Minimum annual after-tax spending you need. Not used in calculations — shown as a reference in results alongside your ideal spending target.')
 		rmd_start_age = st.number_input('RMD start age (person 1)', min_value=65, max_value=89, value=73, key='rmd_start_age')
 		rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73, key='rmd_start_age_spouse')
 		ending_balance_goal = st.number_input('Ending balance goal (legacy target)', value=0.0, min_value=0.0, step=50000.0, key='ending_balance_goal',
@@ -725,6 +728,7 @@ def _render_withdrawal_section(horizon):
 		'rmd_start_age': rmd_start_age,
 		'rmd_start_age_spouse': rmd_start_age_spouse,
 		'ending_balance_goal': ending_balance_goal,
+		'essential_spending': float(essential_spending),
 	}
 
 def _render_add_goals_section(horizon):
@@ -1031,7 +1035,7 @@ _FLOAT_KEYS = {
 	'stock_dividend_yield', 'stock_turnover', 'investment_fee_bps',
 	'guardrail_lower', 'guardrail_upper', 'guardrail_target',
 	'guardrail_max_spending_pct', 'flex_goal_min_pct',
-	'ending_balance_goal',
+	'ending_balance_goal', 'essential_spending',
 	'pension_buyout_income', 'pension_buyout_cola', 'pension_buyout_survivor',
 	'pension_buyout_lump',
 	'inheritance_taxable_amount', 'inheritance_ira_amount',

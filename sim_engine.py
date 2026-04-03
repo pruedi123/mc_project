@@ -554,10 +554,11 @@ def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, ble
 # ── Result processing ───────────────────────────────────────────
 
 def store_distribution_results(results, all_yearly_df, sim_mode_label, ending_balance_goal=1.0,
-							   spending_target=0.0):
+							   spending_target=0.0, essential_spending=0.0):
 	"""Process MC or historical distribution results.
 	Returns a dict of results to be written into session state by the caller.
-	spending_target: the original annual spending goal (before guardrail adjustments)."""
+	spending_target: the original annual spending goal (before guardrail adjustments).
+	essential_spending: minimum spending floor (display only)."""
 	mc_df = pd.DataFrame(results)
 	percentiles_list = [0, 10, 25, 50, 75, 90]
 	summary_cols = ['after_tax_end', 'total_taxes', 'effective_tax_rate', 'portfolio_cagr', 'roth_cagr']
@@ -574,10 +575,13 @@ def store_distribution_results(results, all_yearly_df, sim_mode_label, ending_ba
 	median_run_idx = int((run_ends - median_val).abs().idxmin())
 	median_df = all_yearly_df[all_yearly_df['run'] == median_run_idx].drop(columns=['run', 'total_portfolio']).reset_index(drop=True)
 	# Spending success rate: % of simulations where avg annual spending >= target
+	run_spending = all_yearly_df.groupby('run')['after_tax_spending'].mean()
 	spending_success_rate = None
 	if spending_target > 0:
-		run_spending = all_yearly_df.groupby('run')['after_tax_spending'].mean()
 		spending_success_rate = float((run_spending >= spending_target).mean())
+	essential_success_rate = None
+	if essential_spending > 0:
+		essential_success_rate = float((run_spending >= essential_spending).mean())
 	return {
 		'mc_percentile_rows': pct_rows,
 		'mc_pct_non_positive': pct_non_positive,
@@ -587,6 +591,8 @@ def store_distribution_results(results, all_yearly_df, sim_mode_label, ending_ba
 		'sim_mode': sim_mode_label,
 		'mc_spending_success_rate': spending_success_rate,
 		'mc_spending_target': spending_target,
+		'mc_essential_success_rate': essential_success_rate,
+		'mc_essential_spending': essential_spending,
 	}
 
 def compute_summary_metrics(df: pd.DataFrame, inheritor_rate: float) -> Dict[str, float]:
