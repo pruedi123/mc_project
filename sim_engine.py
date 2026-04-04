@@ -8,6 +8,7 @@ import functools
 import numpy as np
 import pandas as pd
 from typing import Dict, Optional, Sequence
+from concurrent.futures import ProcessPoolExecutor
 
 from tax_engine import (get_standard_deduction, get_ordinary_brackets,
 	compute_taxable_social_security, apply_brackets, compute_capital_gains_tax,
@@ -842,6 +843,41 @@ def run_monte_carlo(num_runs: int, years: int, inheritor_rate: float,
 		results.append(metrics)
 		df_run['run'] = run_idx
 		all_yearly.append(df_run)
+	all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+	return results, all_yearly_df
+
+# ── Parallel historical simulation ──────────────────────────────
+
+def _run_historical_window(args):
+	"""Top-level worker function for multiprocessing. Runs one historical window.
+	Must be top-level (not nested) so it can be pickled by ProcessPoolExecutor."""
+	run_idx, stock_rets, bond_rets, sim_years, pp_factors_run, inheritor_rate, sim_params = args
+	df_run = simulate_withdrawals(
+		years=sim_years, stock_return_series=stock_rets,
+		bond_return_series=bond_rets, pp_factors_run=pp_factors_run, **sim_params)
+	df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
+	metrics = compute_summary_metrics(df_run, inheritor_rate)
+	df_run['run'] = run_idx
+	return metrics, df_run
+
+_PARALLEL_WORKERS = max(1, os.cpu_count() - 2)  # leave 2 cores free for OS + Streamlit
+
+def run_historical_parallel(windows, sim_years, inheritor_rate, sim_params, max_workers=None):
+	"""Run all historical windows in parallel using ProcessPoolExecutor.
+	Returns (results, all_yearly_df) same as the sequential version."""
+	if max_workers is None:
+		max_workers = _PARALLEL_WORKERS
+	# Build work items: each is (run_idx, stock_rets, bond_rets, sim_years, pp_factors, inheritor_rate, params)
+	work_items = []
+	for run_idx, (stock_rets, bond_rets) in enumerate(windows):
+		pp_run = compute_run_pp_factors(run_idx, sim_years)
+		work_items.append((run_idx, stock_rets, bond_rets, sim_years, pp_run, inheritor_rate, sim_params))
+	results = []
+	all_yearly = []
+	with ProcessPoolExecutor(max_workers=max_workers) as executor:
+		for metrics, df_run in executor.map(_run_historical_window, work_items, chunksize=20):
+			results.append(metrics)
+			all_yearly.append(df_run)
 	all_yearly_df = pd.concat(all_yearly, ignore_index=True)
 	return results, all_yearly_df
 

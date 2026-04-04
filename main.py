@@ -8,6 +8,7 @@ from sim_engine import (
 	PP_FACTORS, compute_run_pp_factors, load_master_global, load_bond_factors,
 	get_all_historical_windows, compute_summary_metrics, build_scenario_params,
 	auto_scenario_name, compute_scenario_summary, run_monte_carlo,
+	run_historical_parallel,
 	store_distribution_results, simulate_withdrawals, sample_lognormal_returns,
 	ss_adjustment_factor, ss_back_calculate_fra_benefit, ss_breakeven_table,
 	compute_ss_benefits,
@@ -508,6 +509,9 @@ def main():
 	# Apply pending spend finder result before widgets render
 	if '_pending_spend_finder' in st.session_state:
 		st.session_state['wd_amount_0'] = st.session_state.pop('_pending_spend_finder')
+		if '_pending_spend_finder_ess' in st.session_state:
+			st.session_state['essential_spending'] = st.session_state.pop('_pending_spend_finder_ess')
+		st.session_state['_pending_auto_run'] = True
 
 	st.title('Withdrawal + RMD Simulator (30-year)')
 
@@ -952,8 +956,317 @@ def main():
 			# Move selected baseline to front
 			all_scenarios.insert(0, all_scenarios.pop(baseline_idx))
 
+	# ── Run Full Process (single-button automated workflow) ─────
+	_full_process_auto = st.session_state.pop('_pending_full_process', False)
+	if st.button('Run Full Process', type='primary', key='run_full_process') or _full_process_auto:
+		import math as _math_fp
+
+		sim_years = int(years)
+		is_historical = return_mode == 'Historical (master_global_factors)'
+		mc_runs_fp = int(monte_carlo_runs)
+		inheritor_rate_fp = float(inheritor_marginal_rate)
+		ending_balance_goal_fp = float(ending_balance_goal)
+
+		# Pre-load historical windows once (shared across all phases)
+		if is_historical:
+			fp_windows, fp_window_start_dates = get_all_historical_windows(sim_years)
+
+		def _fp_run_sim(params):
+			"""Run simulation and return (results, all_yearly_df)."""
+			if is_historical:
+				return run_historical_parallel(fp_windows, sim_years, inheritor_rate_fp, params)
+			else:
+				return run_monte_carlo(
+					num_runs=mc_runs_fp, years=sim_years,
+					inheritor_rate=inheritor_rate_fp,
+					taxable_log_drift=float(taxable_log_drift),
+					taxable_log_volatility=float(taxable_log_volatility),
+					bond_log_drift=float(bond_log_drift),
+					bond_log_volatility=float(bond_log_volatility),
+					**params)
+
+		def _fp_spending_success(params, target_spending):
+			"""Run sim and return spending success rate vs target."""
+			_, all_yearly_df = _fp_run_sim(params)
+			run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
+			return float((run_avg >= target_spending).mean()), all_yearly_df
+
+		def _fp_find_spending(params, original_spending, target_pct, guess, tol=2000.0, max_iter=15, progress_cb=None):
+			"""Binary search for spending level achieving target_pct ideal success. Returns (spending, ideal_rate, min_avg)."""
+			def _run(spend_amt):
+				test_params = dict(params)
+				scale = spend_amt / original_spending if original_spending > 0 else 1.0
+				test_params['withdrawal_schedule'] = [v * scale for v in test_params['withdrawal_schedule']]
+				_, ayd = _fp_run_sim(test_params)
+				run_avg = ayd.groupby('run')['after_tax_spending'].mean()
+				return float((run_avg >= spend_amt).mean()), float(run_avg.min())
+
+			rate, min_avg = _run(guess)
+			if abs(rate - target_pct) <= 0.01:
+				return round(guess / 1000) * 1000, rate, min_avg
+
+			if rate >= target_pct:
+				lo, hi = guess, guess * 1.5
+				for _ in range(5):
+					r, _ = _run(hi)
+					if r < target_pct:
+						break
+					hi = lo + (hi - lo) * 1.5
+			else:
+				lo, hi = guess * 0.5, guess
+				for _ in range(5):
+					r, _ = _run(lo)
+					if r >= target_pct:
+						break
+					lo = max(hi - (hi - lo) * 1.5, 0.0)
+
+			for i in range(max_iter):
+				mid = (lo + hi) / 2.0
+				if progress_cb:
+					progress_cb(i, max_iter, mid)
+				r, _ = _run(mid)
+				if r >= target_pct:
+					lo = mid
+				else:
+					hi = mid
+				if hi - lo < tol:
+					break
+			result = round((lo + hi) / 2.0 / 1000) * 1000
+			final_rate, final_min = _run(result)
+			return result, final_rate, final_min
+
+		def _fp_find_decline(params, spending_target, target_rate, guess_decline=20.0, tol=1.0, max_iter=15, progress_cb=None):
+			"""Binary search for % portfolio decline that drops spending success to target_rate. Returns decline %."""
+			_balance_keys = ['taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start',
+				'goal_taxable_start', 'goal_tda_start']
+			def _run(pct_decline):
+				factor = 1.0 - pct_decline / 100.0
+				test_params = dict(params)
+				for k in _balance_keys:
+					if k in test_params:
+						test_params[k] = params[k] * factor
+				_, ayd = _fp_run_sim(test_params)
+				run_avg = ayd.groupby('run')['after_tax_spending'].mean()
+				return float((run_avg >= spending_target).mean())
+
+			rate = _run(guess_decline)
+			if abs(rate - target_rate) <= 0.01:
+				return guess_decline
+
+			if rate > target_rate:
+				lo, hi = guess_decline, min(guess_decline * 1.5, 90.0)
+				for _ in range(5):
+					r = _run(hi)
+					if r <= target_rate:
+						break
+					hi = min(lo + (hi - lo) * 1.5, 95.0)
+			else:
+				hi, lo = guess_decline, max(guess_decline * 0.5, 0.0)
+				for _ in range(5):
+					r = _run(lo)
+					if r > target_rate:
+						break
+					lo = max(hi - (hi - lo) * 1.5, 0.0)
+
+			for i in range(max_iter):
+				mid = (lo + hi) / 2.0
+				if progress_cb:
+					progress_cb(i, max_iter, mid)
+				r = _run(mid)
+				if r > target_rate:
+					lo = mid
+				else:
+					hi = mid
+				if hi - lo < tol:
+					break
+			return round((lo + hi) / 2.0, 1)
+
+		# ── Phase 1: Auto-calculate spending if 0 ──
+		fp_status = st.empty()
+		fp_progress = st.progress(0, text='Starting Full Process...')
+		fp_summary = st.container()
+
+		auto_spending = base_withdrawal_schedule[0] if base_withdrawal_schedule else 0.0
+		if auto_spending <= 0:
+			# 4% of main portfolio
+			portfolio_total = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
+			four_pct = portfolio_total * 0.04
+			# Add all income streams (SS, pensions, other income) at full annual amounts, as if starting year 1
+			income_sum = (float(ss_income_input) + float(ss_income_spouse_input) +
+				float(pension_income_input) + float(pension_income_spouse_input) +
+				float(other_income_input))
+			# Add annuity income if any (from pension buyout or scenarios)
+			income_sum += sim_params.get('annuity_income_p1', 0.0) + sim_params.get('annuity_income_p2', 0.0)
+			auto_spending = round((four_pct + income_sum) / 1000) * 1000
+			# Update withdrawal schedule
+			withdrawal_schedule = [auto_spending] * sim_years
+			base_withdrawal_schedule = list(withdrawal_schedule)
+			sim_params['withdrawal_schedule'] = list(withdrawal_schedule)
+			st.session_state['_base_withdrawal_schedule'] = base_withdrawal_schedule
+			st.session_state['_withdrawal_schedule'] = list(withdrawal_schedule)
+			fp_summary.info(f'**Phase 1 — Auto spending:** 4% of ${portfolio_total:,.0f} = ${four_pct:,.0f} + '
+				f'${income_sum:,.0f} income = **${auto_spending:,.0f}/yr**')
+		else:
+			fp_summary.info(f'**Phase 1 — Spending:** Using entered value of **${auto_spending:,.0f}/yr**')
+
+		original_spending_fp = auto_spending
+		fp_progress.progress(0.05, text='Phase 1 complete — running initial simulation...')
+
+		# ── Phase 2: Run initial simulation ──
+		results_fp, all_yearly_fp = _fp_run_sim(sim_params)
+		sim_mode_label_fp = 'historical_dist' if is_historical else 'simulated'
+		dist_results_fp = store_distribution_results(results_fp, all_yearly_fp, sim_mode_label_fp,
+			ending_balance_goal_fp, spending_target=original_spending_fp,
+			essential_spending=float(essential_spending))
+		for k, v in dist_results_fp.items():
+			st.session_state[k] = v
+		if is_historical:
+			st.session_state['window_start_dates'] = {i: d.strftime('%Y-%m') for i, d in enumerate(fp_window_start_dates)}
+		st.session_state.pop('multi_scenario_results', None)
+
+		initial_success = dist_results_fp.get('mc_spending_success_rate')
+		fp_summary.info(f'**Phase 2 — Initial sim:** spending ${original_spending_fp:,.0f}/yr → '
+			f'{initial_success*100:.0f}% ideal success' if initial_success else
+			f'**Phase 2 — Initial sim complete**')
+		fp_progress.progress(0.15, text='Phase 2 complete — finding optimal spending...')
+
+		# ── Phase 3: Spending Finder (90% ideal, no essential floor) ──
+		def _phase3_cb(i, mx, mid):
+			fp_progress.progress(0.15 + 0.20 * (i + 1) / mx, text=f'Phase 3: trying ${mid:,.0f}...')
+		found_spending, found_rate, found_min = _fp_find_spending(
+			sim_params, original_spending_fp, target_pct=0.90,
+			guess=original_spending_fp, progress_cb=_phase3_cb)
+		fp_summary.success(f'**Phase 3 — Spending Finder (90% target):** **${found_spending:,.0f}/yr** '
+			f'({found_rate*100:.0f}% ideal) | Essential floor: ${found_min:,.0f}')
+		fp_progress.progress(0.40, text='Phase 3 complete — re-running simulation with found values...')
+
+		# ── Phase 4: Re-run simulation with found spending ──
+		rerun_params = dict(sim_params)
+		scale_fp = found_spending / original_spending_fp if original_spending_fp > 0 else 1.0
+		rerun_params['withdrawal_schedule'] = [v * scale_fp for v in sim_params['withdrawal_schedule']]
+		results_fp2, all_yearly_fp2 = _fp_run_sim(rerun_params)
+		dist_results_fp2 = store_distribution_results(results_fp2, all_yearly_fp2, sim_mode_label_fp,
+			ending_balance_goal_fp, spending_target=found_spending,
+			essential_spending=found_min)
+		for k, v in dist_results_fp2.items():
+			st.session_state[k] = v
+		st.session_state['_base_withdrawal_schedule'] = [found_spending] * sim_years
+		st.session_state['_withdrawal_schedule'] = list(rerun_params['withdrawal_schedule'])
+
+		fp_summary.info(f'**Phase 4 — Re-run sim:** spending ${found_spending:,.0f}/yr → '
+			f'{dist_results_fp2.get("mc_spending_success_rate", 0)*100:.0f}% ideal, '
+			f'{dist_results_fp2.get("mc_essential_success_rate", 0)*100:.0f}% essential')
+		fp_progress.progress(0.55, text='Phase 4 complete — finding balance decline threshold...')
+
+		# ── Phase 5: Balance Decline Finder (75% target, 20% guess, 3-month horizon) ──
+		def _phase5_cb(i, mx, mid):
+			fp_progress.progress(0.55 + 0.15 * (i + 1) / mx, text=f'Phase 5: trying {mid:.1f}% decline...')
+		decline_pct = _fp_find_decline(rerun_params, found_spending,
+			target_rate=0.75, guess_decline=20.0, tol=1.0, progress_cb=_phase5_cb)
+
+		# Compute probability of this decline (3-month horizon)
+		_balance_keys_fp = ['taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start',
+			'goal_taxable_start', 'goal_tda_start']
+		orig_total_fp = sum(rerun_params.get(k, 0.0) for k in _balance_keys_fp)
+		decline_factor = 1.0 - decline_pct / 100.0
+		reduced_total_fp = orig_total_fp * decline_factor
+		dollar_drop_fp = orig_total_fp - reduced_total_fp
+
+		# Historical + parametric probability
+		_stock_pct_fp = rerun_params.get('target_stock_pct', 0.6)
+		mg_df_fp = load_master_global()
+		stock_f_fp = mg_df_fp['LBM 100E'].dropna().values
+		bond_f_fp = mg_df_fp['LBM 100 F'].dropna().values
+		n_f_fp = min(len(stock_f_fp), len(bond_f_fp))
+		stock_f_fp = stock_f_fp[:n_f_fp]; bond_f_fp = bond_f_fp[:n_f_fp]
+		horizon_months_fp = 3
+
+		def _extract_monthly_fp(factors_12mo):
+			n = len(factors_12mo)
+			monthly = np.zeros(n + 11)
+			seed = factors_12mo[0] ** (1.0 / 12.0)
+			for k in range(12):
+				monthly[k] = seed
+			for t in range(n - 1):
+				monthly[t + 12] = monthly[t] * factors_12mo[t + 1] / factors_12mo[t]
+			return monthly
+
+		stock_monthly_fp = _extract_monthly_fp(stock_f_fp)
+		bond_monthly_fp = _extract_monthly_fp(bond_f_fp)
+		n_months_fp = min(len(stock_monthly_fp), len(bond_monthly_fp))
+		blended_monthly_fp = _stock_pct_fp * stock_monthly_fp[:n_months_fp] + (1 - _stock_pct_fp) * bond_monthly_fp[:n_months_fp]
+		wealth_fp = np.concatenate([[1.0], np.cumprod(blended_monthly_fp)])
+		skip_fp = 12
+		w_fp = wealth_fp[skip_fp:]
+		rolling_rets_fp = w_fp[horizon_months_fp:] / w_fp[:len(w_fp) - horizon_months_fp] - 1.0
+		n_periods_fp = len(rolling_rets_fp)
+		n_declines_fp = int(np.sum(rolling_rets_fp <= -(decline_pct / 100.0)))
+		empirical_prob_fp = n_declines_fp / n_periods_fp if n_periods_fp > 0 else 0.0
+
+		def _norm_cdf_fp(x):
+			return 0.5 * (1.0 + _math_fp.erf(x / _math_fp.sqrt(2.0)))
+		blended_annual_fp = _stock_pct_fp * stock_f_fp + (1 - _stock_pct_fp) * bond_f_fp
+		annual_log_rets_fp = np.log(blended_annual_fp)
+		mu_fp = float(np.mean(annual_log_rets_fp))
+		sigma_fp = float(np.std(annual_log_rets_fp))
+		frac_fp = horizon_months_fp / 12.0
+		mu_h_fp = mu_fp * frac_fp
+		sigma_h_fp = sigma_fp * np.sqrt(frac_fp)
+		log_thr_fp = np.log(1.0 - decline_pct / 100.0)
+		simulated_prob_fp = _norm_cdf_fp((log_thr_fp - mu_h_fp) / sigma_h_fp)
+
+		fp_summary.warning(f'**Phase 5 — Balance Decline Finder (75% target):** **{decline_pct:.1f}%** decline '
+			f'(${orig_total_fp:,.0f} → ${reduced_total_fp:,.0f}, −${dollar_drop_fp:,.0f}) | '
+			f'Historical prob: {empirical_prob_fp*100:.1f}% | Simulated prob: {simulated_prob_fp*100:.1f}% '
+			f'(3-month horizon)')
+		fp_progress.progress(0.75, text='Phase 5 complete — stress-testing spending at declined balances...')
+
+		# ── Phase 6: Spending Finder with declined balances (85% ideal) ──
+		stressed_params = dict(rerun_params)
+		for k in _balance_keys_fp:
+			if k in stressed_params:
+				stressed_params[k] = rerun_params[k] * decline_factor
+
+		def _phase6_cb(i, mx, mid):
+			fp_progress.progress(0.75 + 0.20 * (i + 1) / mx, text=f'Phase 6: trying ${mid:,.0f}...')
+		stressed_spending, stressed_rate, stressed_min = _fp_find_spending(
+			stressed_params, found_spending, target_pct=0.85,
+			guess=found_spending, progress_cb=_phase6_cb)
+
+		spending_delta = stressed_spending - found_spending
+		fp_summary.error(f'**Phase 6 — Stressed Spending (85% target, {decline_pct:.1f}% decline):** '
+			f'**${stressed_spending:,.0f}/yr** ({stressed_rate*100:.0f}% ideal) | '
+			f'Δ from plan: **{"+" if spending_delta >= 0 else "−"}${abs(spending_delta):,.0f}/yr** '
+			f'({spending_delta / found_spending * 100:+.1f}%)')
+		fp_progress.progress(1.0, text='Full Process complete!')
+
+		# ── Final Summary Card ──
+		fp_summary.markdown('---')
+		fp_summary.markdown(f"""### Full Process Summary
+| | Amount |
+|---|---:|
+| **Starting portfolio** | ${orig_total_fp:,.0f} |
+| **Optimal spending (90% success)** | ${found_spending:,.0f}/yr |
+| **Essential floor (100% of sims)** | ${found_min:,.0f}/yr |
+| **Decline to reach 75% success** | {decline_pct:.1f}% (−${dollar_drop_fp:,.0f}) |
+| **Decline probability (3-mo)** | Historical: {empirical_prob_fp*100:.1f}% · Simulated: {simulated_prob_fp*100:.1f}% |
+| **Stressed portfolio** | ${reduced_total_fp:,.0f} |
+| **Stressed spending (85% success)** | ${stressed_spending:,.0f}/yr |
+| **Spending change if decline** | {"+" if spending_delta >= 0 else "−"}${abs(spending_delta):,.0f}/yr ({spending_delta / found_spending * 100:+.1f}%) |
+""")
+
+		# Store sim config for manual finders
+		st.session_state['_sim_params'] = rerun_params
+		st.session_state['_sim_years'] = sim_years
+		st.session_state['_is_historical'] = is_historical
+		st.session_state['_monte_carlo_runs'] = mc_runs_fp
+		st.session_state['_inheritor_marginal_rate'] = inheritor_rate_fp
+		st.session_state['_ending_balance_goal'] = ending_balance_goal_fp
+
+	st.markdown('---')
 	button_label = 'Run all scenarios' if num_scenarios > 1 else 'Run simulation'
-	if st.button(button_label):
+	_auto_run = st.session_state.pop('_pending_auto_run', False)
+	if st.button(button_label) or _auto_run:
 		# Clear stale SS claiming age analysis (depends on baseline plan inputs)
 		st.session_state.pop('ss_analysis_grid', None)
 		st.session_state.pop('ss_analysis_meta', None)
@@ -970,23 +1283,10 @@ def main():
 		def run_one_scenario(s_params, s_name, progress_placeholder):
 			"""Run a single scenario and return (results, all_yearly_df)."""
 			if is_historical:
-				results = []
-				all_yearly = []
-				for run_idx, (stock_rets, bond_rets) in enumerate(windows):
-					if run_idx % 50 == 0:
-						progress_placeholder.progress(run_idx / n_windows,
-							text=f'{s_name}: {run_idx}/{n_windows} periods')
-					run_pp = compute_run_pp_factors(run_idx, sim_years)
-					df_run = simulate_withdrawals(
-						years=sim_years, stock_return_series=stock_rets,
-						bond_return_series=bond_rets, pp_factors_run=run_pp, **s_params)
-					df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
-					metrics = compute_summary_metrics(df_run, float(inheritor_marginal_rate))
-					results.append(metrics)
-					df_run['run'] = run_idx
-					all_yearly.append(df_run)
+				progress_placeholder.progress(0.1, text=f'{s_name}: running {n_windows} windows in parallel...')
+				results, all_yearly_df = run_historical_parallel(
+					windows, sim_years, float(inheritor_marginal_rate), s_params)
 				progress_placeholder.progress(1.0, text=f'{s_name}: complete')
-				all_yearly_df = pd.concat(all_yearly, ignore_index=True)
 				return results, all_yearly_df
 			else:
 				mc_results, all_yearly_df = run_monte_carlo(
@@ -2120,18 +2420,8 @@ def main():
 						sp['ss_start_age_p2'] = ca
 
 					if is_historical:
-						results = []
-						all_yearly = []
-						for run_idx, (stock_rets, bond_rets) in enumerate(hist_windows):
-							run_pp = compute_run_pp_factors(run_idx, sim_years)
-							df_run = simulate_withdrawals(
-								years=sim_years, stock_return_series=stock_rets,
-								bond_return_series=bond_rets, pp_factors_run=run_pp, **sp)
-							df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
-							results.append(compute_summary_metrics(df_run, float(inheritor_marginal_rate)))
-							df_run['run'] = run_idx
-							all_yearly.append(df_run)
-						all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+						results, all_yearly_df = run_historical_parallel(
+							hist_windows, sim_years, float(inheritor_marginal_rate), sp)
 					else:
 						mc_runs = min(int(monte_carlo_runs), 200)
 						results, all_yearly_df = run_monte_carlo(
@@ -2372,7 +2662,7 @@ def main():
 			st.caption('Find the spending level that gives you a target probability of meeting your spending goal.')
 			col_target, col_guess, col_tol = st.columns(3)
 			with col_target:
-				spend_find_target = st.number_input('Target spending success %', min_value=50, max_value=99,
+				spend_find_target = st.number_input('Target ideal success %', min_value=50, max_value=99,
 					value=90, step=1, key='spend_find_target')
 			with col_guess:
 				_base_sched_default = st.session_state.get('_base_withdrawal_schedule', [])
@@ -2382,6 +2672,18 @@ def main():
 			with col_tol:
 				spend_find_tol = st.number_input('Tolerance ($)', min_value=500, max_value=10000,
 					value=1000, step=500, key='spend_find_tol')
+
+			# Essential floor constraint
+			_ess_default = float(st.session_state.get('essential_spending', 0.0))
+			col_ess_floor, col_ess_target, _ = st.columns(3)
+			with col_ess_floor:
+				spend_find_ess_floor = st.number_input('Essential floor ($)', min_value=0.0,
+					value=_ess_default, step=5000.0, key='spend_find_ess_floor',
+					help='If set, the search also requires this % of sims meet this floor.')
+			with col_ess_target:
+				spend_find_ess_pct = st.number_input('Essential success %', min_value=50, max_value=100,
+					value=100, step=1, key='spend_find_ess_pct',
+					help='Required % of simulations that meet the essential floor.')
 
 			if st.button('Find Spending Level', key='run_spend_finder'):
 				stored_params = st.session_state['_sim_params']
@@ -2393,78 +2695,82 @@ def main():
 				original_spending = base_sched[0] if base_sched else 0.0
 				target_pct = spend_find_target / 100.0
 				tol = float(spend_find_tol)
+				ess_floor = float(spend_find_ess_floor)
+				ess_target_pct = spend_find_ess_pct / 100.0
 
 				if original_spending <= 0:
 					st.warning('No spending target found. Run a simulation first.')
 				else:
 					def _run_with_spending(spend_amt):
-						"""Run simulation with a scaled withdrawal schedule and return spending success rate."""
+						"""Run simulation with a scaled withdrawal schedule and return (ideal_rate, essential_rate)."""
 						test_params = dict(stored_params)
 						orig_sched = list(test_params['withdrawal_schedule'])
 						scale = spend_amt / original_spending if original_spending > 0 else 1.0
 						test_params['withdrawal_schedule'] = [v * scale for v in orig_sched]
 						if is_hist:
 							windows, _ = get_all_historical_windows(sim_years)
-							results = []
-							all_yearly = []
-							for run_idx, (stock_rets, bond_rets) in enumerate(windows):
-								run_pp = compute_run_pp_factors(run_idx, sim_years)
-								df_run = simulate_withdrawals(
-									years=sim_years, stock_return_series=stock_rets,
-									bond_return_series=bond_rets, pp_factors_run=run_pp, **test_params)
-								df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
-								metrics = compute_summary_metrics(df_run, inheritor_rate)
-								results.append(metrics)
-								df_run['run'] = run_idx
-								all_yearly.append(df_run)
-							all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+							results, all_yearly_df = run_historical_parallel(
+								windows, sim_years, inheritor_rate, test_params)
 						else:
 							results, all_yearly_df = run_monte_carlo(
 								num_runs=mc_runs, years=sim_years, **test_params)
 						run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
-						return float((run_avg >= spend_amt).mean())
+						ideal_rate = float((run_avg >= spend_amt).mean())
+						ess_rate = float((run_avg >= ess_floor).mean()) if ess_floor > 0 else 1.0
+						min_avg = float(run_avg.min())
+						return ideal_rate, ess_rate, min_avg
 
 					# Test the user's guess first
 					guess = float(spend_find_guess) if spend_find_guess > 0 else original_spending
 					progress = st.progress(0, text=f'Testing guess ${guess:,.0f}...')
-					guess_rate = _run_with_spending(guess)
+					guess_rate, guess_ess_rate, guess_min = _run_with_spending(guess)
 					iterations = [{'Iteration': 0, 'Spending': f'${guess:,.0f}',
-						'Success Rate': f'{guess_rate*100:.1f}%', 'Range': 'initial guess'}]
+						'Ideal Success': f'{guess_rate*100:.1f}%',
+						**({'Essential Success': f'{guess_ess_rate*100:.1f}%'} if ess_floor > 0 else {}),
+						'Range': 'initial guess'}]
 
-					if abs(guess_rate - target_pct) <= 0.01:
+					def _meets_both(ideal_r, ess_r):
+						"""Check if both ideal and essential constraints are met."""
+						ideal_ok = ideal_r >= target_pct
+						ess_ok = ess_r >= ess_target_pct if ess_floor > 0 else True
+						return ideal_ok and ess_ok
+
+					if abs(guess_rate - target_pct) <= 0.01 and (ess_floor <= 0 or guess_ess_rate >= ess_target_pct):
 						progress.progress(1.0, text='Complete')
-						st.success(f'Your guess of {guess:,.0f} achieves '
-							f'{guess_rate*100:.0f}% spending success (target: {spend_find_target}%).')
+						msg = f'Your guess of {guess:,.0f} achieves {guess_rate*100:.0f}% ideal spending success'
+						if ess_floor > 0:
+							msg += f' and {guess_ess_rate*100:.0f}% essential success'
+						st.success(msg + '.')
+						st.markdown(f'**Implied essential floor (100% of sims):** ${guess_min:,.0f}')
+						result_spending = round(guess / 1000) * 1000
+						st.session_state['_spend_finder_result'] = result_spending
+						st.session_state['_spend_finder_ess_floor'] = guess_min
 					else:
 						has_guess = spend_find_guess > 0 and spend_find_guess != original_spending
 						# Set search bounds based on guess result
-						if guess_rate >= target_pct:
+						if _meets_both(guess_rate, guess_ess_rate):
 							# Guess is too conservative — search upward
 							lo = guess
 							if has_guess:
-								# Tight bounds: +20% above guess
 								hi = guess * 1.2
 							else:
 								hi = guess * 2.0
-							# Expand hi until success drops below target
 							for _ in range(5):
-								r = _run_with_spending(hi)
-								if r < target_pct:
+								r, er, _ = _run_with_spending(hi)
+								if not _meets_both(r, er):
 									break
 								hi = lo + (hi - lo) * 1.5 if has_guess else hi * 1.5
 						else:
 							# Guess is too aggressive — search downward
 							if has_guess:
-								# Tight bounds: -20% below guess
 								lo = guess * 0.8
 							else:
 								lo = 0.0
 							hi = guess
-							# Shrink lo until success exceeds target
 							if has_guess:
 								for _ in range(5):
-									r = _run_with_spending(lo)
-									if r >= target_pct:
+									r, er, _ = _run_with_spending(lo)
+									if _meets_both(r, er):
 										break
 									lo = hi - (hi - lo) * 1.5
 
@@ -2472,10 +2778,12 @@ def main():
 						for i in range(max_iter):
 							mid = (lo + hi) / 2.0
 							progress.progress((i + 1) / max_iter, text=f'Iteration {i+1}: trying ${mid:,.0f}...')
-							rate = _run_with_spending(mid)
+							rate, ess_rate, _ = _run_with_spending(mid)
 							iterations.append({'Iteration': i + 1, 'Spending': f'${mid:,.0f}',
-								'Success Rate': f'{rate*100:.1f}%', 'Range': f'${lo:,.0f} – ${hi:,.0f}'})
-							if rate >= target_pct:
+								'Ideal Success': f'{rate*100:.1f}%',
+								**({'Essential Success': f'{ess_rate*100:.1f}%'} if ess_floor > 0 else {}),
+								'Range': f'${lo:,.0f} – ${hi:,.0f}'})
+							if _meets_both(rate, ess_rate):
 								lo = mid
 							else:
 								hi = mid
@@ -2486,22 +2794,39 @@ def main():
 						result_spending = round((lo + hi) / 2.0 / 1000) * 1000
 						diff = result_spending - original_spending
 
+						# Run once more at result to get final rates for display
+						final_ideal, final_ess, final_min = _run_with_spending(result_spending)
 						if diff > 0:
-							st.success(f'You can increase spending to {result_spending:,.0f} '
-								f'(+{diff:,.0f}/yr) and still achieve a {spend_find_target}% spending success rate.')
+							msg = f'You can increase spending to {result_spending:,.0f} (+{diff:,.0f}/yr)'
 						else:
-							st.warning(f'To achieve a {spend_find_target}% spending success rate, '
-								f'reduce spending to {result_spending:,.0f} ({abs(diff):,.0f}/yr less).')
+							msg = f'Reduce spending to {result_spending:,.0f} ({abs(diff):,.0f}/yr less)'
+						msg += f' — ideal: {final_ideal*100:.0f}%'
+						if ess_floor > 0:
+							msg += f', essential: {final_ess*100:.0f}%'
+						if diff > 0:
+							st.success(msg)
+						else:
+							st.warning(msg)
+						st.markdown(f'**Implied essential floor (100% of sims):** ${final_min:,.0f}')
 						st.caption(f'Original spending: {original_spending:,.0f}')
 						st.dataframe(pd.DataFrame(iterations), use_container_width=True, hide_index=True)
 						st.session_state['_spend_finder_result'] = result_spending
+						st.session_state['_spend_finder_ess_floor'] = final_min
 
 			# Show "Use this value" button if a result exists
 			if '_spend_finder_result' in st.session_state:
 				found_val = st.session_state['_spend_finder_result']
-				if st.button(f'Use {found_val:,.0f} as spending and re-run', key='use_spend_finder'):
+				found_ess = st.session_state.get('_spend_finder_ess_floor')
+				btn_label = f'Use ${found_val:,.0f} ideal'
+				if found_ess:
+					btn_label += f' / ${found_ess:,.0f} essential'
+				btn_label += ' and re-run'
+				if st.button(btn_label, key='use_spend_finder'):
 					st.session_state['_pending_spend_finder'] = found_val
+					if found_ess:
+						st.session_state['_pending_spend_finder_ess'] = found_ess
 					st.session_state.pop('_spend_finder_result', None)
+					st.session_state.pop('_spend_finder_ess_floor', None)
 					st.rerun()
 
 	# ── Balance Decline Finder ──────────────────────────────────
@@ -2527,6 +2852,7 @@ def main():
 				sim_years = st.session_state['_sim_years']
 				is_hist = st.session_state['_is_historical']
 				mc_runs = st.session_state['_monte_carlo_runs']
+				inheritor_rate = st.session_state['_inheritor_marginal_rate']
 				base_sched = st.session_state.get('_base_withdrawal_schedule', [])
 				spending_target = base_sched[0] if base_sched else 0.0
 				target_rate = bd_target_pct / 100.0
@@ -2553,16 +2879,8 @@ def main():
 								test_params[k] = stored_params[k] * factor
 						if is_hist:
 							windows, _ = get_all_historical_windows(sim_years)
-							all_yearly = []
-							for run_idx, (stock_rets, bond_rets) in enumerate(windows):
-								run_pp = compute_run_pp_factors(run_idx, sim_years)
-								df_run = simulate_withdrawals(
-									years=sim_years, stock_return_series=stock_rets,
-									bond_return_series=bond_rets, pp_factors_run=run_pp, **test_params)
-								df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
-								df_run['run'] = run_idx
-								all_yearly.append(df_run)
-							all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+							_, all_yearly_df = run_historical_parallel(
+								windows, sim_years, inheritor_rate, test_params)
 						else:
 							_, all_yearly_df = run_monte_carlo(
 								num_runs=mc_runs, years=sim_years, **test_params)
@@ -2741,6 +3059,7 @@ def main():
 				sim_years = st.session_state['_sim_years']
 				is_hist = st.session_state['_is_historical']
 				mc_runs = st.session_state['_monte_carlo_runs']
+				inheritor_rate = st.session_state['_inheritor_marginal_rate']
 				base_sched = st.session_state.get('_base_withdrawal_schedule', [])
 				spending_target = base_sched[0] if base_sched else 0.0
 				target_rate = bi_target_pct / 100.0
@@ -2764,16 +3083,8 @@ def main():
 								test_params[k] = stored_params[k] * factor
 						if is_hist:
 							windows, _ = get_all_historical_windows(sim_years)
-							all_yearly = []
-							for run_idx, (stock_rets, bond_rets) in enumerate(windows):
-								run_pp = compute_run_pp_factors(run_idx, sim_years)
-								df_run = simulate_withdrawals(
-									years=sim_years, stock_return_series=stock_rets,
-									bond_return_series=bond_rets, pp_factors_run=run_pp, **test_params)
-								df_run['total_portfolio'] = df_run['end_taxable_total'] + df_run['end_tda_total'] + df_run['end_roth']
-								df_run['run'] = run_idx
-								all_yearly.append(df_run)
-							all_yearly_df = pd.concat(all_yearly, ignore_index=True)
+							_, all_yearly_df = run_historical_parallel(
+								windows, sim_years, inheritor_rate, test_params)
 						else:
 							_, all_yearly_df = run_monte_carlo(
 								num_runs=mc_runs, years=sim_years, **test_params)
