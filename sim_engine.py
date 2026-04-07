@@ -785,6 +785,13 @@ def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFra
 		years_in_run=('year', 'count'),
 	)
 	run_spending['avg_annual_after_tax_spending'] = run_spending['total_after_tax_spending'] / run_spending['years_in_run']
+	# First 10 years average spending per run
+	first10 = all_yearly_df[all_yearly_df['year'] <= 10]
+	if not first10.empty:
+		run_first10 = first10.groupby('run')['after_tax_spending'].mean()
+		run_spending['avg_first_10yr_spending'] = run_first10
+	else:
+		run_spending['avg_first_10yr_spending'] = run_spending['avg_annual_after_tax_spending']
 	# Base vs goal spending breakdown
 	has_goal_col = 'goal_spending' in all_yearly_df.columns
 	if has_goal_col:
@@ -797,6 +804,7 @@ def compute_scenario_summary(name: str, results: list, all_yearly_df: pd.DataFra
 		row = {
 			'percentile': p,
 			'avg_annual_after_tax_spending': np.percentile(run_spending['avg_annual_after_tax_spending'], p),
+			'avg_first_10yr_spending': np.percentile(run_spending['avg_first_10yr_spending'], p),
 			'total_lifetime_after_tax_spending': np.percentile(run_spending['total_after_tax_spending'], p),
 		}
 		if has_goal_col:

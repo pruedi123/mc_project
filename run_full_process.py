@@ -62,7 +62,7 @@ def build_sim_params(plan):
         pension_survivor_pct_p2=plan.get('pension_survivor_pct_p2', 0.0),
         pp_factors=PP_FACTORS,
         other_income_annual=plan.get('other_income', 0.0),
-        filing_status='married',
+        filing_status='mfj' if plan.get('filing_status', '') == 'Married Filing Jointly' else 'single',
         use_itemized_deductions=plan.get('use_itemized', False),
         itemized_deduction_amount=plan.get('itemized_deduction', 0.0),
         roth_conversion_amount=plan.get('roth_conversion_amount', 0.0),
@@ -221,7 +221,24 @@ def find_decline(params, spending_target, target_rate, is_historical, windows, s
 
 if __name__ == '__main__':
     # ── Load plan JSON ──
-    plan_path = sys.argv[1] if len(sys.argv) > 1 else \
+    # Usage: python run_full_process.py [plan.json] [--target-pct 0.90] [--shortfall-pct 80]
+    target_pct_override = 0.90
+    shortfall_pct = 80.0
+    skip_next = False
+    positional_args = []
+    for i, a in enumerate(sys.argv[1:], 1):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == '--target-pct':
+            target_pct_override = float(sys.argv[i + 1])
+            skip_next = True
+        elif a == '--shortfall-pct':
+            shortfall_pct = float(sys.argv[i + 1])
+            skip_next = True
+        elif not a.startswith('--'):
+            positional_args.append(a)
+    plan_path = positional_args[0] if positional_args else \
         '/Users/paulruedi/RWM/Current Client Plans/Black, Larry & Lisa/black_larry_lisa.json'
     with open(plan_path) as f:
         plan = json.load(f)
@@ -268,11 +285,11 @@ if __name__ == '__main__':
     initial_success = dist.get('mc_spending_success_rate', 0)
     print(f"  Spending ${original_spending:,.0f}/yr -> {initial_success*100:.0f}% ideal success ({time.time()-t1:.1f}s)")
 
-    # ── Phase 3: Spending Finder (90% target) ──
-    print("\n=== PHASE 3: Find spending at 90% ideal success ===")
+    # ── Phase 3: Spending Finder ──
+    print(f"\n=== PHASE 3: Find spending at {target_pct_override*100:.0f}% ideal success ===")
     t1 = time.time()
     found_spending, found_rate, found_min = find_spending(
-        sim_params, original_spending, target_pct=0.90, guess=original_spending,
+        sim_params, original_spending, target_pct=target_pct_override, guess=original_spending,
         is_historical=is_historical, windows=windows, sim_years=sim_years,
         inheritor_rate=inheritor_rate, plan=plan)
     print(f"  >> ${found_spending:,.0f}/yr ({found_rate*100:.0f}% ideal) | Essential floor: ${found_min:,.0f} ({time.time()-t1:.1f}s)")
@@ -327,9 +344,20 @@ if __name__ == '__main__':
                 print(f"    {int(r['year']):>3}  {int(r['age_p1']):>5}  {int(r['age_p2']):>5}  "
                       f"${found_spending:>11,.0f}  ${guardrail_target:>12,.0f}  ${actual:>11,.0f}  ${r['total_portfolio']:>11,.0f}")
             print(f"    {'─'*3}  {'─'*5}  {'─'*5}  {'─'*12}  {'─'*13}  {'─'*12}  {'─'*12}")
+            first10 = df_1929[df_1929['year'] <= 10]
+            avg_first10 = first10['after_tax_spending'].mean() if not first10.empty else df_1929['after_tax_spending'].mean()
+            shortfall_threshold = found_min * (shortfall_pct / 100.0)
+            n_below = int((df_1929['after_tax_spending'] < shortfall_threshold).sum())
+            pct_below = n_below / len(df_1929) * 100
+            n_below_10 = int((first10['after_tax_spending'] < shortfall_threshold).sum()) if not first10.empty else 0
+            pct_below_10 = n_below_10 / min(10, len(df_1929)) * 100
             print(f"    Avg actual: ${df_1929['after_tax_spending'].mean():,.0f}  |  "
+                  f"First 10yr avg: ${avg_first10:,.0f}  |  "
                   f"Min actual: ${df_1929['after_tax_spending'].min():,.0f}  |  "
                   f"Final portfolio: ${df_1929['total_portfolio'].iloc[-1]:,.0f}")
+            print(f"    Below {shortfall_pct:.0f}% of essential (${shortfall_threshold:,.0f}): "
+                  f"{n_below}/{len(df_1929)} yrs ({pct_below:.1f}%) overall  |  "
+                  f"{n_below_10}/{min(10, len(df_1929))} yrs ({pct_below_10:.1f}%) in first 10")
 
     # ── Phase 5: Balance Decline Finder (75% target) ──
     print("\n=== PHASE 5: Find balance decline to reach 75% success ===")

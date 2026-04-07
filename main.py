@@ -371,7 +371,9 @@ def _render_client_view(success_rate, spending_pct_rows, percentile_rows,
 								st.caption(f'{name}: {currency_fmt.format(avg_goal)}/yr average')
 				else:
 					avg_spending = float(stress_df['Spending'].mean())
-					st.caption(f'Average spending: {currency_fmt.format(avg_spending)}/yr')
+					first10 = stress_df[stress_df['Year'] <= 10]
+					avg_first10 = float(first10['Spending'].mean()) if not first10.empty else avg_spending
+					st.caption(f'Average spending: {currency_fmt.format(avg_spending)}/yr  |  First 10 years: {currency_fmt.format(avg_first10)}/yr')
 				stress_df['_color'] = stress_df.apply(
 					lambda r: 'Below target' if r['Spending'] < r['Target'] else 'At or above target', axis=1)
 				stress_df['Shortfall'] = (stress_df['Target'] - stress_df['Spending']).clip(lower=0)
@@ -443,10 +445,12 @@ def _display_comparison(scenarios, currency_fmt, key_suffix=''):
 	baseline = scenarios[0]
 	baseline_row = next(r for r in baseline['percentile_rows'] if r['percentile'] == compare_pct)
 	baseline_spend = next(r for r in baseline['spending_percentiles'] if r['percentile'] == compare_pct)
+	baseline_first10 = baseline_spend.get('avg_first_10yr_spending', baseline_spend['avg_annual_after_tax_spending'])
 	comparison_rows = []
 	for sc in scenarios:
 		sc_row = next(r for r in sc['percentile_rows'] if r['percentile'] == compare_pct)
 		sc_spend = next(r for r in sc['spending_percentiles'] if r['percentile'] == compare_pct)
+		sc_first10 = sc_spend.get('avg_first_10yr_spending', sc_spend['avg_annual_after_tax_spending'])
 		comparison_rows.append({
 			'Scenario': sc['name'],
 			'After-Tax Ending': sc_row['after_tax_end'],
@@ -456,6 +460,8 @@ def _display_comparison(scenarios, currency_fmt, key_suffix=''):
 			'Eff Tax Rate': sc_row['effective_tax_rate'],
 			'Avg Annual Spending': sc_spend['avg_annual_after_tax_spending'],
 			'Spend Delta': sc_spend['avg_annual_after_tax_spending'] - baseline_spend['avg_annual_after_tax_spending'],
+			'First 10yr Avg': sc_first10,
+			'10yr Delta': sc_first10 - baseline_first10,
 			'% Below Goal': sc['pct_non_positive'] * 100,
 		})
 	comp_df = pd.DataFrame(comparison_rows)
@@ -471,7 +477,7 @@ def _display_comparison(scenarios, currency_fmt, key_suffix=''):
 	comp_df['Scenario'] = unique_names
 	comp_df = comp_df.set_index('Scenario')
 	def _color_deltas(df):
-		delta_cols = {'vs Baseline', 'Tax Delta', 'Spend Delta'}
+		delta_cols = {'vs Baseline', 'Tax Delta', 'Spend Delta', '10yr Delta'}
 		styles = pd.DataFrame('', index=df.index, columns=df.columns)
 		for col in df.columns:
 			if col in delta_cols:
@@ -487,6 +493,8 @@ def _display_comparison(scenarios, currency_fmt, key_suffix=''):
 		'Eff Tax Rate': '{:.2%}'.format,
 		'Avg Annual Spending': currency_fmt,
 		'Spend Delta': currency_fmt,
+		'First 10yr Avg': currency_fmt,
+		'10yr Delta': currency_fmt,
 		'% Below Goal': '{:.1f}%'.format,
 	}).apply(_color_deltas, axis=None))
 

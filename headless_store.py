@@ -42,6 +42,8 @@ def _plan_to_streamlit_format(plan: dict) -> dict:
     }
 
     data = {
+        'person1_label': plan['person1'].get('label', ''),
+        'person2_label': plan['person2'].get('label', ''),
         'start_age': plan['person1']['age'],
         'start_age_spouse': plan['person2']['age'],
         'life_expectancy_primary': plan['person1']['life_expectancy'],
@@ -249,10 +251,12 @@ def _streamlit_to_plan_format(data: dict, client_name: str) -> dict:
     plan = {
         'client': client_name,
         'person1': {
+            'label': data.get('person1_label', ''),
             'age': data.get('start_age', 65),
             'life_expectancy': data.get('life_expectancy_primary', 84),
         },
         'person2': {
+            'label': data.get('person2_label', ''),
             'age': data.get('start_age_spouse', 60),
             'life_expectancy': data.get('life_expectancy_spouse', 89),
         },

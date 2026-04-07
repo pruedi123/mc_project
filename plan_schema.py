@@ -12,8 +12,8 @@ PLAN_DEFAULTS = {
     "client": "Client",
 
     # People
-    "person1": {"age": 65, "life_expectancy": 84},
-    "person2": {"age": 60, "life_expectancy": 89},
+    "person1": {"label": "", "age": 65, "life_expectancy": 84},
+    "person2": {"label": "", "age": 60, "life_expectancy": 89},
 
     # Accounts
     "accounts": {
