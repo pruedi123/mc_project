@@ -2148,7 +2148,7 @@ def main():
 		st.markdown('---')
 		st.subheader('Social Security Claiming Age Analysis')
 
-		is_couple = (filing_status_key == 'married_filing_jointly')
+		is_couple = (filing_status_key == 'mfj')
 		has_p1_ss = float(ss_income_input) > 0
 		has_p2_ss = float(ss_income_spouse_input) > 0
 		_fra_p1 = int(ss_fra_age_p1)

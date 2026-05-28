@@ -261,7 +261,7 @@ def compute_ss_benefits(ss_income_p1: float, start_age_p1: int, fra_age_p1: int,
 	# Spousal top-up (MFJ only): excess of 50% of other's PIA over own PIA, reduced for early claiming.
 	# The reduction is based on the age when spousal benefits actually begin, which is the later of
 	# when each spouse files — because spousal requires the OTHER person to have filed too.
-	is_mfj = (filing_status == 'married_filing_jointly')
+	is_mfj = (filing_status == 'mfj')
 	if is_mfj:
 		excess_p1 = max(0.0, 0.5 * pia_p2 - pia_p1)  # P1 gets spousal from P2's record
 		excess_p2 = max(0.0, 0.5 * pia_p1 - pia_p2)  # P2 gets spousal from P1's record
