@@ -28,6 +28,7 @@ import numpy as np
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -43,7 +44,7 @@ RETURN_MODE_MAP = {
 }
 
 SHEET_NAME = "Scenarios"
-NOTE_TEXT = "Blank cell in a scenario column = same as Baseline."
+NOTE_TEXT = "Every column starts at the same defaults — change only the cells you want."
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +83,7 @@ class Field:
         """Turn a spreadsheet cell value into the plan-ready value."""
         if self.kind in ("int",):
             return int(round(float(raw)))
-        if self.kind in ("dollar",):
+        if self.kind in ("dollar", "num"):
             return float(raw)
         if self.kind == "pct":
             # Stored 0-100 in the plan JSON (translator divides by 100).
@@ -172,6 +173,7 @@ SECTIONS = [
     ("RETURNS", [
         Field("Return mode", "return_mode", "choice",
               choices=["Historical", "Lognormal", "Bootstrap"]),
+        Field("Investment fee (basis points)", "investment_fee_bps", "num"),
     ]),
     ("SIMULATION", [
         Field("Monte Carlo runs", "monte_carlo_runs", "int"),
@@ -210,6 +212,13 @@ def cmd_template(args):
     plan = _load_plan(args.base)
     n_scen = max(1, args.scenarios)
 
+    # Starting defaults applied to EVERY column so each scenario begins from the
+    # same known point — the user then changes only the cells they care about.
+    seed = copy.deepcopy(plan)
+    seed["target_stock_pct"] = float(args.equity)
+    seed["investment_fee_bps"] = float(args.fee_bps)
+    seed["return_mode"] = RETURN_MODE_MAP[args.return_mode.lower()]
+
     wb = Workbook()
     ws = wb.active
     ws.title = SHEET_NAME
@@ -221,14 +230,15 @@ def cmd_template(args):
     # Row 1: note. Row 2: header. Data starts row 3.
     ws.cell(row=1, column=1, value=NOTE_TEXT).font = note_font
 
-    # n_scen = total columns incl. Baseline. Baseline + (n_scen-1) named scenarios.
-    headers = ["Input", "Baseline"] + [f"Scenario {i}" for i in range(2, n_scen + 1)]
+    headers = ["Input"] + [f"Scenario {i}" for i in range(1, n_scen + 1)]
     for col, h in enumerate(headers, start=1):
         c = ws.cell(row=2, column=col, value=h)
         c.font = bold
         c.alignment = Alignment(horizontal="left")
 
+    last_data_col = n_scen + 1  # columns 2..last_data_col hold scenario values
     row = 3
+    dropdown_rows = []  # (row, [allowed values]) for choice/bool fields
     for section, fields in SECTIONS:
         sc = ws.cell(row=row, column=1, value=section)
         sc.font = bold
@@ -236,22 +246,40 @@ def cmd_template(args):
         row += 1
         for f in fields:
             ws.cell(row=row, column=1, value=f.label)
-            bval = _display_value(f, plan)
+            bval = _display_value(f, seed)
             if bval is not None:
-                ws.cell(row=row, column=2, value=bval)
+                for col in range(2, last_data_col + 1):
+                    ws.cell(row=row, column=col, value=bval)
+            if f.kind == "choice":
+                dropdown_rows.append((row, list(f.choices)))
+            elif f.kind == "bool":
+                dropdown_rows.append((row, ["TRUE", "FALSE"]))
             row += 1
+
+    # Dropdowns (Excel data validation) across all scenario columns B..last.
+    last_col = get_column_letter(last_data_col)
+    for drow, values in dropdown_rows:
+        dv = DataValidation(
+            type="list",
+            formula1='"' + ",".join(values) + '"',
+            allow_blank=True,
+            showDropDown=False,  # False = show the arrow (Excel quirk)
+        )
+        ws.add_data_validation(dv)
+        dv.add(f"B{drow}:{last_col}{drow}")
 
     # Formatting: widths + freeze header row and label column.
     ws.column_dimensions["A"].width = 34
-    for i in range(2, n_scen + 1):
+    for i in range(2, last_data_col + 1):
         ws.column_dimensions[get_column_letter(i)].width = 18
     ws.freeze_panes = "B3"
 
     out = Path(args.out)
     wb.save(out)
     print(f"Wrote template: {out}")
-    print(f"  {len(FIELD_BY_LABEL)} inputs, {n_scen} scenario column(s) (Baseline + {n_scen - 1}).")
-    print(f"  Baseline (col B) seeded from {args.base}. Fill columns C+ and run:")
+    print(f"  {len(FIELD_BY_LABEL)} inputs x {n_scen} scenario columns, all seeded to defaults")
+    print(f"  ({args.equity:.0f}% equity, {args.fee_bps:.0f} bps fee, {args.return_mode} returns).")
+    print(f"  Edit only the cells you want, then run:")
     print(f"    python3 scenario_matrix.py run {out} --base {args.base}")
 
 
@@ -400,8 +428,15 @@ def main():
     t = sub.add_parser("template", help="Generate a scenario-matrix workbook from a base plan")
     t.add_argument("--base", required=True, help="Path to base plan JSON (Streamlit/session-state schema)")
     t.add_argument("--out", default="scenario_matrix.xlsx", help="Output .xlsx path")
-    t.add_argument("--scenarios", type=int, default=3,
-                   help="Total scenario columns incl. Baseline (default 3 -> B,C,D)")
+    t.add_argument("--scenarios", type=int, default=5,
+                   help="Number of scenario columns, all seeded to defaults (default 5)")
+    t.add_argument("--equity", type=float, default=60.0,
+                   help="Starting stock %% applied to every column (default 60)")
+    t.add_argument("--fee-bps", type=float, default=100.0,
+                   help="Starting investment fee in basis points (default 100)")
+    t.add_argument("--return-mode", default="Historical",
+                   choices=["Historical", "Lognormal", "Bootstrap"],
+                   help="Starting return mode applied to every column (default Historical)")
     t.set_defaults(func=cmd_template)
 
     r = sub.add_parser("run", help="Run every scenario column and print a comparison")
