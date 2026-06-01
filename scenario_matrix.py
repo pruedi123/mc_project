@@ -33,7 +33,9 @@ from openpyxl.worksheet.datavalidation import DataValidation
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from compare_modes import _metrics, _run_one  # reuse the headless engine glue
-from sim_engine import BOOTSTRAP_MODE_NAME
+from plan_to_sim_params import build_sim_params_from_plan
+from run_full_process import find_spending  # binary-search spending solver
+from sim_engine import BOOTSTRAP_MODE_NAME, get_all_historical_windows
 
 # Friendly return-mode words -> exact engine strings used by _run_one().
 RETURN_MODE_MAP = {
@@ -45,6 +47,11 @@ RETURN_MODE_MAP = {
 
 SHEET_NAME = "Scenarios"
 NOTE_TEXT = "Every column starts at the same defaults — change only the cells you want."
+RUN_ROW_LABEL = "Run? (TRUE = include)"
+SOLVE_ROW_LABEL = "Solve spending @ success % (blank = use typed)"
+SPENDING_FIELD_LABEL = "Annual spending (after-tax)"
+SOLVE_DEFAULT_PCT = 90
+_FALSE_WORDS = ("false", "no", "0", "f", "n", "off")
 
 
 # --------------------------------------------------------------------------- #
@@ -63,6 +70,18 @@ def _set_spending(plan, value):
 def _get_spending(plan):
     periods = plan.get("periods") or [{}]
     return periods[0].get("amount")
+
+
+def _starting_spend_guess(plan):
+    """A non-zero starting spend for the solver to scale from: 4% of the
+    portfolio plus guaranteed income. Needed because find_spending scales the
+    withdrawal schedule proportionally and can't start from $0."""
+    portfolio = sum(float(plan.get(k, 0) or 0)
+                    for k in ("taxable_start", "tda_start", "tda_spouse_start", "roth_start"))
+    income = sum(float(plan.get(k, 0) or 0)
+                 for k in ("ss_income", "ss_income_spouse", "pension_income",
+                           "pension_income_spouse", "other_income"))
+    return max(0.04 * portfolio + income, 1000.0)
 
 
 class Field:
@@ -237,7 +256,18 @@ def cmd_template(args):
         c.alignment = Alignment(horizontal="left")
 
     last_data_col = n_scen + 1  # columns 2..last_data_col hold scenario values
-    row = 3
+
+    # Row 3: "Run?" toggle — runner includes a column only if its cell is TRUE.
+    rc = ws.cell(row=3, column=1, value=RUN_ROW_LABEL)
+    rc.font = bold
+    for col in range(2, last_data_col + 1):
+        ws.cell(row=3, column=col, value="TRUE")
+    run_dv = DataValidation(type="list", formula1='"TRUE,FALSE"',
+                            allow_blank=True, showDropDown=False)
+    ws.add_data_validation(run_dv)
+    run_dv.add(f"B3:{get_column_letter(last_data_col)}3")
+
+    row = 4
     dropdown_rows = []  # (row, [allowed values]) for choice/bool fields
     for section, fields in SECTIONS:
         sc = ws.cell(row=row, column=1, value=section)
@@ -255,6 +285,13 @@ def cmd_template(args):
             elif f.kind == "bool":
                 dropdown_rows.append((row, ["TRUE", "FALSE"]))
             row += 1
+            # Right under spending: the solve-for-spending target row.
+            if f.label == SPENDING_FIELD_LABEL:
+                sc = ws.cell(row=row, column=1, value=SOLVE_ROW_LABEL)
+                sc.font = Font(italic=True)
+                for col in range(2, last_data_col + 1):
+                    ws.cell(row=row, column=col, value=SOLVE_DEFAULT_PCT)
+                row += 1
 
     # Dropdowns (Excel data validation) across all scenario columns B..last.
     last_col = get_column_letter(last_data_col)
@@ -272,7 +309,7 @@ def cmd_template(args):
     ws.column_dimensions["A"].width = 34
     for i in range(2, last_data_col + 1):
         ws.column_dimensions[get_column_letter(i)].width = 18
-    ws.freeze_panes = "B3"
+    ws.freeze_panes = "B4"
 
     out = Path(args.out)
     wb.save(out)
@@ -316,6 +353,8 @@ def _build_scenarios(ws, base_plan):
     names = [name for _, name in scen_cols]
     plans = [copy.deepcopy(base_plan) for _ in scen_cols]
     modes = [None] * len(scen_cols)
+    include = [True] * len(scen_cols)
+    solve_targets = [None] * len(scen_cols)  # fraction (0-1) per column, or None
     unknown = set()
 
     for r in range(header_row + 1, ws.max_row + 1):
@@ -323,6 +362,23 @@ def _build_scenarios(ws, base_plan):
         if label is None:
             continue
         label = str(label).strip()
+        if label == RUN_ROW_LABEL:
+            for idx, (c, _name) in enumerate(scen_cols):
+                v = ws.cell(row=r, column=c).value
+                if v is not None and str(v).strip().lower() in _FALSE_WORDS:
+                    include[idx] = False
+            continue
+        if label == SOLVE_ROW_LABEL:
+            for idx, (c, _name) in enumerate(scen_cols):
+                v = ws.cell(row=r, column=c).value
+                if v is None or str(v).strip() == "":
+                    continue
+                try:
+                    t = float(v)
+                except (ValueError, TypeError):
+                    continue
+                solve_targets[idx] = t / 100.0 if t > 1 else t
+            continue
         field = FIELD_BY_LABEL.get(label)
         if field is None:
             # Section headers and free-text rows are fine; only warn on rows
@@ -348,7 +404,18 @@ def _build_scenarios(ws, base_plan):
 
     if unknown:
         print("Warning: ignoring unrecognized input rows: " + ", ".join(sorted(unknown)))
-    return names, plans, modes
+
+    keep = [i for i in range(len(scen_cols)) if include[i]]
+    if not keep:
+        raise SystemExit("No scenarios marked to run (every 'Run?' cell is FALSE).")
+    skipped = [names[i] for i in range(len(scen_cols)) if i not in keep]
+    if skipped:
+        print("Skipping (Run? = FALSE): " + ", ".join(skipped))
+    names = [names[i] for i in keep]
+    plans = [plans[i] for i in keep]
+    modes = [modes[i] for i in keep]
+    solve_targets = [solve_targets[i] for i in keep]
+    return names, plans, modes, solve_targets
 
 
 def _fmt(v, kind):
@@ -365,6 +432,7 @@ def _fmt(v, kind):
 
 # (metric_key, row label, format kind) — same metrics compare_modes surfaces.
 METRIC_ROWS = [
+    ("solved_spending", "Solved spending", "dollar"),
     ("n_paths", "Paths", "int"),
     ("portfolio_survival_%", "Survival %", "pct"),
     ("spending_success_%", "Spending success %", "pct"),
@@ -380,23 +448,52 @@ METRIC_ROWS = [
 ]
 
 
+def _solve_spending(plan, mode, target_pct):
+    """Binary-search the max sustainable annual spending at target_pct success,
+    reusing run_full_process.find_spending across all return modes."""
+    guess = _starting_spend_guess(plan)
+    pguess = copy.deepcopy(plan)
+    _set_spending(pguess, guess)
+    built = build_sim_params_from_plan(pguess, return_mode=mode)
+    sim_params = built["sim_params"]
+    sim_years = built["sim_years"]
+    inheritor_rate = built["inheritor_marginal_rate"]
+
+    is_historical = "Historical" in mode
+    windows = get_all_historical_windows(sim_years)[0] if is_historical else None
+
+    solved, _rate, _floor = find_spending(
+        sim_params, original_spending=guess, target_pct=target_pct, guess=guess,
+        is_historical=is_historical, windows=windows, sim_years=sim_years,
+        inheritor_rate=inheritor_rate, plan=pguess,
+    )
+    return float(solved)
+
+
 def cmd_run(args):
     base_plan = _load_plan(args.base)
     wb = load_workbook(args.xlsx, data_only=True)
     ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
 
-    names, plans, modes = _build_scenarios(ws, base_plan)
+    names, plans, modes, solve_targets = _build_scenarios(ws, base_plan)
 
     print(f"Scenarios: {len(names)}   Monte Carlo paths: {args.runs}\n")
     metrics = []
     headers_info = []
-    for name, plan, mode in zip(names, plans, modes):
+    for name, plan, mode, solve in zip(names, plans, modes, solve_targets):
         friendly_mode = next(
             (k.title() for k, v in RETURN_MODE_MAP.items() if v == mode), mode
         )
-        print(f"Running {name} ({friendly_mode}) ...", flush=True)
+        solved_spending = None
+        if solve is not None:
+            print(f"Solving {name} ({friendly_mode}) for {solve * 100:.0f}% success ...", flush=True)
+            solved_spending = _solve_spending(plan, mode, solve)
+            _set_spending(plan, solved_spending)
+        else:
+            print(f"Running {name} ({friendly_mode}) ...", flush=True)
         results, ayd, sim_years, base_spending = _run_one(plan, mode, args.runs)
-        m = _metrics(results, ayd, sim_years, base_spending)
+        m = _metrics(results, ayd, sim_years, base_spending) or {}
+        m["solved_spending"] = solved_spending
         metrics.append(m)
         stock = float(plan.get("target_stock_pct", 0))
         headers_info.append(
