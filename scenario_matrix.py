@@ -209,6 +209,9 @@ SECTIONS = [
         Field("Roth conversion amount", "roth_conversion_amount", "dollar"),
         Field("Roth conversion years", "roth_conversion_years", "int"),
         Field("Roth bracket fill rate", "roth_bracket_fill_rate", "fraction"),
+        Field("Roth conversion tax source", "roth_conversion_tax_source", "choice",
+              choices=["Taxable", "TDA (reduce net conversion)"],
+              get_fn=lambda p: p.get("roth_conversion_tax_source") or "Taxable"),
     ]),
     ("TAXES", [
         Field("Filing status", "filing_status", "choice",
