@@ -35,7 +35,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from compare_modes import _metrics, _run_one  # reuse the headless engine glue
 from plan_to_sim_params import build_sim_params_from_plan
 from run_full_process import find_spending  # binary-search spending solver
-from sim_engine import BOOTSTRAP_MODE_NAME, get_all_historical_windows
+from sim_engine import (
+    BOOTSTRAP_MODE_NAME,
+    get_all_historical_windows,
+    ss_adjustment_factor,
+    ss_back_calculate_fra_benefit,
+)
 
 # Friendly return-mode words -> exact engine strings used by _run_one().
 RETURN_MODE_MAP = {
@@ -82,6 +87,24 @@ def _starting_spend_guess(plan):
                  for k in ("ss_income", "ss_income_spouse", "pension_income",
                            "pension_income_spouse", "other_income"))
     return max(0.04 * portfolio + income, 1000.0)
+
+
+def _setter(key):
+    def _set(plan, value):
+        plan[key] = float(value)
+    return _set
+
+
+def _fra_benefit_getter(inc_key, age_key, fra_key):
+    """Seed the FRA-benefit cell by back-calculating from the base plan's
+    at-claim benefit, so an unchanged sheet reproduces the original number."""
+    def _get(plan):
+        inc = float(plan.get(inc_key, 0) or 0)
+        if inc <= 0:
+            return 0
+        return round(ss_back_calculate_fra_benefit(
+            inc, int(plan.get(age_key, 67)), int(plan.get(fra_key, 67))))
+    return _get
 
 
 class Field:
@@ -161,10 +184,20 @@ SECTIONS = [
         Field("Withdraw TDA before taxable", "prefer_tda_before_taxable", "bool"),
     ]),
     ("SOCIAL SECURITY", [
-        Field("SS benefit — Person 1", "ss_income", "dollar"),
+        Field("SS FRA benefit — Person 1", "_ss_fra_benefit_p1", "dollar",
+              get_fn=_fra_benefit_getter("ss_income", "ss_start_age_p1", "ss_fra_age_p1"),
+              set_fn=_setter("_ss_fra_benefit_p1")),
+        Field("SS FRA age — Person 1", "ss_fra_age_p1", "int"),
         Field("SS claim age — Person 1", "ss_start_age_p1", "int"),
-        Field("SS benefit — Person 2", "ss_income_spouse", "dollar"),
+        Field("Already claiming amount — Person 1", "_ss_override_p1", "dollar",
+              set_fn=_setter("_ss_override_p1")),
+        Field("SS FRA benefit — Person 2", "_ss_fra_benefit_p2", "dollar",
+              get_fn=_fra_benefit_getter("ss_income_spouse", "ss_start_age_p2", "ss_fra_age_p2"),
+              set_fn=_setter("_ss_fra_benefit_p2")),
+        Field("SS FRA age — Person 2", "ss_fra_age_p2", "int"),
         Field("SS claim age — Person 2", "ss_start_age_p2", "int"),
+        Field("Already claiming amount — Person 2", "_ss_override_p2", "dollar",
+              set_fn=_setter("_ss_override_p2")),
     ]),
     ("PENSIONS", [
         Field("Pension income — Person 1", "pension_income", "dollar"),
@@ -201,6 +234,41 @@ SECTIONS = [
 
 # Flat label -> Field lookup (label is the spreadsheet key in column A).
 FIELD_BY_LABEL = {f.label: f for _, fields in SECTIONS for f in fields}
+
+# Per-person SS resolution config:
+# (override_key, derived_row_label, income_key, claim_key, fra_age_key, fra_benefit_key)
+_SS_PEOPLE = [
+    ("_ss_override_p1", "→ Derived SS benefit (auto) — Person 1",
+     "ss_income", "ss_start_age_p1", "ss_fra_age_p1", "_ss_fra_benefit_p1"),
+    ("_ss_override_p2", "→ Derived SS benefit (auto) — Person 2",
+     "ss_income_spouse", "ss_start_age_p2", "ss_fra_age_p2", "_ss_fra_benefit_p2"),
+]
+
+
+def _ss_derived_formula(L, fb_r, cl_r, fa_r, ov_r):
+    """Excel formula mirroring sim_engine.ss_adjustment_factor: override wins,
+    else FRA benefit x early-reduction / delayed-credit factor for the claim age."""
+    fb, cl, fa, ov = f"{L}{fb_r}", f"{L}{cl_r}", f"{L}{fa_r}", f"{L}{ov_r}"
+    return (f'=IF({ov}<>"",{ov},{fb}*IF(({cl}-{fa})*12<0,'
+            f'1-IF(({fa}-{cl})*12<=36,({fa}-{cl})*12*5/9/100,'
+            f'36*5/9/100+(({fa}-{cl})*12-36)*5/12/100),'
+            f'1+MIN(({cl}-{fa})*12,(70-{fa})*12)*2/3/100))')
+
+
+def _finalize_ss(plan):
+    """Resolve each person's SS income into the engine's ss_income field:
+    exact override if given, else FRA benefit x claim-age factor (same SSA
+    formula the engine uses). Pops the helper keys so they don't leak."""
+    for ov_key, _lbl, inc_key, claim_key, fra_key, fb_key in _SS_PEOPLE:
+        ovr = plan.pop(ov_key, None)
+        fb = plan.pop(fb_key, None)
+        if ovr is not None:
+            plan[inc_key] = float(ovr)
+        elif fb is not None:
+            factor = ss_adjustment_factor(int(plan.get(claim_key, 67)),
+                                          int(plan.get(fra_key, 67)))
+            plan[inc_key] = float(fb) * factor
+    return plan
 
 
 def _load_plan(path):
@@ -269,12 +337,14 @@ def cmd_template(args):
 
     row = 4
     dropdown_rows = []  # (row, [allowed values]) for choice/bool fields
+    field_row = {}      # field.key -> worksheet row, for formula references
     for section, fields in SECTIONS:
         sc = ws.cell(row=row, column=1, value=section)
         sc.font = bold
         sc.fill = section_fill
         row += 1
         for f in fields:
+            field_row[f.key] = row
             ws.cell(row=row, column=1, value=f.label)
             bval = _display_value(f, seed)
             if bval is not None:
@@ -292,6 +362,16 @@ def cmd_template(args):
                 for col in range(2, last_data_col + 1):
                     ws.cell(row=row, column=col, value=SOLVE_DEFAULT_PCT)
                 row += 1
+            # After each person's override row: the live derived-benefit formula.
+            for ov_key, dlabel, _inc, claim_key, fra_key, fb_key in _SS_PEOPLE:
+                if f.key == ov_key:
+                    dc = ws.cell(row=row, column=1, value=dlabel)
+                    dc.font = Font(italic=True, color="808080")
+                    for col in range(2, last_data_col + 1):
+                        ws.cell(row=row, column=col, value=_ss_derived_formula(
+                            get_column_letter(col), field_row[fb_key],
+                            field_row[claim_key], field_row[fra_key], field_row[ov_key]))
+                    row += 1
 
     # Dropdowns (Excel data validation) across all scenario columns B..last.
     last_col = get_column_letter(last_data_col)
@@ -362,6 +442,8 @@ def _build_scenarios(ws, base_plan):
         if label is None:
             continue
         label = str(label).strip()
+        if label.startswith("→"):  # derived/info rows are display-only
+            continue
         if label == RUN_ROW_LABEL:
             for idx, (c, _name) in enumerate(scen_cols):
                 v = ws.cell(row=r, column=c).value
@@ -404,6 +486,9 @@ def _build_scenarios(ws, base_plan):
 
     if unknown:
         print("Warning: ignoring unrecognized input rows: " + ", ".join(sorted(unknown)))
+
+    for p in plans:                 # resolve FRA benefit / override -> ss_income
+        _finalize_ss(p)
 
     keep = [i for i in range(len(scen_cols)) if include[i]]
     if not keep:
