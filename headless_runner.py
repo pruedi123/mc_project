@@ -6,11 +6,14 @@ generates PDF report, returns results.
 
 import numpy as np
 import pandas as pd
+from datetime import date as _date
 
 from sim_engine import (
-    PP_FACTORS, compute_run_pp_factors, load_master_global, load_bond_factors,
+    PP_FACTORS, compute_run_pp_factors, load_portfolio_factors,
+    should_use_actual_allocation_columns,
     get_all_historical_windows, compute_summary_metrics, build_scenario_params,
     compute_scenario_summary, run_monte_carlo, simulate_withdrawals,
+    resolve_mortgage_params,
 )
 from pdf_report import generate_report
 from plan_schema import apply_defaults, validate_plan, plan_to_session_state
@@ -91,12 +94,22 @@ def _build_sim_params(plan: dict, years: int, withdrawal_schedule: list) -> dict
 
     target_stock_pct = alloc['stock_pct'] / 100.0
 
+    # Mortgage: fixed nominal payment for the loan term, or payoff from taxable at start
+    mort = plan.get('mortgage') or {}
+    adj_taxable_start, mortgage_payment_annual, mortgage_years_remaining = resolve_mortgage_params(
+        float(mort.get('balance', 0)),
+        float(mort.get('rate', 0)),
+        int(mort.get('years_remaining', 0)),
+        bool(mort.get('payoff_at_start', False)),
+        float(accts['taxable']),
+    )
+
     params = dict(
         start_age_primary=int(plan['person1']['age']),
         start_age_spouse=int(plan['person2']['age']),
         life_expectancy_primary=int(plan['person1']['life_expectancy']),
         life_expectancy_spouse=int(plan['person2']['life_expectancy']),
-        taxable_start=float(accts['taxable']),
+        taxable_start=adj_taxable_start,
         roth_start=float(accts.get('roth', 0)),
         tda_start=float(accts['tda_p1']),
         tda_spouse_start=float(accts.get('tda_p2', 0)),
@@ -133,6 +146,9 @@ def _build_sim_params(plan: dict, years: int, withdrawal_schedule: list) -> dict
         annuity_survivor_pct_p1=float(annuities.get('person1', {}).get('survivor_pct', 0)),
         annuity_survivor_pct_p2=float(annuities.get('person2', {}).get('survivor_pct', 0)),
         annuity_start_year=int(annuities.get('start_year', 1)),
+        # Mortgage
+        mortgage_payment_annual=mortgage_payment_annual,
+        mortgage_years_remaining=mortgage_years_remaining,
         # Other income
         other_income_annual=float(plan.get('other_income', 0)),
         earned_income_annual=float(earned.get('annual', 0)),
@@ -184,6 +200,8 @@ def _build_sim_params(plan: dict, years: int, withdrawal_schedule: list) -> dict
         inheritance_ira_amount=0.0,
         # Withdrawal preference
         prefer_tda_before_taxable=bool(alloc.get('prefer_tda_before_taxable', False)),
+        # Year 1 = the year the plan is run (OBBBA senior-bonus window)
+        sim_start_calendar_year=int(plan.get('sim_start_calendar_year', _date.today().year)),
     )
 
     # Handle inheritance if specified
@@ -203,6 +221,9 @@ def _compute_blended_params(plan: dict, sim_params: dict):
     """Compute and set blended_mu/sigma on sim_params for guardrails."""
     ret = plan['returns']
     target_stock_pct = sim_params['target_stock_pct']
+    return_mode_name = 'Historical (master_global_factors)' if ret['mode'] != 'lognormal' else 'Simulated (lognormal)'
+    historical_allocation_source = plan.get('historical_allocation_source', 'Actual allocation columns')
+    use_actual = should_use_actual_allocation_columns(return_mode_name, historical_allocation_source)
 
     if ret['mode'] == 'lognormal':
         stock_mu = float(ret['stock_log_drift'])
@@ -210,22 +231,20 @@ def _compute_blended_params(plan: dict, sim_params: dict):
         bond_mu = float(ret['bond_log_drift'])
         bond_sigma = float(ret['bond_log_volatility'])
     else:
-        mg_df = load_master_global()
-        stock_factors = mg_df['LBM 100E'].dropna().values
-        stock_log_rets = np.log(stock_factors)
-        stock_mu = float(np.mean(stock_log_rets))
-        stock_sigma = float(np.std(stock_log_rets))
-        bond_log_returns = np.log(1.0 + load_bond_factors())
-        bond_mu = float(np.mean(bond_log_returns))
-        bond_sigma = float(np.std(bond_log_returns))
+        allocation_log_rets = np.log(load_portfolio_factors(target_stock_pct, use_actual))
+        stock_log_rets = allocation_log_rets
+        bond_log_returns = allocation_log_rets
+        stock_mu = float(np.mean(allocation_log_rets))
+        stock_sigma = float(np.std(allocation_log_rets))
+        bond_mu = stock_mu
+        bond_sigma = stock_sigma
 
     if sim_params['guardrails_enabled']:
-        blended_mu = target_stock_pct * stock_mu + (1 - target_stock_pct) * bond_mu
         if ret['mode'] != 'lognormal':
-            n = min(len(stock_log_rets), len(bond_log_returns))
-            blended_log_rets = target_stock_pct * stock_log_rets[:n] + (1 - target_stock_pct) * bond_log_returns[:n]
-            blended_sigma = float(np.std(blended_log_rets))
+            blended_mu = stock_mu
+            blended_sigma = stock_sigma
         else:
+            blended_mu = target_stock_pct * stock_mu + (1 - target_stock_pct) * bond_mu
             rho = 0.10
             w_s, w_b = target_stock_pct, 1 - target_stock_pct
             blended_sigma = float(np.sqrt(
@@ -285,7 +304,8 @@ def _parse_scenario_overrides(scenario_def: dict) -> dict:
 
 
 def _run_single(sim_params: dict, years: int, ret: dict, inheritor_rate: float,
-                ending_balance_goal: float, num_runs: int, name: str) -> dict:
+                ending_balance_goal: float, num_runs: int, name: str,
+                use_actual_allocation_columns: bool = True) -> dict:
     """Run a single simulation and return a scenario summary dict."""
     if ret['mode'] == 'lognormal':
         results, all_yearly_df = run_monte_carlo(
@@ -298,7 +318,8 @@ def _run_single(sim_params: dict, years: int, ret: dict, inheritor_rate: float,
             **sim_params,
         )
     else:
-        windows, _ = get_all_historical_windows(years)
+        target_stock_pct = sim_params['target_stock_pct']
+        windows, _ = get_all_historical_windows(years, target_stock_pct, use_actual_allocation_columns)
         results = []
         all_yearly = []
         for run_idx, (stock_rets, bond_rets) in enumerate(windows):
@@ -313,8 +334,18 @@ def _run_single(sim_params: dict, years: int, ret: dict, inheritor_rate: float,
             all_yearly.append(df_run)
         all_yearly_df = pd.concat(all_yearly, ignore_index=True)
 
+    # Spending target = the planned average annual spending (full schedule,
+    # goals included) — NOT period 1's amount, which overstates the target
+    # for go-go/slow-go plans. compute_scenario_summary measures the share of
+    # runs whose average after-tax spending met this plan.
+    schedule = sim_params.get('withdrawal_schedule') or []
+    spending_target = float(np.mean(schedule)) if len(schedule) > 0 else 0.0
+    # An ending-balance goal of $0 makes "portfolio outlived the plan"
+    # unmeasurable (balances can't go negative) — floor it at $1 so runs
+    # that fully deplete count as depleted.
+    depletion_goal = max(float(ending_balance_goal), 1.0)
     return compute_scenario_summary(name, results, all_yearly_df,
-        inheritor_rate, ending_balance_goal)
+        inheritor_rate, depletion_goal, spending_target=spending_target)
 
 
 def _select_median_run(all_yearly_df: pd.DataFrame) -> pd.DataFrame:
@@ -379,6 +410,9 @@ def run_plan(plan: dict, verbose: bool = False) -> dict:
     stock_mu, stock_sigma, bond_mu, bond_sigma = _compute_blended_params(plan, sim_params)
 
     ret = plan['returns']
+    return_mode_name = 'Historical (master_global_factors)' if ret['mode'] != 'lognormal' else 'Simulated (lognormal)'
+    historical_allocation_source = plan.get('historical_allocation_source', 'Actual allocation columns')
+    use_actual_allocation_columns = should_use_actual_allocation_columns(return_mode_name, historical_allocation_source)
     inheritor_rate = float(plan['tax']['inheritor_marginal_rate'])
     ending_balance_goal = float(plan.get('ending_balance_goal', 0))
     num_runs = int(plan['num_sims'])
@@ -396,7 +430,9 @@ def run_plan(plan: dict, verbose: bool = False) -> dict:
         # Run baseline first
         if verbose:
             print(f"  Running scenario 1/{len(scenarios_def) + 1}: Baseline...")
-        baseline_summary = _run_single(sim_params, years, ret, inheritor_rate, ending_balance_goal, num_runs, 'Baseline')
+        baseline_summary = _run_single(
+            sim_params, years, ret, inheritor_rate, ending_balance_goal, num_runs, 'Baseline',
+            use_actual_allocation_columns)
         multi_scenario_results.append(baseline_summary)
 
         # Run each scenario as a full plan with overrides applied at plan level
@@ -427,11 +463,16 @@ def run_plan(plan: dict, verbose: bool = False) -> dict:
             _compute_blended_params(sc_plan, sc_sim_params)
 
             sc_ret = sc_plan['returns']
+            sc_return_mode_name = 'Historical (master_global_factors)' if sc_ret['mode'] != 'lognormal' else 'Simulated (lognormal)'
+            sc_hist_source = sc_plan.get('historical_allocation_source', historical_allocation_source)
+            sc_use_actual = should_use_actual_allocation_columns(sc_return_mode_name, sc_hist_source)
             sc_inheritor = float(sc_plan['tax']['inheritor_marginal_rate'])
             sc_end_goal = float(sc_plan.get('ending_balance_goal', 0))
             sc_num_runs = int(sc_plan.get('num_sims', num_runs))
 
-            sc_summary = _run_single(sc_sim_params, sc_years, sc_ret, sc_inheritor, sc_end_goal, sc_num_runs, s_name)
+            sc_summary = _run_single(
+                sc_sim_params, sc_years, sc_ret, sc_inheritor, sc_end_goal, sc_num_runs, s_name,
+                sc_use_actual)
             multi_scenario_results.append(sc_summary)
 
         # Use baseline for primary results
@@ -439,6 +480,9 @@ def run_plan(plan: dict, verbose: bool = False) -> dict:
         percentile_rows = baseline['percentile_rows']
         spending_percentiles = baseline['spending_percentiles']
         pct_non_positive = baseline['pct_non_positive']
+        spending_success_rate = baseline['spending_success_rate']
+        spending_target = baseline['spending_target']
+        actual_num_sims = baseline['num_sims']
         primary_all_yearly = baseline['all_yearly_df']
         sim_df = _select_median_run(primary_all_yearly)
 
@@ -447,10 +491,15 @@ def run_plan(plan: dict, verbose: bool = False) -> dict:
         if verbose:
             print("  Running simulation...")
 
-        summary = _run_single(sim_params, years, ret, inheritor_rate, ending_balance_goal, num_runs, 'Baseline')
+        summary = _run_single(
+            sim_params, years, ret, inheritor_rate, ending_balance_goal, num_runs, 'Baseline',
+            use_actual_allocation_columns)
         percentile_rows = summary['percentile_rows']
         spending_percentiles = summary['spending_percentiles']
         pct_non_positive = summary['pct_non_positive']
+        spending_success_rate = summary['spending_success_rate']
+        spending_target = summary['spending_target']
+        actual_num_sims = summary['num_sims']
         primary_all_yearly = summary['all_yearly_df']
         sim_df = _select_median_run(primary_all_yearly)
 
@@ -462,9 +511,11 @@ def run_plan(plan: dict, verbose: bool = False) -> dict:
         'percentile_rows': percentile_rows,
         'spending_percentiles': spending_percentiles,
         'pct_non_positive': pct_non_positive,
+        'spending_success_rate': spending_success_rate,
+        'spending_target': spending_target,
         'all_yearly': primary_all_yearly,
         'sim_df': sim_df,
-        'num_sims': num_runs,
+        'num_sims': actual_num_sims,
         'multi_scenario_results': multi_scenario_results,
         'scenario_input_diffs': scenario_input_diffs if scenarios_def else None,
     }
@@ -474,8 +525,15 @@ def run_plan(plan: dict, verbose: bool = False) -> dict:
     pdf_bytes = generate_report(session_state)
 
     # Step 9: Return
+    # success_rate = share of runs whose average after-tax spending met the
+    # plan (the metric that actually grades the plan under guardrails).
+    # portfolio_survival_rate = share of runs ending above the balance goal
+    # (floored at $1) — kept separate; do NOT present it as plan success.
     return {
-        'success_rate': 1.0 - pct_non_positive,
+        'success_rate': spending_success_rate if spending_success_rate is not None else 1.0 - pct_non_positive,
+        'spending_success_rate': spending_success_rate,
+        'spending_target': spending_target,
+        'portfolio_survival_rate': 1.0 - pct_non_positive,
         'percentile_rows': percentile_rows,
         'spending_percentiles': spending_percentiles,
         'pdf_bytes': pdf_bytes,
@@ -483,7 +541,7 @@ def run_plan(plan: dict, verbose: bool = False) -> dict:
         'all_yearly': primary_all_yearly,
         'sim_df': sim_df,
         'multi_scenario_results': multi_scenario_results,
-        'num_sims': num_runs,
+        'num_sims': actual_num_sims,
         'pct_non_positive': pct_non_positive,
     }
 
@@ -510,7 +568,9 @@ if __name__ == '__main__':
 
     result = run_plan(plan, verbose=verbose)
 
-    print(f"\nSuccess rate: {result['success_rate']:.1%}")
+    print(f"\nSpending success rate: {result['success_rate']:.1%}"
+          f" (avg spending >= ${result['spending_target']:,.0f}/yr plan)")
+    print(f"Portfolio survival rate: {result['portfolio_survival_rate']:.1%}")
     m = next((r for r in result['percentile_rows'] if r['percentile'] == 50), None)
     if m:
         print(f"Median ending portfolio: ${m['after_tax_end']:,.0f}")

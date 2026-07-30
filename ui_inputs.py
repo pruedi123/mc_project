@@ -18,7 +18,8 @@ def _is_cloud() -> bool:
 
 # Keys that map directly to session_state widget keys for save/load
 _SAVEABLE_KEYS = [
-	'start_age', 'start_age_spouse', 'life_expectancy_primary', 'life_expectancy_spouse',
+	'start_age', 'start_age_spouse', 'person1_gender', 'person2_gender',
+	'life_expectancy_primary', 'life_expectancy_spouse',
 	'taxable_start', 'taxable_stock_basis_pct', 'taxable_bond_basis_pct',
 	'roth_start', 'tda_start', 'tda_spouse_start',
 	'target_stock_pct', 'roth_conversion_mode', 'roth_conversion_amount', 'roth_conversion_years',
@@ -29,11 +30,12 @@ _SAVEABLE_KEYS = [
 	'pension_income', 'pension_cola_p1', 'pension_survivor_pct_p1',
 	'pension_income_spouse', 'pension_cola_p2', 'pension_survivor_pct_p2',
 	'other_income',
+	'mortgage_balance', 'mortgage_rate', 'mortgage_years_remaining', 'mortgage_payoff_at_start',
 	'pension_buyout_enabled', 'pension_buyout_baseline', 'pension_buyout_person',
 	'pension_buyout_lump', 'pension_buyout_income', 'pension_buyout_cola', 'pension_buyout_survivor',
 	'taxes_enabled', 'filing_status', 'use_itemized', 'itemized_deduction',
 	'inheritor_marginal_rate', 'state_tax_rate', 'state_exempt_retirement',
-	'return_mode', 'taxable_log_drift', 'taxable_log_volatility',
+	'return_mode', 'historical_allocation_source', 'taxable_log_drift', 'taxable_log_volatility',
 	'bond_log_drift', 'bond_log_volatility', 'random_seed', 'seed_mode',
 	'stock_dividend_yield', 'stock_turnover', 'investment_fee_bps',
 	'guardrails_enabled', 'guardrail_lower', 'guardrail_upper', 'guardrail_target',
@@ -43,7 +45,7 @@ _SAVEABLE_KEYS = [
 	'tcja_sunset', 'tcja_sunset_year',
 	'qcd_annual', 'earned_income', 'earned_income_years',
 	'irmaa_enabled', 'prefer_tda_before_taxable',
-	'essential_spending',
+	'essential_spending', 'ideal_spending', 'acceptable_spending', 'redline_spending',
 	'display_decimals', 'monte_carlo_runs',
 	'num_scenarios',
 ]
@@ -54,25 +56,12 @@ def _get_client_dirs():
 	return sorted([d for d in os.listdir(SAVES_DIR)
 					if os.path.isdir(os.path.join(SAVES_DIR, d)) and not d.startswith('.')])
 
-def _build_client_folder(last: str, first: str, identifier: str = '') -> str:
-	"""Build client folder name like 'Smith, John' or 'Smith, John (Portland)'."""
-	name = f'{last}, {first}'
-	if identifier:
-		name += f' ({identifier})'
-	return name
-
-def _default_plan_name(last: str, first: str, identifier: str, existing: list) -> str:
-	"""Generate a default plan name like 'smith_john' or 'smith_john_portland', auto-incrementing if needed."""
-	parts = [last.lower(), first.lower()]
-	if identifier:
-		parts.append(identifier.lower())
-	base = '_'.join(parts).replace(' ', '_')
-	if base not in existing:
-		return base
-	n = 2
-	while f'{base}_{n}' in existing:
+def _default_plan_name(existing: list) -> str:
+	"""Generate next plan name like 'plan_1', 'plan_2', auto-incrementing."""
+	n = 1
+	while f'plan_{n}' in existing:
 		n += 1
-	return f'{base}_{n}'
+	return f'plan_{n}'
 
 def _get_saved_files(client: str):
 	"""Return sorted list of .json filenames (without extension) for a client, excluding _results companion files."""
@@ -121,13 +110,7 @@ def _save_inputs_to_json(client: str, name: str):
 		sc_overrides = {}
 		for s_idx in range(2, n_sc + 1):
 			sc_data = {}
-			for suffix in ['spend_mode', 'spend_scale', 'spend_flat', 'stock_chk', 'stock',
-							'roth_chk', 'roth_mode', 'roth_amt', 'roth_yrs', 'roth_bracket',
-							'annuity_chk', 'ann_purchase',
-							'ann_income', 'ann_cola', 'ann_person', 'ann_surv', 'ann_start',
-							'buyout_chk', 'buyout_choice', 'buyout_person', 'buyout_lump',
-							'buyout_income', 'buyout_cola', 'buyout_surv',
-							'le_chk', 'le_p1', 'le_p2']:
+			for suffix in _SC_OVERRIDE_SUFFIXES:
 				key = f'sc_{suffix}_{s_idx}'
 				if key in st.session_state:
 					sc_data[key] = st.session_state[key]
@@ -218,19 +201,48 @@ def _collect_inputs_as_json() -> str:
 		sc_overrides = {}
 		for s_idx in range(2, n_sc + 1):
 			sc_data = {}
-			for suffix in ['spend_mode', 'spend_scale', 'spend_flat', 'stock_chk', 'stock',
-							'roth_chk', 'roth_mode', 'roth_amt', 'roth_yrs', 'roth_bracket',
-							'annuity_chk', 'ann_purchase',
-							'ann_income', 'ann_cola', 'ann_person', 'ann_surv', 'ann_start',
-							'buyout_chk', 'buyout_choice', 'buyout_person', 'buyout_lump',
-							'buyout_income', 'buyout_cola', 'buyout_surv',
-							'le_chk', 'le_p1', 'le_p2']:
+			for suffix in _SC_OVERRIDE_SUFFIXES:
 				key = f'sc_{suffix}_{s_idx}'
 				if key in st.session_state:
 					sc_data[key] = st.session_state[key]
 			sc_overrides[str(s_idx)] = sc_data
 		data['scenario_overrides'] = sc_overrides
 	return json.dumps(data, indent=2, default=str)
+
+# Every scenario-override widget key suffix (widget keys are f'sc_{suffix}_{i}').
+# Missing entries here silently drop that widget from save/load round trips —
+# 'ann_source' and 'mortgage_chk' were absent until 2026-07-30.
+_SC_OVERRIDE_SUFFIXES = [
+	'spend_mode', 'spend_scale', 'spend_flat', 'stock_chk', 'stock',
+	'roth_chk', 'roth_mode', 'roth_amt', 'roth_yrs', 'roth_bracket',
+	'annuity_chk', 'ann_purchase', 'ann_source',
+	'ann_income', 'ann_cola', 'ann_person', 'ann_surv', 'ann_start',
+	'mortgage_chk',
+	'buyout_chk', 'buyout_choice', 'buyout_person', 'buyout_lump',
+	'buyout_income', 'buyout_cola', 'buyout_surv',
+	'le_chk', 'le_p1', 'le_p2',
+]
+
+
+def _fill_rate_to_label(v):
+	"""Normalize a stored roth_bracket_fill_rate to a selectbox label.
+
+	The sidebar selectbox (key='roth_bracket_fill_rate') keeps the LABEL
+	('22%') in session state, so saved plans may carry either the label or a
+	legacy float (0.22). Returns a valid label, or None if unrecognizable."""
+	if isinstance(v, str) and v in _BRACKET_RATE_OPTIONS:
+		return v
+	try:
+		f = float(str(v).rstrip('%'))
+	except (TypeError, ValueError):
+		return None
+	if f > 1.0:
+		f = f / 100.0
+	for label, rate in _BRACKET_RATE_OPTIONS.items():
+		if abs(rate - f) < 1e-9:
+			return label
+	return None
+
 
 def _load_inputs_from_json(client: str, name: str):
 	"""Read Current Client Plans/{client}/{name}.json and set values into session_state."""
@@ -239,7 +251,12 @@ def _load_inputs_from_json(client: str, name: str):
 		data = json.load(f)
 	for k in _SAVEABLE_KEYS:
 		if k in data:
-			st.session_state[k] = data[k]
+			v = data[k]
+			if k == 'roth_bracket_fill_rate':
+				v = _fill_rate_to_label(v)
+				if v is None:
+					continue
+			st.session_state[k] = v
 	# Restore withdrawal periods
 	if 'periods' in data:
 		for i, p in enumerate(data['periods']):
@@ -286,6 +303,8 @@ def save_results_to_json(client: str, name: str):
 		'num_sims': int(st.session_state.get('num_sims', 0)),
 		'percentile_rows': pct_rows,
 		'spending_percentiles': st.session_state.get('mc_spending_pct_rows', []),
+		'spending_safety_metrics': st.session_state.get('mc_spending_safety_metrics'),
+		'essential_reserve_analysis': st.session_state.get('mc_essential_reserve_analysis'),
 		'pct_non_positive': float(st.session_state.get('mc_pct_non_positive', 0.0)),
 		'median_yearly': {
 			'years': median_by_year.index.tolist(),
@@ -341,58 +360,42 @@ def _render_save_load_section():
 				client_dirs = _get_client_dirs()  # refresh after rename
 
 		# Choose existing client or enter new
+		# Load alias map to show real names in dropdown (local only)
+		_alias_map_path = os.path.expanduser('~/RWM/.client_aliases.json')
+		_amap = {}
+		if os.path.exists(_alias_map_path):
+			with open(_alias_map_path) as _af:
+				_amap = json.load(_af)
+
 		if client_dirs:
 			client_options = ['-- New Client --'] + client_dirs
-			selected = st.selectbox('Select client', client_options, key='client_select')
+			def _format_client(opt):
+				if opt == '-- New Client --':
+					return opt
+				real = _amap.get(opt, '')
+				return f'{opt} — {real}' if real else opt
+			selected = st.selectbox('Select client', client_options, key='client_select',
+									format_func=_format_client)
 		else:
 			selected = '-- New Client --'
 
 		if selected == '-- New Client --':
-			col_last, col_first = st.columns(2)
-			with col_last:
-				last_s = st.text_input('Last name', value='', key='client_last',
-									placeholder='e.g. Smith').strip()
-			with col_first:
-				first_s = st.text_input('First name', value='', key='client_first',
-									placeholder='e.g. John').strip()
-			id_s = st.text_input('Identifier (optional)', value='', key='client_id',
-										placeholder='e.g. Portland').strip()
-			if last_s and first_s:
-				client = _build_client_folder(last_s, first_s, id_s)
+			alias_input = st.text_input('Client alias', value='', key='client_alias_input',
+									placeholder='e.g. Arctic-Hill').strip()
+			if alias_input:
+				client = alias_input
+				# Create folder immediately so saves work
+				os.makedirs(os.path.join(SAVES_DIR, client), exist_ok=True)
 			else:
 				client = ''
-				last_s = first_s = id_s = ''
-				st.info('Enter last and first name to save or load plans.')
+				st.info('Enter the client alias to save or load plans.')
 		else:
 			client = selected
-			# Parse last, first, identifier back from folder name
-			m = re.match(r'^(.+),\s+(.+?)(?:\s+\((.+)\))?$', client)
-			if m:
-				last_s, first_s, id_s = m.group(1), m.group(2), m.group(3) or ''
-			else:
-				last_s = first_s = id_s = ''
-
-			# --- Rename Client ---
-			with st.popover('Rename Client'):
-				new_last = st.text_input('Last name', value=last_s, key='rename_last')
-				new_first = st.text_input('First name', value=first_s, key='rename_first')
-				new_id = st.text_input('Identifier (optional)', value=id_s, key='rename_id')
-				new_last_s, new_first_s, new_id_s = new_last.strip(), new_first.strip(), new_id.strip()
-				if new_last_s and new_first_s:
-					new_folder = _build_client_folder(new_last_s, new_first_s, new_id_s)
-					if new_folder != client:
-						if st.button('Rename'):
-							st.session_state['_pending_rename'] = (client, new_folder)
-							st.rerun()
-					else:
-						st.caption('No changes.')
-				else:
-					st.warning('Last and first name are required.')
 
 		if client:
 			if _is_cloud():
 				# ── Cloud mode: download instead of save to disk ──
-				default_plan = _default_plan_name(last_s, first_s, id_s, []) if last_s and first_s else 'my_plan'
+				default_plan = _default_plan_name([])
 				save_name = st.text_input('Plan name', value=default_plan, key='save_file_name')
 				json_str = _collect_inputs_as_json()
 				st.download_button(
@@ -401,7 +404,7 @@ def _render_save_load_section():
 					file_name=f'{save_name.strip() or default_plan}.json',
 					mime='application/json',
 				)
-				st.caption('Save this file to iCloud Drive > RWM > Current Client Plans > (client folder) to sync with your Mac.')
+				st.caption('Save this file to iCloud Drive > RWM > Current Client Plans > (client alias folder) to sync with your Mac.')
 			else:
 				# ── Local mode: save to disk ──
 				saved_files = _get_saved_files(client)
@@ -410,8 +413,8 @@ def _render_save_load_section():
 					load_client, load_name = st.session_state.pop('_pending_load')
 					_load_inputs_from_json(load_client, load_name)
 					st.session_state['save_file_name'] = load_name
-				# Auto-generate default plan name from client name
-				default_plan = _default_plan_name(last_s, first_s, id_s, saved_files) if last_s and first_s else 'my_plan'
+				# Auto-generate default plan name
+				default_plan = _default_plan_name(saved_files)
 				save_name = st.text_input('Plan name', value=default_plan, key='save_file_name')
 				if st.button('Save Inputs'):
 					if save_name.strip():
@@ -534,7 +537,7 @@ def _render_scenario_section():
 						value=36000.0, step=1000.0, key=f'sc_ann_income_{i}',
 						help='Annual income received from the annuity.')
 					sc_overrides['annuity_cola'] = st.number_input(f'S{i} annuity COLA',
-						value=0.0, format="%.4f", key=f'sc_ann_cola_{i}',
+						value=0.0, min_value=0.0, max_value=0.15, step=0.005, format="%.4f", key=f'sc_ann_cola_{i}',
 						help='Annual cost-of-living adjustment on the annuity income. 0 = fixed payments.')
 					sc_overrides['annuity_person'] = st.radio(f'S{i} annuity owner',
 						['Person 1', 'Person 2'], horizontal=True, key=f'sc_ann_person_{i}')
@@ -544,6 +547,12 @@ def _render_scenario_section():
 					sc_overrides['annuity_start_year'] = int(st.number_input(f'S{i} annuity income starts (year)',
 						value=1, min_value=1, max_value=40, key=f'sc_ann_start_{i}',
 						help='Simulation year when annuity payments begin. Year 1 = immediately.'))
+				mortgage_chk = st.checkbox(f'S{i} pay off mortgage at start', key=f'sc_mortgage_chk_{i}',
+					help='Pay off the remaining mortgage balance (from the main sidebar Mortgage section) '
+					'out of the taxable account in year 1 and drop the payments. Enter the balance in the '
+					'sidebar with "Pay off at start" UNCHECKED so the baseline keeps the loan.')
+				if mortgage_chk:
+					sc_overrides['mortgage_payoff_amount'] = float(st.session_state.get('mortgage_balance', 0.0) or 0.0)
 				buyout_chk = st.checkbox(f'S{i} pension buyout (lump sum vs annuity)', key=f'sc_buyout_chk_{i}',
 					help='Compare taking a one-time lump sum (rolled into TDA) vs receiving an annual pension/annuity. '
 					'For a dedicated comparison, use the Pension Buyout section instead.')
@@ -560,7 +569,7 @@ def _render_scenario_section():
 						value=12000.0, step=1000.0, key=f'sc_buyout_income_{i}',
 						help='Annual income if you choose the annuity/pension option instead.')
 					sc_overrides['buyout_annuity_cola'] = st.number_input(f'S{i} buyout annuity COLA',
-						value=0.0, format="%.4f", key=f'sc_buyout_cola_{i}',
+						value=0.0, min_value=0.0, max_value=0.15, step=0.005, format="%.4f", key=f'sc_buyout_cola_{i}',
 						help='Annual cost-of-living adjustment. 0 = fixed payments (purchasing power erodes with inflation).')
 					sc_overrides['buyout_annuity_survivor_pct'] = st.number_input(f'S{i} buyout annuity survivor %',
 						value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05, key=f'sc_buyout_surv_{i}',
@@ -589,13 +598,23 @@ def _render_scenario_section():
 def _render_ages_section():
 	"""Render Ages & Timeline expander. Returns dict of age values."""
 	with st.expander('Ages & Timeline'):
-		start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65, key='start_age')
-		start_age_spouse = st.number_input('Starting age (person 2)', min_value=18, max_value=120, value=60, key='start_age_spouse')
+		p1_col1, p1_col2 = st.columns([3, 1])
+		with p1_col1:
+			start_age = st.number_input('Starting age (person 1)', min_value=18, max_value=120, value=65, key='start_age')
+		with p1_col2:
+			person1_gender = st.selectbox('Gender', ['', 'M', 'F'], key='person1_gender')
+		p2_col1, p2_col2 = st.columns([3, 1])
+		with p2_col1:
+			start_age_spouse = st.number_input('Starting age (person 2)', min_value=18, max_value=120, value=60, key='start_age_spouse')
+		with p2_col2:
+			person2_gender = st.selectbox('Gender', ['', 'M', 'F'], key='person2_gender')
 		life_expectancy_primary = st.number_input('Primary life expectancy (last age lived through)', min_value=int(start_age), max_value=120, value=84, step=1, key='life_expectancy_primary')
 		life_expectancy_spouse = st.number_input('Spouse life expectancy (last age lived through)', min_value=int(start_age_spouse), max_value=120, value=89, step=1, key='life_expectancy_spouse')
 	return {
 		'start_age': start_age,
 		'start_age_spouse': start_age_spouse,
+		'person1_gender': person1_gender,
+		'person2_gender': person2_gender,
 		'life_expectancy_primary': life_expectancy_primary,
 		'life_expectancy_spouse': life_expectancy_spouse,
 	}
@@ -706,7 +725,7 @@ def _render_withdrawal_section(horizon):
 			if is_last:
 				period_end = horizon
 				st.markdown(f'**Period {i+1}:** years {period_start}–{period_end}')
-				period_amount = st.number_input(f'Period {i+1} annual After-Tax Spending Goal', value=60000.0, step=1000.0, key=f'wd_amount_{i}')
+				period_amount = st.number_input(f'Period {i+1} annual After-Tax Spending Goal', value=80000.0, step=1000.0, key=f'wd_amount_{i}')
 			else:
 				max_end = horizon - (int(num_withdrawal_periods) - 1 - i)
 				default_end = min(period_start + 4, max_end)
@@ -717,8 +736,14 @@ def _render_withdrawal_section(horizon):
 			num_years = int(period_end) - period_start + 1
 			withdrawal_schedule_inputs.append((num_years, float(period_amount)))
 			period_start = int(period_end) + 1
-		essential_spending = st.number_input('Essential spending floor (display only)', value=0.0, min_value=0.0, step=1000.0, key='essential_spending',
-			help='Minimum annual after-tax spending you need. Not used in calculations — shown as a reference in results alongside your ideal spending target.')
+		first_period_amount = withdrawal_schedule_inputs[0][1] if withdrawal_schedule_inputs else 80000.0
+		st.markdown('**Spending safety levels**')
+		ideal_spending = st.number_input('Ideal spending goal ($)', value=float(first_period_amount), min_value=0.0, step=1000.0, key='ideal_spending',
+			help='Preferred annual real spending level for the plan.')
+		essential_spending = st.number_input('Essential spending floor ($)', value=float(first_period_amount) * 0.90, min_value=0.0, step=1000.0, key='essential_spending',
+			help='Minimum annual real spending level. The reserve analysis calculates the bucket needed to prevent any year below this level.')
+		acceptable_spending = essential_spending
+		redline_spending = essential_spending
 		rmd_start_age = st.number_input('RMD start age (person 1)', min_value=65, max_value=89, value=73, key='rmd_start_age')
 		rmd_start_age_spouse = st.number_input('RMD start age (person 2)', min_value=65, max_value=90, value=73, key='rmd_start_age_spouse')
 		ending_balance_goal = st.number_input('Ending balance goal (legacy target)', value=0.0, min_value=0.0, step=50000.0, key='ending_balance_goal',
@@ -729,6 +754,9 @@ def _render_withdrawal_section(horizon):
 		'rmd_start_age_spouse': rmd_start_age_spouse,
 		'ending_balance_goal': ending_balance_goal,
 		'essential_spending': float(essential_spending),
+		'ideal_spending': float(ideal_spending),
+		'acceptable_spending': float(acceptable_spending),
+		'redline_spending': float(redline_spending),
 	}
 
 def _render_add_goals_section(horizon):
@@ -740,7 +768,7 @@ def _render_add_goals_section(horizon):
 		# Defaults for goal 0: Long-term care in last 3 years; goal 1: Legacy in final year
 		_ltc_default_begin = max(1, horizon - 2)
 		_goal_defaults = {
-			0: {'label': 'Long-term care', 'amount': 100000.0, 'begin': _ltc_default_begin, 'end': horizon, 'priority': 'Flexible', 'cap': 50.0},
+			0: {'label': 'Long-term care', 'amount': 100000.0, 'begin': _ltc_default_begin, 'end': horizon, 'priority': 'Flexible', 'cap': -1.0},
 		}
 		for g in range(int(num_add_goals)):
 			st.markdown(f'**Goal {g+1}**')
@@ -785,21 +813,27 @@ def _render_add_goals_section(horizon):
 def _render_income_section():
 	"""Render Other Income expander. Returns dict of income values."""
 	with st.expander('Other Income'):
-		ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=0.0, step=1000.0, key='ss_income')
+		ss_income_input = st.number_input('Annual Social Security - person 1 (current year)', value=25000.0, step=1000.0, key='ss_income')
 		ss_start_age_p1 = st.number_input('SS start age - person 1', min_value=60, max_value=90, value=67, step=1, key='ss_start_age_p1')
 		ss_fra_age_p1 = st.selectbox('SS full retirement age - person 1', [66, 67], index=1, key='ss_fra_age_p1')
-		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=0.0, step=1000.0, key='ss_income_spouse')
-		ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=67, step=1, key='ss_start_age_p2')
+		ss_income_spouse_input = st.number_input('Annual Social Security - person 2 (current year)', value=15000.0, step=1000.0, key='ss_income_spouse')
+		ss_start_age_p2 = st.number_input('SS start age - person 2', min_value=60, max_value=90, value=65, step=1, key='ss_start_age_p2')
 		ss_fra_age_p2 = st.selectbox('SS full retirement age - person 2', [66, 67], index=1, key='ss_fra_age_p2')
-		ss_cola = st.number_input('Social Security COLA', value=0.0, format="%.4f", key='ss_cola')
+		ss_cola = st.number_input('Social Security COLA', value=0.0, min_value=0.0, max_value=0.15,
+			step=0.005, format="%.4f", key='ss_cola',
+			help='Real (above-inflation) COLA as a decimal: 0.02 = 2%/yr. Capped at 0.15 to catch percent-vs-decimal typos.')
 		st.caption('Enter each person\'s own worker benefit from their SSA statement. '
 			'Spousal top-up and survivor benefits are computed automatically for married filers.')
 		pension_income_input = st.number_input('Annual pension income - person 1', value=0.0, step=1000.0, key='pension_income')
-		pension_cola_p1 = st.number_input('Pension COLA - person 1', value=0.00, format="%.4f", key='pension_cola_p1')
+		pension_cola_p1 = st.number_input('Pension COLA - person 1', value=0.00, min_value=0.0, max_value=0.15,
+			step=0.005, format="%.4f", key='pension_cola_p1',
+			help='Annual COLA as a decimal: 0.02 = 2%/yr.')
 		pension_survivor_pct_p1 = st.number_input('Pension survivor % - person 1', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
 			help='Fraction of person 1 pension paid to survivor after person 1 dies', key='pension_survivor_pct_p1')
 		pension_income_spouse_input = st.number_input('Annual pension income - person 2', value=0.0, step=1000.0, key='pension_income_spouse')
-		pension_cola_p2 = st.number_input('Pension COLA - person 2', value=0.00, format="%.4f", key='pension_cola_p2')
+		pension_cola_p2 = st.number_input('Pension COLA - person 2', value=0.00, min_value=0.0, max_value=0.15,
+			step=0.005, format="%.4f", key='pension_cola_p2',
+			help='Annual COLA as a decimal: 0.02 = 2%/yr.')
 		pension_survivor_pct_p2 = st.number_input('Pension survivor % - person 2', value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
 			help='Fraction of person 2 pension paid to survivor after person 2 dies', key='pension_survivor_pct_p2')
 		other_income_input = st.number_input('Other ordinary income', value=0.0, step=1000.0, key='other_income')
@@ -816,7 +850,23 @@ def _render_income_section():
 		qcd_annual = st.number_input('Annual QCD amount (from IRA, age 70+)', value=0.0, step=1000.0, key='qcd_annual',
 			help='QCDs go directly from your IRA to charity. They satisfy RMD requirements but are excluded '
 			'from taxable income. Available at age 70\u00bd (modeled as 70). Max $105,000/year per person.')
+	with st.expander('Mortgage'):
+		mortgage_balance = st.number_input('Remaining mortgage balance', value=0.0, step=10000.0, key='mortgage_balance',
+			help='Current principal balance. Leave 0 if the house is paid off or rent is already in spending.')
+		mortgage_rate = st.number_input('Mortgage interest rate', value=0.0, min_value=0.0, max_value=0.20,
+			format="%.4f", step=0.0025, key='mortgage_rate', help='Annual rate as a fraction, e.g. 0.0625 for 6.25%.')
+		mortgage_years_remaining = st.number_input('Years remaining on loan', value=0, min_value=0, max_value=40,
+			step=1, key='mortgage_years_remaining')
+		mortgage_payoff_at_start = st.checkbox('Pay off at start (from taxable)', key='mortgage_payoff_at_start',
+			help='Write the payoff check from the taxable account in year 1 instead of making payments. '
+			'Compare against keeping the loan using a scenario override.')
+		st.caption('The payment is fixed in nominal dollars, so its real cost declines with inflation — '
+			'unlike regular spending, which holds its purchasing power. Payments are never reduced by guardrails.')
 	return {
+		'mortgage_balance': mortgage_balance,
+		'mortgage_rate': mortgage_rate,
+		'mortgage_years_remaining': mortgage_years_remaining,
+		'mortgage_payoff_at_start': mortgage_payoff_at_start,
 		'ss_income': ss_income_input,
 		'ss_start_age_p1': ss_start_age_p1,
 		'ss_fra_age_p1': ss_fra_age_p1,
@@ -856,7 +906,8 @@ def _render_pension_buyout_section():
 			pension_buyout_income = st.number_input('Annuity income alternative (annual)',
 				value=12000.0, step=1000.0, key='pension_buyout_income')
 			pension_buyout_cola = st.number_input('Annuity COLA',
-				value=0.0, format="%.4f", key='pension_buyout_cola')
+				value=0.0, min_value=0.0, max_value=0.15, step=0.005, format="%.4f", key='pension_buyout_cola',
+				help='Annual COLA as a decimal: 0.02 = 2%/yr.')
 			pension_buyout_survivor = st.number_input('Annuity survivor %',
 				value=0.0, min_value=0.0, max_value=1.0, format="%.2f", step=0.05,
 				key='pension_buyout_survivor',
@@ -881,7 +932,8 @@ def _render_pension_buyout_section():
 def _render_tax_section():
 	"""Render Tax Settings expander. Returns dict of tax values."""
 	with st.expander('Tax Settings'):
-		taxes_enabled = st.checkbox('Enable taxation', value=True, help='Uncheck to disable all taxes (useful for testing withdrawal mechanics)', key='taxes_enabled')
+		taxes_enabled = st.checkbox('Enable taxation', value=True, help='Uncheck to disable all taxes (useful for testing withdrawal mechanics). '
+			'Leave ON for client work — an untaxed projection materially overstates spending capacity.', key='taxes_enabled')
 		filing_status_choice = st.radio('Filing status', ['Single', 'Married Filing Jointly'], horizontal=True, index=1, key='filing_status')
 		filing_status_key = 'single' if filing_status_choice == 'Single' else 'mfj'
 		standard_deduction_display = 14600 if filing_status_key == 'single' else 29200
@@ -934,7 +986,7 @@ def _render_tax_section():
 def _render_return_section():
 	"""Render Return Assumptions expander. Returns dict of return values."""
 	with st.expander('Return Assumptions'):
-		return_mode = st.radio('Return mode', ['Simulated (lognormal)', 'Historical (master_global_factors)'], horizontal=False, index=1, key='return_mode')
+		return_mode = st.radio('Return mode', ['Simulated (lognormal)', 'Historical (master_global_factors)', 'Bootstrap (circular block)'], horizontal=False, index=1, key='return_mode')
 		stock_total_return = 0.0
 		bond_return = 0.0
 		if return_mode == 'Simulated (lognormal)':
@@ -945,8 +997,28 @@ def _render_return_section():
 			bond_log_volatility = st.number_input('Bond log volatility (σ)', value=0.04796435, format="%.8f", key='bond_log_volatility')
 			random_seed_input = st.number_input('Random seed for returns', value=42, step=1, key='random_seed')
 			seed_mode = st.radio('Seed mode', ['Random each run', 'Fixed seed'], horizontal=True, index=0, key='seed_mode')
+			historical_allocation_source = 'Actual allocation columns'
+		elif return_mode == 'Bootstrap (circular block)':
+			st.caption('Joint LBM 100E (stocks) + LBM 100 F (bonds) circular moving block bootstrap with regime-persistence constraints. Stock and bond paths are paired by date — empirical stock-bond co-movement is preserved. 1,000 precomputed paths per horizon (1-40 yrs).')
+			taxable_log_drift = 0.0
+			taxable_log_volatility = 0.0
+			bond_log_drift = 0.0
+			bond_log_volatility = 0.0
+			random_seed_input = 42
+			seed_mode = 'Fixed seed'
+			historical_allocation_source = 'Actual allocation columns'
 		else:
-			st.caption('Returns from LBM 100E (stocks) and LBM 100 F (bonds). Runs all historical periods as a distribution.')
+			historical_allocation_source = st.radio(
+				'Historical allocation source',
+				['Actual allocation columns', 'Blend LBM 100E / LBM 100 F'],
+				horizontal=False,
+				index=0,
+				key='historical_allocation_source',
+			)
+			if historical_allocation_source == 'Actual allocation columns':
+				st.caption('Uses the workbook allocation column for the selected equity percentage, such as LBM 60E.')
+			else:
+				st.caption('Uses separate LBM 100E and LBM 100 F return paths, then blends them by the selected equity percentage.')
 			taxable_log_drift = 0.0
 			taxable_log_volatility = 0.0
 			bond_log_drift = 0.0
@@ -955,9 +1027,10 @@ def _render_return_section():
 			seed_mode = 'Fixed seed'
 		stock_dividend_yield = st.number_input('Stock dividend (qualified) yield', value=0.02, format="%.4f", key='stock_dividend_yield')
 		stock_turnover = st.number_input('Stock turnover rate', value=0.10, format="%.4f", key='stock_turnover')
-		investment_fee_bps = st.number_input('Investment fee (basis points)', value=0.0, min_value=0.0, max_value=100.0, step=5.0, key='investment_fee_bps')
+		investment_fee_bps = st.number_input('Investment fee (basis points)', value=120.0, min_value=0.0, max_value=200.0, step=5.0, key='investment_fee_bps')
 	return {
-		'return_mode': return_mode,
+			'return_mode': return_mode,
+			'historical_allocation_source': historical_allocation_source,
 		'stock_total_return': stock_total_return,
 		'bond_return': bond_return,
 		'taxable_log_drift': taxable_log_drift,
@@ -983,7 +1056,7 @@ def _render_guardrail_section():
 			guardrail_inner_sims = st.number_input('Inner MC simulations per check', value=200, min_value=50, max_value=1000, step=50, key='guardrail_inner_sims')
 			guardrail_max_spending_pct = st.number_input(
 				'Max spending cap (% above base withdrawal, -1=no cap, 0=no increase)',
-				value=50.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
+				value=-1.0, min_value=-1.0, max_value=200.0, format="%.0f", step=10.0,
 				help='0 = spending can never exceed base target. 50 = up to 150% of base. -1 = unlimited.',
 				key='guardrail_max_spending_pct')
 			flex_goal_min_pct = st.number_input(
@@ -1035,11 +1108,13 @@ _FLOAT_KEYS = {
 	'stock_dividend_yield', 'stock_turnover', 'investment_fee_bps',
 	'guardrail_lower', 'guardrail_upper', 'guardrail_target',
 	'guardrail_max_spending_pct', 'flex_goal_min_pct',
-	'ending_balance_goal', 'essential_spending',
+	'ending_balance_goal', 'essential_spending', 'ideal_spending', 'acceptable_spending', 'redline_spending',
 	'pension_buyout_income', 'pension_buyout_cola', 'pension_buyout_survivor',
 	'pension_buyout_lump',
 	'inheritance_taxable_amount', 'inheritance_ira_amount',
-	'roth_bracket_fill_rate',
+	# 'roth_bracket_fill_rate' is deliberately NOT here: its widget is a
+	# selectbox whose session value is a label ('22%'), normalized on load
+	'mortgage_balance', 'mortgage_rate',
 }
 _INT_KEYS = {
 	'start_age', 'start_age_spouse', 'life_expectancy_primary', 'life_expectancy_spouse',
@@ -1049,6 +1124,7 @@ _INT_KEYS = {
 	'earned_income_years', 'roth_conversion_years',
 	'guardrail_inner_sims', 'monte_carlo_runs', 'random_seed',
 	'display_decimals', 'inheritance_year', 'tcja_sunset_year',
+	'mortgage_years_remaining',
 }
 
 def _apply_pending_upload():
@@ -1061,9 +1137,18 @@ def _apply_pending_upload():
 			v = data[k]
 			if v is None:
 				continue
-			if k in _FLOAT_KEYS:
+			if k == 'roth_bracket_fill_rate':
+				# Selectbox holds a LABEL ('22%'); float() would crash on it
+				v = _fill_rate_to_label(v)
+				if v is None:
+					continue
+			elif k in _FLOAT_KEYS:
 				v = float(v)
 			elif k in _INT_KEYS and not isinstance(v, bool):
+				# Legacy guard: a fractional target_stock_pct (0.6) would
+				# int() to 0 — a silent 0%-stock plan
+				if k == 'target_stock_pct' and 0 < float(v) <= 1:
+					v = float(v) * 100
 				v = int(v)
 			st.session_state[k] = v
 	if 'periods' in data:

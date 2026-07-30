@@ -5,3 +5,11 @@ __pycache__/
 .history/
 mcproj/
 saves/
+
+# Outputs & client/temp data — never commit (client plan JSONs may carry real names)
+*.json
+*.csv
+!precomputed_bootstrap_returns/*.csv
+precomputed_bootstrap_returns_backup_*/
+*REAL-DEFECTIVE*
+retirement_fitting_room.html

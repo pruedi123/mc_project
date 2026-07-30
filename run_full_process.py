@@ -8,110 +8,23 @@ import pandas as pd
 sys.path.insert(0, '/Users/paulruedi/Desktop/Updated Web Calcs/mc_project')
 from sim_engine import (
     get_all_historical_windows, run_historical_parallel,
-    store_distribution_results, load_master_global, load_bond_factors,
+    store_distribution_results, load_portfolio_factors, should_use_actual_allocation_columns,
     PP_FACTORS, compute_run_pp_factors, simulate_withdrawals,
 )
+from spending_safety import essential_reserve_analysis
+from plan_to_sim_params import build_sim_params_from_plan
 
 
 def build_sim_params(plan):
-    """Build sim_params dict from a plan JSON."""
-    sim_years = max(1, max(plan['life_expectancy_primary'] - plan['start_age'],
-                          plan['life_expectancy_spouse'] - plan['start_age_spouse']) + 1)
-    target_stock_pct = plan['target_stock_pct'] / 100.0 if plan['target_stock_pct'] > 1 else plan['target_stock_pct']
-
-    periods = plan.get('periods', [{'amount': 0.0}])
-    base_spending = periods[0].get('amount', 0.0)
-    withdrawal_schedule = [base_spending] * sim_years
-
-    mg_df = load_master_global()
-    stock_log_rets = np.log(mg_df['LBM 100E'].dropna().values)
-    bond_log_returns = np.log(1.0 + load_bond_factors())
-    stock_mu = float(np.mean(stock_log_rets))
-    bond_mu = float(np.mean(bond_log_returns))
-    n = min(len(stock_log_rets), len(bond_log_returns))
-    blended_log_rets = target_stock_pct * stock_log_rets[:n] + (1 - target_stock_pct) * bond_log_returns[:n]
-    blended_mu = target_stock_pct * stock_mu + (1 - target_stock_pct) * bond_mu
-    blended_sigma = float(np.std(blended_log_rets))
-
-    sim_params = dict(
-        start_age_primary=plan['start_age'],
-        start_age_spouse=plan['start_age_spouse'],
-        taxable_start=plan['taxable_start'],
-        stock_total_return=0.0,
-        stock_dividend_yield=plan.get('stock_dividend_yield', 0.02),
-        stock_turnover=plan.get('stock_turnover', 0.10),
-        investment_fee_bps=plan.get('investment_fee_bps', 0.0),
-        bond_return=0.0,
-        roth_start=plan['roth_start'],
-        tda_start=plan['tda_start'],
-        tda_spouse_start=plan['tda_spouse_start'],
-        target_stock_pct=target_stock_pct,
-        taxable_stock_basis_pct=plan.get('taxable_stock_basis_pct', 50.0),
-        taxable_bond_basis_pct=plan.get('taxable_bond_basis_pct', 100.0),
-        withdrawal_schedule=withdrawal_schedule,
-        rmd_start_age=plan.get('rmd_start_age', 73),
-        rmd_start_age_spouse=plan.get('rmd_start_age_spouse', 73),
-        ss_income_annual=plan.get('ss_income', 0.0),
-        ss_income_spouse_annual=plan.get('ss_income_spouse', 0.0),
-        ss_cola=plan.get('ss_cola', 0.0),
-        pension_income_annual=plan.get('pension_income', 0.0),
-        pension_income_spouse_annual=plan.get('pension_income_spouse', 0.0),
-        pension_cola_p1=plan.get('pension_cola_p1', 0.0),
-        pension_cola_p2=plan.get('pension_cola_p2', 0.0),
-        pension_survivor_pct_p1=plan.get('pension_survivor_pct_p1', 0.0),
-        pension_survivor_pct_p2=plan.get('pension_survivor_pct_p2', 0.0),
-        pp_factors=PP_FACTORS,
-        other_income_annual=plan.get('other_income', 0.0),
-        filing_status='mfj' if plan.get('filing_status', '') == 'Married Filing Jointly' else 'single',
-        use_itemized_deductions=plan.get('use_itemized', False),
-        itemized_deduction_amount=plan.get('itemized_deduction', 0.0),
-        roth_conversion_amount=plan.get('roth_conversion_amount', 0.0),
-        roth_conversion_years=plan.get('roth_conversion_years', 0),
-        roth_conversion_tax_source='tda',
-        roth_conversion_source='person1',
-        roth_conversion_mode='none',
-        roth_bracket_fill_rate=plan.get('roth_bracket_fill_rate', 0.24),
-        ss_start_age_p1=plan.get('ss_start_age_p1', 67),
-        ss_start_age_p2=plan.get('ss_start_age_p2', 67),
-        ss_fra_age_p1=plan.get('ss_fra_age_p1', 67),
-        ss_fra_age_p2=plan.get('ss_fra_age_p2', 67),
-        state_tax_rate=plan.get('state_tax_rate', 0.05),
-        state_exempt_retirement=plan.get('state_exempt_retirement', False),
-        life_expectancy_primary=plan['life_expectancy_primary'],
-        life_expectancy_spouse=plan['life_expectancy_spouse'],
-        guardrails_enabled=plan.get('guardrails_enabled', True),
-        guardrail_lower=plan.get('guardrail_lower', 0.75),
-        guardrail_upper=plan.get('guardrail_upper', 0.90),
-        guardrail_target=plan.get('guardrail_target', 0.85),
-        guardrail_inner_sims=plan.get('guardrail_inner_sims', 200),
-        guardrail_max_spending_pct=plan.get('guardrail_max_spending_pct', 25.0),
-        taxes_enabled=plan.get('taxes_enabled', True),
-        goal_schedule=None,
-        flex_goal_schedule=None,
-        flex_goal_min_pct=plan.get('flex_goal_min_pct', 50.0),
-        base_is_essential=False,
-        flex_capped_base_schedule=None,
-        flex_cap_max_schedule=None,
-        inheritance_enabled=plan.get('inheritance_enabled', False),
-        inheritance_year=plan.get('inheritance_year', 1),
-        inheritance_taxable_amount=plan.get('inheritance_taxable_amount', 0.0),
-        inheritance_ira_amount=plan.get('inheritance_ira_amount', 0.0),
-        tcja_sunset=plan.get('tcja_sunset', False),
-        tcja_sunset_year=plan.get('tcja_sunset_year', 2),
-        qcd_annual=plan.get('qcd_annual', 0.0),
-        earned_income_annual=plan.get('earned_income', 0.0),
-        earned_income_years=plan.get('earned_income_years', 0),
-        irmaa_enabled=plan.get('irmaa_enabled', False),
-        prefer_tda_before_taxable=plan.get('prefer_tda_before_taxable', False),
-        goal_taxable_start=0.0,
-        goal_tda_start=0.0,
-        goal_tda_p1_fraction=0.0,
-        goal_liquidation_schedule=None,
-        goal_stock_pct=target_stock_pct,
-        blended_mu=blended_mu,
-        blended_sigma=blended_sigma,
-    )
-    return sim_params, sim_years, target_stock_pct, base_spending, mg_df
+    """Translate a saved plan JSON into sim_params via the faithful
+    Streamlit-equivalent translator (plan_to_sim_params) so headless numbers
+    match on-screen numbers: multi-period spending, add_goals, Roth
+    conversions, filing status, and UI-matching defaults all flow through.
+    Raises NotImplementedError (loudly) for pension-buyout plans and
+    separately-funded goals rather than silently dropping them."""
+    tr = build_sim_params_from_plan(plan)
+    return (tr['sim_params'], tr['sim_years'], tr['target_stock_pct'],
+            tr['base_spending'], tr['use_actual_allocation_columns'], tr)
 
 
 def run_sim(params, is_historical, windows, sim_years, inheritor_rate, plan):
@@ -119,12 +32,16 @@ def run_sim(params, is_historical, windows, sim_years, inheritor_rate, plan):
         return run_historical_parallel(windows, sim_years, inheritor_rate, params)
     else:
         from sim_engine import run_monte_carlo
+        # Pass return_mode through so Bootstrap plans actually use the
+        # precomputed bootstrap grids instead of silently running lognormal.
         return run_monte_carlo(
-            num_runs=1000, years=sim_years, inheritor_rate=inheritor_rate,
-            taxable_log_drift=plan.get('taxable_log_drift', 0.09),
-            taxable_log_volatility=plan.get('taxable_log_volatility', 0.205),
-            bond_log_drift=plan.get('bond_log_drift', 0.017),
-            bond_log_volatility=plan.get('bond_log_volatility', 0.048),
+            num_runs=int(plan.get('monte_carlo_runs', 1000)),
+            years=sim_years, inheritor_rate=inheritor_rate,
+            taxable_log_drift=plan.get('taxable_log_drift', 0.09038261),
+            taxable_log_volatility=plan.get('taxable_log_volatility', 0.20485277),
+            bond_log_drift=plan.get('bond_log_drift', 0.0172918),
+            bond_log_volatility=plan.get('bond_log_volatility', 0.04796435),
+            return_mode=plan.get('return_mode', 'Simulated (lognormal)'),
             **params)
 
 
@@ -132,10 +49,15 @@ def find_spending(params, original_spending, target_pct, guess, is_historical, w
     def _run(spend_amt):
         test_params = dict(params)
         scale = spend_amt / original_spending if original_spending > 0 else 1.0
-        test_params['withdrawal_schedule'] = [v * scale for v in test_params['withdrawal_schedule']]
+        test_schedule = [v * scale for v in test_params['withdrawal_schedule']]
+        test_params['withdrawal_schedule'] = test_schedule
+        # Grade against the scaled schedule's planned AVERAGE (== spend_amt for
+        # flat plans) so go-go/slow-go schedules aren't judged on period 1 alone.
+        planned_avg = float(np.mean(test_schedule)) if test_schedule else spend_amt
         _, ayd = run_sim(test_params, is_historical, windows, sim_years, inheritor_rate, plan)
         run_avg = ayd.groupby('run')['after_tax_spending'].mean()
-        return float((run_avg >= spend_amt).mean()), float(run_avg.min())
+        # $1 tolerance: the withdrawal solver targets net spending +/- $0.50
+        return float((run_avg >= planned_avg - 1.0).mean()), float(run_avg.min())
 
     rate, min_avg = _run(guess)
     if abs(rate - target_pct) <= 0.01:
@@ -184,7 +106,7 @@ def find_decline(params, spending_target, target_rate, is_historical, windows, s
                 test_params[k] = params[k] * factor
         _, ayd = run_sim(test_params, is_historical, windows, sim_years, inheritor_rate, plan)
         run_avg = ayd.groupby('run')['after_tax_spending'].mean()
-        return float((run_avg >= spending_target).mean())
+        return float((run_avg >= spending_target - 1.0).mean())
 
     rate = _run(guess_decline)
     if abs(rate - target_rate) <= 0.01:
@@ -219,11 +141,61 @@ def find_decline(params, spending_target, target_rate, is_historical, windows, s
     return round((lo + hi) / 2.0, 1)
 
 
+def find_increase(params, spending_target, target_rate, is_historical, windows, sim_years, inheritor_rate, plan, guess_increase=20.0, tol=1.0, max_iter=15):
+    balance_keys = ['taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start',
+        'goal_taxable_start', 'goal_tda_start']
+
+    def _run(pct_increase):
+        factor = 1.0 + pct_increase / 100.0
+        test_params = dict(params)
+        for k in balance_keys:
+            if k in test_params:
+                test_params[k] = params[k] * factor
+        _, ayd = run_sim(test_params, is_historical, windows, sim_years, inheritor_rate, plan)
+        run_avg = ayd.groupby('run')['after_tax_spending'].mean()
+        return float((run_avg >= spending_target - 1.0).mean())
+
+    rate = _run(guess_increase)
+    if abs(rate - target_rate) <= 0.01:
+        return guess_increase
+
+    if rate < target_rate:
+        lo, hi = guess_increase, min(guess_increase * 1.5, 200.0)
+        for _ in range(5):
+            r = _run(hi)
+            if r >= target_rate:
+                break
+            hi = min(lo + (hi - lo) * 1.5, 200.0)
+            if hi >= 200.0:
+                break
+    else:
+        hi, lo = guess_increase, max(guess_increase * 0.5, 0.0)
+        for _ in range(5):
+            r = _run(lo)
+            if r < target_rate:
+                break
+            lo = max(hi - (hi - lo) * 1.5, 0.0)
+
+    for i in range(max_iter):
+        mid = (lo + hi) / 2.0
+        print(f"  iter {i+1}: trying {mid:.1f}% increase ...", end=' ', flush=True)
+        r = _run(mid)
+        print(f"-> {r*100:.0f}%")
+        if r < target_rate:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return round((lo + hi) / 2.0, 1)
+
+
 if __name__ == '__main__':
     # ── Load plan JSON ──
     # Usage: python run_full_process.py [plan.json] [--target-pct 0.90] [--shortfall-pct 80]
     target_pct_override = 0.90
     shortfall_pct = 80.0
+    redline_override = None
     skip_next = False
     positional_args = []
     for i, a in enumerate(sys.argv[1:], 1):
@@ -236,6 +208,9 @@ if __name__ == '__main__':
         elif a == '--shortfall-pct':
             shortfall_pct = float(sys.argv[i + 1])
             skip_next = True
+        elif a == '--redline':
+            redline_override = float(sys.argv[i + 1])
+            skip_next = True
         elif not a.startswith('--'):
             positional_args.append(a)
     plan_path = positional_args[0] if positional_args else \
@@ -247,9 +222,9 @@ if __name__ == '__main__':
     print(f"Portfolio: taxable=${plan['taxable_start']:,.0f}  TDA=${plan['tda_start']:,.0f}  "
           f"TDA-spouse=${plan['tda_spouse_start']:,.0f}  Roth=${plan['roth_start']:,.0f}")
 
-    sim_params, sim_years, target_stock_pct, base_spending, mg_df = build_sim_params(plan)
-    inheritor_rate = plan['inheritor_marginal_rate']
-    ending_balance_goal = plan.get('ending_balance_goal', 0.0)
+    sim_params, sim_years, target_stock_pct, base_spending, use_actual_allocation_columns, translated = build_sim_params(plan)
+    inheritor_rate = translated['inheritor_marginal_rate']
+    ending_balance_goal = translated['ending_balance_goal']
     is_historical = 'Historical' in plan.get('return_mode', 'Historical')
     windows = None
 
@@ -257,7 +232,8 @@ if __name__ == '__main__':
     t0 = time.time()
     if is_historical:
         print(f"\nLoading historical windows for {sim_years} years...")
-        windows, window_start_dates = get_all_historical_windows(sim_years)
+        windows, window_start_dates = get_all_historical_windows(
+            sim_years, target_stock_pct, use_actual_allocation_columns)
         print(f"  {len(windows)} windows loaded in {time.time()-t0:.1f}s")
 
     # ── Phase 1: Auto-calculate spending ──
@@ -265,23 +241,30 @@ if __name__ == '__main__':
     portfolio_total = plan['taxable_start'] + plan['tda_start'] + plan['tda_spouse_start'] + plan['roth_start']
     four_pct = portfolio_total * 0.04
     income_sum = (plan.get('ss_income', 0) + plan.get('ss_income_spouse', 0) +
-        plan.get('pension_income', 0) + plan.get('pension_income_spouse', 0) + plan.get('other_income', 0))
+        plan.get('pension_income', 0) + plan.get('pension_income_spouse', 0) + plan.get('other_income', 0) +
+        sim_params.get('annuity_income_p1', 0.0) + sim_params.get('annuity_income_p2', 0.0))
     if base_spending <= 0:
         auto_spending = round((four_pct + income_sum) / 1000) * 1000
-        withdrawal_schedule = [auto_spending] * sim_years
-        sim_params['withdrawal_schedule'] = list(withdrawal_schedule)
+        # Layer auto-spending on top of the translated schedule (which may
+        # already carry add_goal amounts) instead of replacing it.
+        sim_params['withdrawal_schedule'] = [auto_spending + v for v in sim_params['withdrawal_schedule']]
         print(f"  4% of ${portfolio_total:,.0f} = ${four_pct:,.0f} + ${income_sum:,.0f} income = ${auto_spending:,.0f}/yr")
     else:
         auto_spending = base_spending
         print(f"  Using entered spending: ${auto_spending:,.0f}/yr")
     original_spending = auto_spending
+    ideal_spending = float(plan.get('ideal_spending') or plan.get('spending', {}).get('ideal') or original_spending)
+    acceptable_spending = float(plan.get('acceptable_spending') or plan.get('spending', {}).get('acceptable') or ideal_spending * 0.90)
+    redline_spending = float(redline_override or plan.get('redline_spending') or plan.get('essential_spending') or plan.get('spending', {}).get('redline') or ideal_spending * 0.80)
 
     # ── Phase 2: Initial simulation ──
     print("\n=== PHASE 2: Initial simulation ===")
     t1 = time.time()
+    planned_avg_initial = float(np.mean(sim_params['withdrawal_schedule']))
     results, all_yearly = run_sim(sim_params, is_historical, windows, sim_years, inheritor_rate, plan)
     dist = store_distribution_results(results, all_yearly, 'historical_dist' if is_historical else 'simulated',
-        ending_balance_goal, spending_target=original_spending, essential_spending=0.0)
+        ending_balance_goal, spending_target=planned_avg_initial, essential_spending=redline_spending,
+        acceptable_spending=acceptable_spending, redline_spending=redline_spending)
     initial_success = dist.get('mc_spending_success_rate', 0)
     print(f"  Spending ${original_spending:,.0f}/yr -> {initial_success*100:.0f}% ideal success ({time.time()-t1:.1f}s)")
 
@@ -300,11 +283,18 @@ if __name__ == '__main__':
     rerun_params = dict(sim_params)
     scale = found_spending / original_spending if original_spending > 0 else 1.0
     rerun_params['withdrawal_schedule'] = [v * scale for v in sim_params['withdrawal_schedule']]
+    found_planned_avg = float(np.mean(rerun_params['withdrawal_schedule']))
     results2, all_yearly2 = run_sim(rerun_params, is_historical, windows, sim_years, inheritor_rate, plan)
     dist2 = store_distribution_results(results2, all_yearly2, 'historical_dist' if is_historical else 'simulated',
-        ending_balance_goal, spending_target=found_spending, essential_spending=found_min)
+        ending_balance_goal, spending_target=found_planned_avg, essential_spending=redline_spending,
+        acceptable_spending=acceptable_spending, redline_spending=redline_spending)
     print(f"  ${found_spending:,.0f}/yr -> {dist2.get('mc_spending_success_rate',0)*100:.0f}% ideal, "
           f"{dist2.get('mc_essential_success_rate',0)*100:.0f}% essential ({time.time()-t1:.1f}s)")
+    reserve_analysis = essential_reserve_analysis(all_yearly2, found_spending, redline_spending)
+    before_ess = reserve_analysis['before_reserve']['essential']
+    after_ess = reserve_analysis['after_reserve']['essential']
+    print(f"  Essential reserve needed: ${reserve_analysis['reserve_needed']:,.0f} "
+          f"({before_ess['runs_below']} runs below before, {after_ess['runs_below']} after)")
 
     # After-tax ending balance distribution
     after_tax_ends = np.array([r['after_tax_end'] for r in results2])
@@ -338,11 +328,13 @@ if __name__ == '__main__':
             print(f"\n  Sept 1929 Start — Year-by-Year Detail (target=${found_spending:,.0f}/yr)")
             print(f"    {'Yr':>3}  {'AgeP1':>5}  {'AgeP2':>5}  {'Input Target':>12}  {'Guardrail Adj':>13}  {'Actual Spend':>12}  {'Portfolio':>12}")
             print(f"    {'─'*3}  {'─'*5}  {'─'*5}  {'─'*12}  {'─'*13}  {'─'*12}  {'─'*12}")
+            rerun_schedule = rerun_params['withdrawal_schedule']
             for _, r in df_1929.iterrows():
                 guardrail_target = r['net_spending_target']
                 actual = r['after_tax_spending']
+                input_target = rerun_schedule[int(r['year']) - 1]
                 print(f"    {int(r['year']):>3}  {int(r['age_p1']):>5}  {int(r['age_p2']):>5}  "
-                      f"${found_spending:>11,.0f}  ${guardrail_target:>12,.0f}  ${actual:>11,.0f}  ${r['total_portfolio']:>11,.0f}")
+                      f"${input_target:>11,.0f}  ${guardrail_target:>12,.0f}  ${actual:>11,.0f}  ${r['total_portfolio']:>11,.0f}")
             print(f"    {'─'*3}  {'─'*5}  {'─'*5}  {'─'*12}  {'─'*13}  {'─'*12}  {'─'*12}")
             first10 = df_1929[df_1929['year'] <= 10]
             avg_first10 = first10['after_tax_spending'].mean() if not first10.empty else df_1929['after_tax_spending'].mean()
@@ -362,7 +354,7 @@ if __name__ == '__main__':
     # ── Phase 5: Balance Decline Finder (75% target) ──
     print("\n=== PHASE 5: Find balance decline to reach 75% success ===")
     t1 = time.time()
-    decline_pct = find_decline(rerun_params, found_spending, target_rate=0.75,
+    decline_pct = find_decline(rerun_params, found_planned_avg, target_rate=0.75,
         is_historical=is_historical, windows=windows, sim_years=sim_years,
         inheritor_rate=inheritor_rate, plan=plan, guess_decline=20.0)
     balance_keys = ['taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start', 'goal_taxable_start', 'goal_tda_start']
@@ -372,10 +364,7 @@ if __name__ == '__main__':
     dollar_drop = orig_total - reduced_total
 
     # Historical probability of this decline (3-month horizon)
-    stock_f = mg_df['LBM 100E'].dropna().values
-    bond_f = mg_df['LBM 100 F'].dropna().values
-    nf = min(len(stock_f), len(bond_f))
-    stock_f = stock_f[:nf]; bond_f = bond_f[:nf]
+    allocation_f = load_portfolio_factors(target_stock_pct, use_actual_allocation_columns)
     horizon_months = 3
 
     def _extract_monthly(factors_12mo):
@@ -388,11 +377,8 @@ if __name__ == '__main__':
             monthly[t + 12] = monthly[t] * factors_12mo[t + 1] / factors_12mo[t]
         return monthly
 
-    stock_monthly = _extract_monthly(stock_f)
-    bond_monthly = _extract_monthly(bond_f)
-    nm = min(len(stock_monthly), len(bond_monthly))
-    blended_monthly = target_stock_pct * stock_monthly[:nm] + (1 - target_stock_pct) * bond_monthly[:nm]
-    wealth = np.concatenate([[1.0], np.cumprod(blended_monthly)])
+    allocation_monthly = _extract_monthly(allocation_f)
+    wealth = np.concatenate([[1.0], np.cumprod(allocation_monthly)])
     w = wealth[12:]
     rolling_rets = w[horizon_months:] / w[:len(w) - horizon_months] - 1.0
     n_declines = int(np.sum(rolling_rets <= -(decline_pct / 100.0)))
@@ -400,8 +386,7 @@ if __name__ == '__main__':
 
     def _norm_cdf(x):
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-    blended_annual = target_stock_pct * stock_f + (1 - target_stock_pct) * bond_f
-    annual_log_rets = np.log(blended_annual)
+    annual_log_rets = np.log(allocation_f)
     mu = float(np.mean(annual_log_rets))
     sigma = float(np.std(annual_log_rets))
     frac = horizon_months / 12.0
@@ -411,6 +396,26 @@ if __name__ == '__main__':
 
     print(f"  >> {decline_pct:.1f}% decline (${orig_total:,.0f} -> ${reduced_total:,.0f}, -${dollar_drop:,.0f})")
     print(f"     Historical prob: {empirical_prob*100:.1f}% | Simulated prob: {simulated_prob*100:.1f}% (3-month horizon)")
+    print(f"     ({time.time()-t1:.1f}s)")
+
+    # ── Phase 5b: Balance Increase Finder (95% target) ──
+    print("\n=== PHASE 5b: Find balance increase to reach 95% success ===")
+    t1 = time.time()
+    increase_pct = find_increase(rerun_params, found_planned_avg, target_rate=0.95,
+        is_historical=is_historical, windows=windows, sim_years=sim_years,
+        inheritor_rate=inheritor_rate, plan=plan, guess_increase=20.0)
+    increase_factor = 1.0 + increase_pct / 100.0
+    increased_total = orig_total * increase_factor
+    dollar_gain = increased_total - orig_total
+
+    # Historical probability of this gain (3-month horizon, same rolling series as decline)
+    n_gains = int(np.sum(rolling_rets >= (increase_pct / 100.0)))
+    empirical_prob_up = n_gains / len(rolling_rets) if len(rolling_rets) > 0 else 0.0
+    log_thr_up = np.log(1.0 + increase_pct / 100.0)
+    simulated_prob_up = 1.0 - _norm_cdf((log_thr_up - mu_h) / sigma_h)
+
+    print(f"  >> {increase_pct:.1f}% increase (${orig_total:,.0f} -> ${increased_total:,.0f}, +${dollar_gain:,.0f})")
+    print(f"     Historical prob: {empirical_prob_up*100:.1f}% | Simulated prob: {simulated_prob_up*100:.1f}% (3-month horizon)")
     print(f"     ({time.time()-t1:.1f}s)")
 
     # ── Phase 6: Stressed Spending (85% target at declined balances) ──
@@ -438,9 +443,12 @@ if __name__ == '__main__':
 {'='*60}
   Starting portfolio          ${orig_total:,.0f}
   Optimal spending (90%)      ${found_spending:,.0f}/yr
+  Essential reserve needed    ${reserve_analysis['reserve_needed']:,.0f}
   Essential floor (100%)      ${found_min:,.0f}/yr
   Decline to reach 75%        {decline_pct:.1f}% (-${dollar_drop:,.0f})
   Decline prob (3-mo)         Hist: {empirical_prob*100:.1f}% | Sim: {simulated_prob*100:.1f}%
+  Increase to reach 95%       {increase_pct:.1f}% (+${dollar_gain:,.0f})
+  Increase prob (3-mo)        Hist: {empirical_prob_up*100:.1f}% | Sim: {simulated_prob_up*100:.1f}%
   Stressed portfolio           ${reduced_total:,.0f}
   Stressed spending (85%)     ${stressed_spending:,.0f}/yr
   Spending change if decline  {'+'if spending_delta>=0 else '-'}${abs(spending_delta):,.0f}/yr ({spending_delta/found_spending*100:+.1f}%)

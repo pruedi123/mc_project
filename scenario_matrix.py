@@ -203,6 +203,12 @@ SECTIONS = [
         Field("Pension income — Person 1", "pension_income", "dollar"),
         Field("Pension income — Person 2", "pension_income_spouse", "dollar"),
     ]),
+    ("MORTGAGE", [
+        Field("Mortgage balance", "mortgage_balance", "dollar"),
+        Field("Mortgage rate", "mortgage_rate", "fraction"),
+        Field("Mortgage years remaining", "mortgage_years_remaining", "int"),
+        Field("Pay off mortgage at start", "mortgage_payoff_at_start", "bool"),
+    ]),
     ("ROTH CONVERSIONS", [
         Field("Roth conversion mode", "roth_conversion_mode", "choice",
               choices=["None", "Fixed amount", "Fill to bracket"]),
@@ -542,13 +548,20 @@ def _solve_spending(plan, mode, target_pct):
     guess = _starting_spend_guess(plan)
     pguess = copy.deepcopy(plan)
     _set_spending(pguess, guess)
+    # find_spending's run_sim reads plan['return_mode'] — pin it to this
+    # column's engine mode so Bootstrap columns solve under bootstrap paths.
+    pguess["return_mode"] = mode
     built = build_sim_params_from_plan(pguess, return_mode=mode)
     sim_params = built["sim_params"]
     sim_years = built["sim_years"]
     inheritor_rate = built["inheritor_marginal_rate"]
 
     is_historical = "Historical" in mode
-    windows = get_all_historical_windows(sim_years)[0] if is_historical else None
+    # Solve on the same allocation column the run uses (e.g. LBM 60E), not
+    # the 100E/100F reconstruction.
+    windows = get_all_historical_windows(
+        sim_years, built["target_stock_pct"], built["use_actual_allocation_columns"]
+    )[0] if is_historical else None
 
     solved, _rate, _floor = find_spending(
         sim_params, original_spending=guess, target_pct=target_pct, guess=guess,
@@ -579,7 +592,9 @@ def cmd_run(args):
             _set_spending(plan, solved_spending)
         else:
             print(f"Running {name} ({friendly_mode}) ...", flush=True)
-        results, ayd, sim_years, base_spending = _run_one(plan, mode, args.runs)
+        # Honor a per-column "Monte Carlo runs" cell; fall back to --runs
+        n_runs = int(plan.get("monte_carlo_runs") or args.runs)
+        results, ayd, sim_years, base_spending = _run_one(plan, mode, n_runs)
         m = _metrics(results, ayd, sim_years, base_spending) or {}
         m["solved_spending"] = solved_spending
         metrics.append(m)

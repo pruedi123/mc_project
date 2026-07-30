@@ -8,15 +8,19 @@ HEADLESS_DIR = os.path.expanduser('~/RWM/Current Client Plans')
 
 
 def _client_dir(client_name: str) -> str:
+    """Client folder path. client_name should be an alias (e.g. 'Arctic-Hill')."""
     return os.path.join(HEADLESS_DIR, client_name)
 
 
-def _plan_stem(client_name: str) -> str:
-    """Convert 'Jones, Bob & Mary' -> 'jones_bob_mary'."""
-    stem = client_name.lower()
-    for ch in [',', '&', '  ']:
-        stem = stem.replace(ch, ' ')
-    return '_'.join(stem.split())
+def _next_plan_name(cdir: str) -> str:
+    """Return next available plan name like 'plan_1', 'plan_2', etc."""
+    os.makedirs(cdir, exist_ok=True)
+    existing = [f for f in os.listdir(cdir) if f.startswith('plan_') and f.endswith('.json')
+                and not f.endswith('_results.json') and not f.endswith('_plan.json')]
+    n = 1
+    while f'plan_{n}.json' in existing:
+        n += 1
+    return f'plan_{n}'
 
 
 def _plan_to_streamlit_format(plan: dict) -> dict:
@@ -43,7 +47,9 @@ def _plan_to_streamlit_format(plan: dict) -> dict:
 
     data = {
         'person1_label': plan['person1'].get('label', ''),
+        'person1_gender': plan['person1'].get('gender', ''),
         'person2_label': plan['person2'].get('label', ''),
+        'person2_gender': plan['person2'].get('gender', ''),
         'start_age': plan['person1']['age'],
         'start_age_spouse': plan['person2']['age'],
         'life_expectancy_primary': plan['person1']['life_expectancy'],
@@ -122,6 +128,11 @@ def _plan_to_streamlit_format(plan: dict) -> dict:
     else:
         periods = [{'amount': float(spending.get('annual', 60000))}]
     data['periods'] = periods
+    ideal_spending = float(spending.get('ideal') or spending.get('annual', periods[0]['amount']))
+    data['ideal_spending'] = ideal_spending
+    data['acceptable_spending'] = float(spending.get('acceptable') or ideal_spending * 0.90)
+    data['redline_spending'] = float(spending.get('redline') or ideal_spending * 0.80)
+    data['essential_spending'] = data['redline_spending']
 
     # Annuities
     ann = plan.get('annuities', {})
@@ -166,8 +177,10 @@ def save_plan(plan: dict, pdf_bytes: bytes = None) -> dict:
     cdir = _client_dir(client)
     os.makedirs(cdir, exist_ok=True)
 
-    stem = _plan_stem(client)
-    name = stem  # always overwrite the same file
+    # Check if a plan already exists — overwrite it; otherwise create plan_1
+    existing = sorted([f for f in os.listdir(cdir) if f.startswith('plan_') and f.endswith('.json')
+                       and not f.endswith('_results.json') and not f.endswith('_plan.json')])
+    name = existing[0][:-5] if existing else _next_plan_name(cdir)  # strip .json
 
     # Convert to Streamlit format
     streamlit_data = _plan_to_streamlit_format(plan)
@@ -217,13 +230,14 @@ def update_plan(plan: dict, json_path: str, pdf_bytes: bytes = None) -> dict:
 
 
 def load_plan(client_name: str, plan_name: str = None) -> dict:
-    """Load a saved plan in clean format. If plan_name is None, load the most recent.
+    """Load a saved plan in clean format. client_name is an alias (e.g. 'Arctic-Hill').
 
+    If plan_name is None, load the most recent.
     Loads the Streamlit-format .json (authoritative) and converts to clean format.
     """
     cdir = _client_dir(client_name)
     if not os.path.isdir(cdir):
-        raise FileNotFoundError(f'No client folder: {cdir}')
+        raise FileNotFoundError(f'No folder for alias: {client_name}')
 
     # Load Streamlit format files (authoritative)
     jsons = sorted([f for f in os.listdir(cdir)
@@ -252,11 +266,13 @@ def _streamlit_to_plan_format(data: dict, client_name: str) -> dict:
         'client': client_name,
         'person1': {
             'label': data.get('person1_label', ''),
+            'gender': data.get('person1_gender', ''),
             'age': data.get('start_age', 65),
             'life_expectancy': data.get('life_expectancy_primary', 84),
         },
         'person2': {
             'label': data.get('person2_label', ''),
+            'gender': data.get('person2_gender', ''),
             'age': data.get('start_age_spouse', 60),
             'life_expectancy': data.get('life_expectancy_spouse', 89),
         },
@@ -348,6 +364,9 @@ def _streamlit_to_plan_format(data: dict, client_name: str) -> dict:
             plan['spending']['periods'] = [{'amount': p['amount']} for p in periods]
     else:
         plan['spending']['annual'] = 60000
+    plan['spending']['ideal'] = data.get('ideal_spending', plan['spending']['annual'])
+    plan['spending']['acceptable'] = data.get('acceptable_spending', plan['spending']['ideal'] * 0.90)
+    plan['spending']['redline'] = data.get('redline_spending', data.get('essential_spending', plan['spending']['ideal'] * 0.80))
 
     return plan
 

@@ -12,8 +12,8 @@ PLAN_DEFAULTS = {
     "client": "Client",
 
     # People
-    "person1": {"label": "", "age": 65, "life_expectancy": 84},
-    "person2": {"label": "", "age": 60, "life_expectancy": 89},
+    "person1": {"label": "", "gender": "", "age": 65, "life_expectancy": 84},
+    "person2": {"label": "", "gender": "", "age": 60, "life_expectancy": 89},
 
     # Accounts
     "accounts": {
@@ -29,6 +29,9 @@ PLAN_DEFAULTS = {
     "spending": {
         "annual": 60000,
         "periods": None,  # [{"amount": 60000, "years": 10}, {"amount": 40000}]
+        "ideal": None,
+        "acceptable": None,
+        "redline": None,
     },
 
     # Allocation
@@ -56,6 +59,10 @@ PLAN_DEFAULTS = {
         "person2": {"income": 0, "cola": 0.0, "survivor_pct": 0.0},
         "start_year": 1,
     },
+
+    # Mortgage: fixed nominal payment computed from balance/rate/years_remaining.
+    # payoff_at_start=True writes the check from taxable in year 1 instead.
+    "mortgage": {"balance": 0, "rate": 0.0, "years_remaining": 0, "payoff_at_start": False},
 
     # Other income
     "other_income": 0,
@@ -221,6 +228,13 @@ def plan_to_session_state(plan: dict, results: dict) -> dict:
     else:
         ss['num_withdrawal_periods'] = 1
         ss['wd_amount_0'] = spending['annual']
+    ideal = spending.get('ideal') or spending.get('annual', 0)
+    acceptable = spending.get('acceptable') or ideal * 0.90
+    redline = spending.get('redline') or ideal * 0.80
+    ss['ideal_spending'] = ideal
+    ss['acceptable_spending'] = acceptable
+    ss['redline_spending'] = redline
+    ss['essential_spending'] = redline
 
     # Simulation settings
     ss['num_sims'] = results.get('num_sims', plan['num_sims'])
@@ -235,6 +249,8 @@ def plan_to_session_state(plan: dict, results: dict) -> dict:
     # Simulation results
     ss['mc_percentile_rows'] = results.get('percentile_rows', [])
     ss['mc_pct_non_positive'] = results.get('pct_non_positive', 0.0)
+    ss['mc_spending_success_rate'] = results.get('spending_success_rate')
+    ss['mc_spending_target'] = results.get('spending_target', 0.0)
     ss['mc_spending_pct_rows'] = results.get('spending_percentiles', [])
     ss['mc_all_yearly'] = results.get('all_yearly')
     ss['sim_df'] = results.get('sim_df')
@@ -293,6 +309,15 @@ def describe_plan_diffs(baseline: dict, scenario: dict) -> list:
         s_ann = scenario.get('annuities', {}).get(person, {}).get('income', 0)
         if b_ann != s_ann:
             diffs.append(f"{label}: ${b_ann:,.0f} -> ${s_ann:,.0f}/yr")
+
+    # Mortgage
+    b_mort = baseline.get('mortgage') or {}
+    s_mort = scenario.get('mortgage') or {}
+    if b_mort.get('balance', 0) != s_mort.get('balance', 0):
+        diffs.append(f"Mortgage balance: ${b_mort.get('balance', 0):,.0f} -> ${s_mort.get('balance', 0):,.0f}")
+    if bool(b_mort.get('payoff_at_start', False)) != bool(s_mort.get('payoff_at_start', False)):
+        diffs.append(
+            "Mortgage: paid off at start" if s_mort.get('payoff_at_start') else "Mortgage: kept (monthly payments)")
 
     # Goals
     b_goals = baseline.get('goals') or []

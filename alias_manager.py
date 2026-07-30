@@ -49,9 +49,8 @@ if entries:
             st.markdown(f"**{alias}**")
 
         if labels:
-            # Get the actual plan files to read inputs
-            real_name_for_plans = e.get('real_name') or _load_alias_map().get(alias, '')
-            plan_dir = os.path.join(CLIENT_DIR, real_name_for_plans)
+            # Plan files are in the alias-named folder
+            plan_dir = os.path.join(CLIENT_DIR, alias)
             plan_files = sorted([
                 f for f in os.listdir(plan_dir)
                 if f.endswith('.json')

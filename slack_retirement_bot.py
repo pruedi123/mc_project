@@ -17,6 +17,7 @@ Usage:
 import os
 import sys
 import json
+import time
 import smtplib
 import logging
 from email.mime.multipart import MIMEMultipart
@@ -60,6 +61,7 @@ OUTPUT FORMAT: Return ONLY valid JSON, no explanation, no markdown code fences.
 
 RULES:
 - Client name format: "Last, First & Spouse" (e.g., "Thompson, Mike & Linda")
+- Gender goes in person1/person2 as "m" or "f" (e.g., "gender": "m")
 - Ages go in person1/person2 objects
 - Account balances in accounts object (taxable, tda_p1, tda_p2, roth)
 - Social Security in social_security object with person1/person2 sub-objects (benefit, start_age, fra)
@@ -81,6 +83,12 @@ FOR UPDATES to existing plans:
 If the user says something like "change Thompson allocation to 80%" or "update Jones spending to 70k",
 return JSON with:
   {"_action": "update", "_client": "Thompson", "allocation": {"stock_pct": 80}}
+
+IMPORTANT: Client names may be codename-style aliases like "Teal-Helm", "Sky-Dune", "Maple-Helm", etc.
+These ARE valid client names. Treat them exactly the same as traditional names.
+Examples:
+  "change Teal-Helm allocation to 80%" -> {"_action": "update", "_client": "Teal-Helm", "allocation": {"stock_pct": 80}}
+  "update Sky-Dune spending to 75k" -> {"_action": "update", "_client": "Sky-Dune", "spending": {"annual": 75000}}
 
 FOR NEW PLANS:
 Return the full plan JSON with client name and all specified fields.
@@ -116,6 +124,9 @@ Example - adding goals to a new or existing plan:
 When the user says "add a long-term care goal of $100k from years 28-30 to the Kranks plan":
   {"_action": "update", "_client": "Kranks", "goals": [{"label": "Long-term care", "amount": 100000, "begin": 28, "end": 30, "priority": "Flexible"}]}
 
+IMPORTANT: Always check the "Existing clients" list below. Any message that mentions one of those
+client names (even if the name looks like a codename) is a plan-related message, NOT a greeting or question.
+
 If the message is not about a retirement plan (greeting, question, etc.), return:
   {"_action": "ignore"}
 """
@@ -127,12 +138,22 @@ def parse_with_claude(text: str) -> dict:
     clients = list_clients()
     client_list = ", ".join(clients) if clients else "none"
 
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        system=PARSE_SYSTEM_PROMPT + f"\n\nExisting clients: {client_list}",
-        messages=[{"role": "user", "content": text}],
-    )
+    models = ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"]
+    for model in models:
+        try:
+            response = claude.messages.create(
+                model=model,
+                max_tokens=2000,
+                system=PARSE_SYSTEM_PROMPT + f"\n\nExisting clients: {client_list}",
+                messages=[{"role": "user", "content": text}],
+            )
+            logger.info(f"Parsed with {model}")
+            break
+        except anthropic._exceptions.OverloadedError:
+            logger.warning(f"{model} overloaded, trying next model...")
+            continue
+    else:
+        raise Exception("All models overloaded — try again in a few minutes")
     raw = response.content[0].text.strip()
     # Strip markdown code fences if present
     if raw.startswith('```'):
@@ -293,8 +314,8 @@ def _process_message(text, channel, thread_ts, say_fn, slack_client):
                 f"*{matches[0]}*",
                 "",
                 "*Demographics:*",
-                f"  Person 1: age {p1.get('age', '?')}, life expectancy {p1.get('life_expectancy', '?')}",
-                f"  Person 2: age {p2.get('age', '?')}, life expectancy {p2.get('life_expectancy', '?')}",
+                f"  Person 1{' (' + p1['gender'].upper() + ')' if p1.get('gender') else ''}: age {p1.get('age', '?')}, life expectancy {p1.get('life_expectancy', '?')}",
+                f"  Person 2{' (' + p2['gender'].upper() + ')' if p2.get('gender') else ''}: age {p2.get('age', '?')}, life expectancy {p2.get('life_expectancy', '?')}",
                 "",
                 "*Accounts:*",
                 f"  Taxable: ${accts.get('taxable', 0):,.0f} (basis: {accts.get('taxable_stock_basis_pct', 50)}% stock, {accts.get('taxable_bond_basis_pct', 100)}% bond)",

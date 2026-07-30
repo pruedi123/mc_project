@@ -464,15 +464,18 @@ def generate_html_report(
         ('30-year average spending',
          lambda s: s.get('worst_case_1929', {}).get('avg_spending'), _fmt),
         ('Comfort Level *',
-         lambda s: int(s.get('found_min', 0) * 0.80) if s.get('found_min') else None, _fmt),
+         lambda s: int(s.get('found_min', 0) * s.get('comfort_pct', 0.80)) if s.get('found_min') else None, _fmt),
         ('Years below Comfort Level *',
          lambda s: s.get('worst_case_1929', {}).get('years_below_essential', '—'),
          lambda v: v),
         ('Final portfolio',
          lambda s: s.get('worst_case_1929', {}).get('final_portfolio'), _fmt),
     ], title="Worst Historical Period (1929)")
+    # Label follows the scenarios' comfort_pct (set by run_full_process
+    # --shortfall-pct); hardcoding 80% here once contradicted the data rows.
+    _comfort_label = int(round((scenarios[0].get('comfort_pct', 0.80) if scenarios else 0.80) * 100))
     wc_table += ('<p style="font-size: 0.78rem; color: #888; margin-top: -16px;">'
-                 '* Comfort Level = 80% x Essential Floor — a spending level '
+                 f'* Comfort Level = {_comfort_label}% x Essential Floor — a spending level '
                  'we really don\'t want to go below.</p>')
 
     # ── 1929 Year-by-Year Details (expandable) ──

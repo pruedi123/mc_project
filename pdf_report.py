@@ -99,6 +99,11 @@ def _gather_report_data(ss: dict) -> dict:
     # Results
     data['pct_rows'] = ss.get('mc_percentile_rows', [])
     data['pct_non_positive'] = float(ss.get('mc_pct_non_positive', 0))
+    # Spending success (share of runs whose avg after-tax spending met the
+    # plan) is the honest headline; portfolio non-depletion is not, because
+    # guardrails cut spending rather than let balances go negative.
+    data['spending_success_rate'] = ss.get('mc_spending_success_rate')
+    data['spending_target'] = float(ss.get('mc_spending_target', 0) or 0)
     data['spending_pct_rows'] = ss.get('mc_spending_pct_rows', [])
     data['all_yearly'] = ss.get('mc_all_yearly', None)
     data['sim_df'] = ss.get('sim_df', None)  # median single run
@@ -198,7 +203,7 @@ def _chart_spending_sources(sim_df: pd.DataFrame) -> io.BytesIO:
 def _chart_scenario_comparison(multi_results: list) -> io.BytesIO:
     """Grouped bar comparing scenarios: success rate and median ending portfolio."""
     names = [s['name'] for s in multi_results]
-    success = [round((1 - s['pct_non_positive']) * 100, 1) for s in multi_results]
+    success = [round(_scenario_success_rate(s)[0] * 100, 1) for s in multi_results]
 
     # Median ending portfolio
     ending = []
@@ -312,6 +317,15 @@ class RetirementReportPDF(FPDF):
 
 # ── Page builders ───────────────────────────────────────────────
 
+def _scenario_success_rate(sc: dict):
+    """Headline success for a scenario summary: spending-on-plan share when
+    available, else portfolio non-depletion. Returns (fraction, is_spending)."""
+    ssr = sc.get('spending_success_rate')
+    if ssr is not None:
+        return float(ssr), True
+    return 1.0 - float(sc.get('pct_non_positive', 0.0)), False
+
+
 def _build_page_1(pdf: RetirementReportPDF, data: dict):
     """Page 1: The Big Picture - key assumptions and headline success rate."""
     pdf.add_page()
@@ -341,7 +355,8 @@ def _build_page_1(pdf: RetirementReportPDF, data: dict):
         start_x = (210 - total_w) / 2
         box_y = pdf.get_y()
         for idx, sc in enumerate(multi):
-            sr = (1 - sc['pct_non_positive']) * 100
+            sr_frac, _sr_is_spending = _scenario_success_rate(sc)
+            sr = sr_frac * 100
             x = start_x + idx * (box_w + 4)
             if sr >= 80:
                 pdf.set_fill_color(234, 250, 241)
@@ -364,7 +379,19 @@ def _build_page_1(pdf: RetirementReportPDF, data: dict):
             pdf.cell(box_w, 5, f"{sc['num_sims']:,} {mode_label}", align='C')
         pdf.set_y(box_y + 36)
     else:
-        success_rate = (1 - data['pct_non_positive']) * 100
+        ssr = data.get('spending_success_rate')
+        if ssr is not None:
+            success_rate = float(ssr) * 100
+            target = data.get('spending_target', 0)
+            if target > 0:
+                caption = (f"Spending stayed on plan (avg of at least {_fmt_dollar(target)}/yr) "
+                           f"in {success_rate:.0f}% of {data['num_sims']:,} {mode_label}")
+            else:
+                caption = f"Spending stayed on plan in {success_rate:.0f}% of {data['num_sims']:,} {mode_label}"
+        else:
+            success_rate = (1 - data['pct_non_positive']) * 100
+            caption = (f"Your portfolio was not depleted in {success_rate:.0f}% of "
+                       f"{data['num_sims']:,} {mode_label}")
         pdf.set_fill_color(234, 250, 241) if success_rate >= 80 else pdf.set_fill_color(253, 237, 236)
         box_y = pdf.get_y()
         pdf.rect(30, box_y, 150, 28, style='F')
@@ -377,8 +404,7 @@ def _build_page_1(pdf: RetirementReportPDF, data: dict):
         pdf.set_xy(30, box_y + 16)
         pdf.set_font('Helvetica', '', 9)
         pdf.set_text_color(80, 80, 80)
-        pdf.cell(150, 6, f"Your portfolio lasted the full plan in {success_rate:.0f}% of {data['num_sims']:,} {mode_label}",
-                 align='C')
+        pdf.cell(150, 6, caption, align='C')
         pdf.ln(18)
 
     # Key assumptions section
@@ -463,7 +489,8 @@ def _build_range_of_outcomes_page(pdf: RetirementReportPDF, pct_rows, spend_rows
         'No one can predict exactly what will happen with investments. The table below shows '
         'three possible outcomes based on our simulations: a bad scenario (10th percentile - only '
         '10% of outcomes were worse), a typical scenario (50th - the middle outcome), and a good '
-        'scenario (90th percentile - only 10% did better).'
+        'scenario (90th percentile - only 10% did better). Each column is measured separately '
+        'across all simulations, so a row shows outcomes at that level - not one single simulation.'
     )
 
     # Build 3-row table: Bad / Typical / Good
@@ -542,29 +569,20 @@ def _build_income_sources_page(pdf: RetirementReportPDF, all_yearly, title='Wher
     pdf.add_page()
     pdf.section_title(title)
     pdf.body_text(
-        'This shows the typical (median) path for your retirement income. Each row represents '
-        'a year, showing how much comes from Social Security, pensions, portfolio withdrawals, '
+        'This shows the simulation closest to the middle (median) outcome, year by year: '
+        'how much comes from Social Security, pensions, portfolio withdrawals, '
         'and how much you have remaining.'
     )
 
     if all_yearly is not None and len(all_yearly) > 0:
-        # Build median year-by-year from all runs
-        has_annuity = 'annuity_income_real' in all_yearly.columns and all_yearly['annuity_income_real'].sum() > 0
-        agg_dict = {
-            'age_p1': 'first',
-            'ss_income_total': 'median',
-            'pension_income_real': 'median' if 'pension_income_real' in all_yearly.columns else 'first',
-            'after_tax_spending': 'median',
-            'total_portfolio': 'median',
-            'withdrawal_used': 'median',
-            'total_taxes': 'median',
-        }
-        if has_annuity:
-            agg_dict['annuity_income_real'] = 'median'
-        has_other = 'other_income' in all_yearly.columns and all_yearly['other_income'].sum() > 0
-        if has_other:
-            agg_dict['other_income'] = 'median'
-        median_by_year = all_yearly.groupby('year').agg(agg_dict).reset_index()
+        # Use ONE actual run (the one ending closest to the median) for both
+        # the table and the chart below — independent per-column medians are
+        # not a path: their columns don't sum and they contradict the chart.
+        run_ends = all_yearly.groupby('run')['total_portfolio'].last()
+        median_run_idx = int((run_ends - run_ends.median()).abs().idxmin())
+        median_by_year = all_yearly[all_yearly['run'] == median_run_idx].reset_index(drop=True)
+        has_annuity = 'annuity_income_real' in median_by_year.columns and median_by_year['annuity_income_real'].sum() > 0
+        has_other = 'other_income' in median_by_year.columns and median_by_year['other_income'].sum() > 0
 
         # Compute net portfolio withdrawal = spending - income sources
         median_by_year['net_withdrawal'] = (
@@ -632,17 +650,13 @@ def _build_income_sources_page(pdf: RetirementReportPDF, all_yearly, title='Wher
         if step > 1:
             pdf.set_font('Helvetica', 'I', 8)
             pdf.set_text_color(130, 130, 130)
-            pdf.cell(0, 4, f'Showing every {_ordinal(step)} year. All values are medians across simulations.',
+            pdf.cell(0, 4, f'Showing every {_ordinal(step)} year of the median simulation.',
                      new_x='LMARGIN', new_y='NEXT')
             pdf.ln(3)
 
-        # Income sources chart from median single run of this scenario
-        run_ends = all_yearly.groupby('run')['total_portfolio'].last()
-        median_val = run_ends.median()
-        median_run_idx = int((run_ends - median_val).abs().idxmin())
-        median_df = all_yearly[all_yearly['run'] == median_run_idx].copy()
-        if len(median_df) > 0:
-            chart_buf = _chart_spending_sources(median_df)
+        # Income sources chart from the SAME median run as the table above
+        if len(median_by_year) > 0:
+            chart_buf = _chart_spending_sources(median_by_year.copy())
             pdf.image(chart_buf, x=15, w=180)
 
 
@@ -698,7 +712,7 @@ def _build_page_4(pdf: RetirementReportPDF, data: dict):
     col_widths = [36, 16, 28, 22, 26, 22, 24, 16]
     rows = []
     for sc in multi:
-        success = f"{(1 - sc['pct_non_positive']) * 100:.0f}%"
+        success = f"{_scenario_success_rate(sc)[0] * 100:.0f}%"
         row50 = next((r for r in sc['percentile_rows'] if r['percentile'] == 50), None)
         end_val = row50['after_tax_end'] if row50 else 0
         taxes = row50['total_taxes'] if row50 else 0

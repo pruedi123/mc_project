@@ -11,6 +11,7 @@ def dollar_growth_distribution(
 	stock_pct: float,
 	years: int,
 	mode: str = 'historical',
+	use_actual_allocation_columns: bool = True,
 	stock_drift: float = 0.0,
 	stock_vol: float = 0.0,
 	bond_drift: float = 0.0,
@@ -35,7 +36,7 @@ def dollar_growth_distribution(
 	bond_pct = 1.0 - stock_pct
 
 	if mode == 'historical':
-		windows, _ = get_all_historical_windows(years)
+		windows, _ = get_all_historical_windows(years, stock_pct, use_actual_allocation_columns)
 		n = len(windows)
 		ending = np.empty(n)
 		for i, (stock_rets, bond_rets) in enumerate(windows):
@@ -71,6 +72,7 @@ def dollar_growth_by_year(
 	stock_pct: float,
 	max_years: int,
 	mode: str = 'historical',
+	use_actual_allocation_columns: bool = True,
 	stock_drift: float = 0.0,
 	stock_vol: float = 0.0,
 	bond_drift: float = 0.0,
@@ -89,7 +91,7 @@ def dollar_growth_by_year(
 	bond_pct = 1.0 - stock_pct
 
 	if mode == 'historical':
-		windows, _ = get_all_historical_windows(max_years)
+		windows, _ = get_all_historical_windows(max_years, stock_pct, use_actual_allocation_columns)
 		n = len(windows)
 		grid = np.empty((n, max_years))
 		for i, (stock_rets, bond_rets) in enumerate(windows):

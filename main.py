@@ -3,18 +3,21 @@ import pandas as pd
 import numpy as np
 import altair as alt
 import matplotlib.pyplot as plt
+from datetime import date as _dt_date
 
 from sim_engine import (
-	PP_FACTORS, compute_run_pp_factors, load_master_global, load_bond_factors,
+	PP_FACTORS, compute_run_pp_factors,
+	load_portfolio_factors, should_use_actual_allocation_columns,
 	get_all_historical_windows, compute_summary_metrics, build_scenario_params,
 	auto_scenario_name, compute_scenario_summary, run_monte_carlo,
 	run_historical_parallel,
 	store_distribution_results, simulate_withdrawals, sample_lognormal_returns,
 	ss_adjustment_factor, ss_back_calculate_fra_benefit, ss_breakeven_table,
-	compute_ss_benefits,
+	compute_ss_benefits, resolve_mortgage_params, mortgage_annual_payment,
 )
 from ui_inputs import render_sidebar, save_results_to_json, load_plan_results, get_plans_with_results
 from growth_engine import dollar_growth_distribution, dollar_growth_by_year
+from spending_safety import solve_essential_floor_for_reserve
 
 st.set_page_config(page_title='Withdrawal + RMD Simulator', layout='wide')
 
@@ -181,7 +184,7 @@ def _render_client_view(success_rate, spending_pct_rows, percentile_rows,
 						base_schedule=None, run_spending=None,
 						inheritor_marginal_rate=0.0,
 						withdrawal_schedule=None, window_start_dates=None,
-						funded_goals=None):
+						funded_goals=None, essential_spending=0.0):
 	"""Simplified client-facing results view: verdict, spending, legacy, and median portfolio chart."""
 
 	# ── Section 1: The Verdict ──
@@ -350,12 +353,15 @@ def _render_client_view(success_rate, spending_pct_rows, percentile_rows,
 				run_raw = all_yearly[all_yearly['run'] == run_idx]
 				if run_raw.empty:
 					continue
+				essential_goal = float(essential_spending or 0.0)
 				stress_df = pd.DataFrame({
 					'Year': run_raw['year'].values,
 					'Spending': run_raw['after_tax_spending'].values,
 					'Target': [withdrawal_schedule[i] if i < len(withdrawal_schedule)
 							   else withdrawal_schedule[-1] for i in range(len(run_raw))],
 				})
+				if essential_goal > 0:
+					stress_df['Essential Goal'] = essential_goal
 				# Build spending summary broken out by base + goals
 				st.markdown(f'**Starting {period_label}**')
 				if has_goal_breakdown and active_goals and 'base_after_tax_spending' in run_raw.columns:
@@ -391,8 +397,22 @@ def _render_client_view(success_rate, spending_pct_rows, percentile_rows,
 				goal_line = alt.Chart(stress_df).mark_line(
 					color='#ef4444', strokeDash=[6, 3], strokeWidth=2
 				).encode(x=alt.X('Year:O'), y=alt.Y('Target:Q'))
-				st.altair_chart((spend_chart + goal_line).interactive(), use_container_width=True)
-			st.caption('Blue bars = after-tax spending at or above target. Red bars = below target. Dashed line = spending target.')
+				layered_chart = spend_chart + goal_line
+				if essential_goal > 0:
+					essential_line = alt.Chart(stress_df).mark_line(
+						color='#d97706', strokeDash=[3, 3], strokeWidth=2
+					).encode(
+						x=alt.X('Year:O'),
+						y=alt.Y('Essential Goal:Q'),
+						tooltip=[alt.Tooltip('Year:O'),
+								 alt.Tooltip('Essential Goal:Q', format='$,.0f')]
+					)
+					layered_chart = layered_chart + essential_line
+				st.altair_chart(layered_chart.interactive(), use_container_width=True)
+			caption = 'Blue bars = after-tax spending at or above target. Red bars = below target. Red dashed line = spending target.'
+			if float(essential_spending or 0.0) > 0:
+				caption += ' Orange dashed line = essential spending goal.'
+			st.caption(caption)
 
 
 def _client_spending_cards(data_series, target, currency_fmt='${:,.0f}'):
@@ -402,7 +422,8 @@ def _client_spending_cards(data_series, target, currency_fmt='${:,.0f}'):
 	strong_val = float(np.percentile(data_series, 90))
 
 	def _pick_colors(val):
-		if target and target > 0 and val >= target:
+		# $1 tolerance: don't color a card red over penny-level solver noise
+		if target and target > 0 and val >= target - 1.0:
 			return '#b8860b', '#fdf6e3'
 		return '#ef4444', '#fef2f2'
 
@@ -558,6 +579,9 @@ def main():
 	rmd_start_age_spouse = inputs['rmd_start_age_spouse']
 	ending_balance_goal = inputs['ending_balance_goal']
 	essential_spending = inputs.get('essential_spending', 0.0)
+	ideal_spending = inputs.get('ideal_spending', 0.0)
+	acceptable_spending = inputs.get('acceptable_spending', 0.0)
+	redline_spending = inputs.get('redline_spending', essential_spending)
 	add_goal_inputs = inputs['add_goal_inputs']
 	ss_income_input = inputs['ss_income']
 	ss_start_age_p1 = inputs['ss_start_age_p1']
@@ -576,6 +600,10 @@ def main():
 	earned_income_input = inputs['earned_income']
 	earned_income_years = inputs['earned_income_years']
 	qcd_annual = inputs['qcd_annual']
+	mortgage_balance = inputs['mortgage_balance']
+	mortgage_rate = inputs['mortgage_rate']
+	mortgage_years_remaining_input = inputs['mortgage_years_remaining']
+	mortgage_payoff_at_start = inputs['mortgage_payoff_at_start']
 	pension_buyout_enabled = inputs['pension_buyout_enabled']
 	pension_buyout_baseline = inputs['pension_buyout_baseline']
 	pension_buyout_person = inputs['pension_buyout_person']
@@ -599,6 +627,8 @@ def main():
 	irmaa_enabled = inputs['irmaa_enabled']
 	prefer_tda_before_taxable = inputs['prefer_tda_before_taxable']
 	return_mode = inputs['return_mode']
+	historical_allocation_source = inputs.get('historical_allocation_source', 'Actual allocation columns')
+	use_actual_allocation_columns = should_use_actual_allocation_columns(return_mode, historical_allocation_source)
 	stock_total_return = inputs['stock_total_return']
 	bond_return = inputs['bond_return']
 	taxable_log_drift = inputs['taxable_log_drift']
@@ -696,9 +726,10 @@ def main():
 		for fg in funded_goals:
 			grid = dollar_growth_by_year(
 				stock_pct=fg['fund_stock_pct'] / 100.0,
-				max_years=int(fg['end_year']),
-				mode='historical' if is_hist_mode else 'simulated',
-				stock_drift=float(inputs['taxable_log_drift']),
+					max_years=int(fg['end_year']),
+					mode='historical' if is_hist_mode else 'simulated',
+					use_actual_allocation_columns=use_actual_allocation_columns,
+					stock_drift=float(inputs['taxable_log_drift']),
 				stock_vol=float(inputs['taxable_log_volatility']),
 				bond_drift=float(inputs['bond_log_drift']),
 				bond_vol=float(inputs['bond_log_volatility']),
@@ -739,6 +770,20 @@ def main():
 	adjusted_tda_start = float(tda_start) - goal_tda1_start
 	adjusted_tda_spouse_start = float(tda_spouse_start) - goal_tda2_start
 
+	# Mortgage: fixed nominal payment for the loan term, or payoff from taxable at start
+	try:
+		adjusted_taxable_start, mortgage_payment_annual, mortgage_years_active = resolve_mortgage_params(
+			float(mortgage_balance), float(mortgage_rate), int(mortgage_years_remaining_input),
+			bool(mortgage_payoff_at_start), adjusted_taxable_start)
+	except ValueError as e:
+		st.error(str(e))
+		st.stop()
+	if mortgage_payment_annual > 0:
+		st.caption(f"Mortgage: ${mortgage_payment_annual:,.0f}/yr (nominal) for {mortgage_years_active} more years, "
+			f"added to spending as an essential outflow.")
+	elif mortgage_payoff_at_start and mortgage_balance > 0:
+		st.caption(f"Mortgage: ${float(mortgage_balance):,.0f} paid off from taxable at start.")
+
 	if funded_goals:
 		total_set_aside = sum(fg['total_cost'] for fg in funded_goals)
 		st.info(f"**Separately funded goals:** ${total_set_aside:,.0f} set aside from portfolio "
@@ -778,6 +823,8 @@ def main():
 		pension_survivor_pct_p1=float(pension_survivor_pct_p1),
 		pension_survivor_pct_p2=float(pension_survivor_pct_p2),
 		pp_factors=PP_FACTORS,
+		mortgage_payment_annual=float(mortgage_payment_annual),
+		mortgage_years_remaining=int(mortgage_years_active),
 		other_income_annual=float(other_income_input),
 		filing_status=filing_status_key, use_itemized_deductions=bool(use_itemized),
 		itemized_deduction_amount=float(itemized_deduction_input),
@@ -824,6 +871,9 @@ def main():
 		goal_tda_p1_fraction=goal_tda1_start / goal_tda_total if goal_tda_total > 0 else 0.0,
 		goal_liquidation_schedule=goal_liquidation_schedule if any(g > 0 for g in goal_liquidation_schedule) else None,
 		goal_stock_pct=goal_stock_pct,
+		# Year 1 of the simulation = the year the plan is run (drives the
+		# OBBBA senior-bonus window, which expires after 2028)
+		sim_start_calendar_year=_dt_date.today().year,
 	)
 
 	# Compute stock/bond return parameters (needed for guardrails and scenario comparison)
@@ -833,22 +883,20 @@ def main():
 		bond_mu = float(bond_log_drift)
 		bond_sigma = float(bond_log_volatility)
 	else:
-		mg_df = load_master_global()
-		stock_factors = mg_df['LBM 100E'].dropna().values
-		stock_log_rets = np.log(stock_factors)
-		stock_mu = float(np.mean(stock_log_rets))
-		stock_sigma = float(np.std(stock_log_rets))
-		bond_log_returns = np.log(1.0 + load_bond_factors())
-		bond_mu = float(np.mean(bond_log_returns))
-		bond_sigma = float(np.std(bond_log_returns))
+		allocation_factors = load_portfolio_factors(target_stock_pct, use_actual_allocation_columns)
+		allocation_log_rets = np.log(allocation_factors)
+		stock_log_rets = allocation_log_rets
+		bond_log_returns = allocation_log_rets
+		stock_mu = float(np.mean(allocation_log_rets))
+		stock_sigma = float(np.std(allocation_log_rets))
+		bond_mu = stock_mu
+		bond_sigma = stock_sigma
 	if guardrails_enabled:
-		blended_mu = target_stock_pct * stock_mu + (1 - target_stock_pct) * bond_mu
 		if return_mode != 'Simulated (lognormal)':
-			# Compute sigma from actual blended portfolio log returns — captures real correlation
-			n = min(len(stock_log_rets), len(bond_log_returns))
-			blended_log_rets = target_stock_pct * stock_log_rets[:n] + (1 - target_stock_pct) * bond_log_returns[:n]
-			blended_sigma = float(np.std(blended_log_rets))
+			blended_mu = stock_mu
+			blended_sigma = stock_sigma
 		else:
+			blended_mu = target_stock_pct * stock_mu + (1 - target_stock_pct) * bond_mu
 			# No raw return series available; use variance formula with assumed correlation
 			rho = 0.10
 			w_s, w_b = target_stock_pct, 1 - target_stock_pct
@@ -977,7 +1025,8 @@ def main():
 
 		# Pre-load historical windows once (shared across all phases)
 		if is_historical:
-			fp_windows, fp_window_start_dates = get_all_historical_windows(sim_years)
+			fp_windows, fp_window_start_dates = get_all_historical_windows(
+				sim_years, target_stock_pct, use_actual_allocation_columns)
 
 		def _fp_run_sim(params):
 			"""Run simulation and return (results, all_yearly_df)."""
@@ -991,23 +1040,29 @@ def main():
 					taxable_log_volatility=float(taxable_log_volatility),
 					bond_log_drift=float(bond_log_drift),
 					bond_log_volatility=float(bond_log_volatility),
+					return_mode=return_mode,
 					**params)
 
 		def _fp_spending_success(params, target_spending):
 			"""Run sim and return spending success rate vs target."""
 			_, all_yearly_df = _fp_run_sim(params)
 			run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
-			return float((run_avg >= target_spending).mean()), all_yearly_df
+			# $1 tolerance for the withdrawal solver's +/- $0.50 target
+			return float((run_avg >= target_spending - 1.0).mean()), all_yearly_df
 
 		def _fp_find_spending(params, original_spending, target_pct, guess, tol=2000.0, max_iter=15, progress_cb=None):
 			"""Binary search for spending level achieving target_pct ideal success. Returns (spending, ideal_rate, min_avg)."""
 			def _run(spend_amt):
 				test_params = dict(params)
 				scale = spend_amt / original_spending if original_spending > 0 else 1.0
-				test_params['withdrawal_schedule'] = [v * scale for v in test_params['withdrawal_schedule']]
+				test_sched = [v * scale for v in test_params['withdrawal_schedule']]
+				test_params['withdrawal_schedule'] = test_sched
+				# Grade against the scaled schedule's planned average
+				# (== spend_amt for flat plans), $1 solver tolerance
+				planned_avg = float(np.mean(test_sched)) if test_sched else spend_amt
 				_, ayd = _fp_run_sim(test_params)
 				run_avg = ayd.groupby('run')['after_tax_spending'].mean()
-				return float((run_avg >= spend_amt).mean()), float(run_avg.min())
+				return float((run_avg >= planned_avg - 1.0).mean()), float(run_avg.min())
 
 			rate, min_avg = _run(guess)
 			if abs(rate - target_pct) <= 0.01:
@@ -1055,7 +1110,7 @@ def main():
 						test_params[k] = params[k] * factor
 				_, ayd = _fp_run_sim(test_params)
 				run_avg = ayd.groupby('run')['after_tax_spending'].mean()
-				return float((run_avg >= spending_target).mean())
+				return float((run_avg >= spending_target - 1.0).mean())
 
 			rate = _run(guess_decline)
 			if abs(rate - target_rate) <= 0.01:
@@ -1096,8 +1151,12 @@ def main():
 
 		auto_spending = base_withdrawal_schedule[0] if base_withdrawal_schedule else 0.0
 		if auto_spending <= 0:
-			# 4% of main portfolio
-			portfolio_total = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
+			# 4% of the engine's actual starting balances (sim_params), so a
+			# pension-buyout lump sum, mortgage payoff, or goal set-aside is
+			# reflected — raw sidebar values would bias lump-vs-annuity by
+			# counting the annuity income but not the lump in the 4% base.
+			portfolio_total = (float(sim_params.get('taxable_start', 0.0)) + float(sim_params.get('tda_start', 0.0)) +
+				float(sim_params.get('tda_spouse_start', 0.0)) + float(sim_params.get('roth_start', 0.0)))
 			four_pct = portfolio_total * 0.04
 			# Add all income streams (SS, pensions, other income) at full annual amounts, as if starting year 1
 			income_sum = (float(ss_income_input) + float(ss_income_spouse_input) +
@@ -1124,8 +1183,11 @@ def main():
 		results_fp, all_yearly_fp = _fp_run_sim(sim_params)
 		sim_mode_label_fp = 'historical_dist' if is_historical else 'simulated'
 		dist_results_fp = store_distribution_results(results_fp, all_yearly_fp, sim_mode_label_fp,
-			ending_balance_goal_fp, spending_target=original_spending_fp,
-			essential_spending=float(essential_spending))
+			ending_balance_goal_fp,
+			spending_target=float(np.mean(base_withdrawal_schedule)) if base_withdrawal_schedule else original_spending_fp,
+			essential_spending=float(essential_spending),
+			acceptable_spending=float(acceptable_spending),
+			redline_spending=float(redline_spending))
 		for k, v in dist_results_fp.items():
 			st.session_state[k] = v
 		if is_historical:
@@ -1154,8 +1216,11 @@ def main():
 		rerun_params['withdrawal_schedule'] = [v * scale_fp for v in sim_params['withdrawal_schedule']]
 		results_fp2, all_yearly_fp2 = _fp_run_sim(rerun_params)
 		dist_results_fp2 = store_distribution_results(results_fp2, all_yearly_fp2, sim_mode_label_fp,
-			ending_balance_goal_fp, spending_target=found_spending,
-			essential_spending=found_min)
+			ending_balance_goal_fp,
+			spending_target=float(np.mean(rerun_params['withdrawal_schedule'])),
+			essential_spending=float(essential_spending),
+			acceptable_spending=float(acceptable_spending),
+			redline_spending=float(redline_spending))
 		for k, v in dist_results_fp2.items():
 			st.session_state[k] = v
 		st.session_state['_base_withdrawal_schedule'] = [found_spending] * sim_years
@@ -1182,11 +1247,7 @@ def main():
 
 		# Historical + parametric probability
 		_stock_pct_fp = rerun_params.get('target_stock_pct', 0.6)
-		mg_df_fp = load_master_global()
-		stock_f_fp = mg_df_fp['LBM 100E'].dropna().values
-		bond_f_fp = mg_df_fp['LBM 100 F'].dropna().values
-		n_f_fp = min(len(stock_f_fp), len(bond_f_fp))
-		stock_f_fp = stock_f_fp[:n_f_fp]; bond_f_fp = bond_f_fp[:n_f_fp]
+		allocation_f_fp = load_portfolio_factors(_stock_pct_fp, use_actual_allocation_columns)
 		horizon_months_fp = 3
 
 		def _extract_monthly_fp(factors_12mo):
@@ -1199,11 +1260,9 @@ def main():
 				monthly[t + 12] = monthly[t] * factors_12mo[t + 1] / factors_12mo[t]
 			return monthly
 
-		stock_monthly_fp = _extract_monthly_fp(stock_f_fp)
-		bond_monthly_fp = _extract_monthly_fp(bond_f_fp)
-		n_months_fp = min(len(stock_monthly_fp), len(bond_monthly_fp))
-		blended_monthly_fp = _stock_pct_fp * stock_monthly_fp[:n_months_fp] + (1 - _stock_pct_fp) * bond_monthly_fp[:n_months_fp]
-		wealth_fp = np.concatenate([[1.0], np.cumprod(blended_monthly_fp)])
+		allocation_monthly_fp = _extract_monthly_fp(allocation_f_fp)
+		n_months_fp = len(allocation_monthly_fp)
+		wealth_fp = np.concatenate([[1.0], np.cumprod(allocation_monthly_fp)])
 		skip_fp = 12
 		w_fp = wealth_fp[skip_fp:]
 		rolling_rets_fp = w_fp[horizon_months_fp:] / w_fp[:len(w_fp) - horizon_months_fp] - 1.0
@@ -1213,8 +1272,7 @@ def main():
 
 		def _norm_cdf_fp(x):
 			return 0.5 * (1.0 + _math_fp.erf(x / _math_fp.sqrt(2.0)))
-		blended_annual_fp = _stock_pct_fp * stock_f_fp + (1 - _stock_pct_fp) * bond_f_fp
-		annual_log_rets_fp = np.log(blended_annual_fp)
+		annual_log_rets_fp = np.log(allocation_f_fp)
 		mu_fp = float(np.mean(annual_log_rets_fp))
 		sigma_fp = float(np.std(annual_log_rets_fp))
 		frac_fp = horizon_months_fp / 12.0
@@ -1267,6 +1325,11 @@ def main():
 		st.session_state['_sim_params'] = rerun_params
 		st.session_state['_sim_years'] = sim_years
 		st.session_state['_is_historical'] = is_historical
+		# Persist the return mode too — without it the finders silently fall
+		# back to lognormal after a Bootstrap full-process run
+		st.session_state['_return_mode'] = return_mode
+		st.session_state['_historical_allocation_source'] = historical_allocation_source
+		st.session_state['_use_actual_allocation_columns'] = use_actual_allocation_columns
 		st.session_state['_monte_carlo_runs'] = mc_runs_fp
 		st.session_state['_inheritor_marginal_rate'] = inheritor_rate_fp
 		st.session_state['_ending_balance_goal'] = ending_balance_goal_fp
@@ -1283,19 +1346,38 @@ def main():
 		sim_years = int(years)
 		is_historical = return_mode == 'Historical (master_global_factors)'
 
-		# Pre-load historical windows once (shared across scenarios)
-		if is_historical:
-			windows, window_start_dates = get_all_historical_windows(sim_years)
-			n_windows = len(windows)
+		# Honor the seed controls (they were previously wired to nothing):
+		# Fixed seed -> reproducible inner-MC + lognormal draws; Random -> unpinned.
+		from sim_engine import set_mc_seed
+		if inputs.get('seed_mode') == 'Fixed seed':
+			set_mc_seed(int(inputs.get('random_seed_input', 42)))
+		else:
+			set_mc_seed(0)
+
+		# Bootstrap grids exist for 1-40 year horizons only — fail with a clear
+		# message instead of a FileNotFoundError traceback mid-run.
+		if return_mode == 'Bootstrap (circular block)':
+			try:
+				from sim_engine import load_bootstrap_grids
+				load_bootstrap_grids(sim_years)
+			except (FileNotFoundError, ValueError) as e:
+				st.error(f'Bootstrap mode cannot run a {sim_years}-year horizon: {e}')
+				st.stop()
+
+		window_start_dates = None
 
 		def run_one_scenario(s_params, s_name, progress_placeholder):
 			"""Run a single scenario and return (results, all_yearly_df)."""
 			if is_historical:
+				scenario_stock_pct = float(s_params.get('target_stock_pct', target_stock_pct))
+				windows, scenario_window_start_dates = get_all_historical_windows(
+					sim_years, scenario_stock_pct, use_actual_allocation_columns)
+				n_windows = len(windows)
 				progress_placeholder.progress(0.1, text=f'{s_name}: running {n_windows} windows in parallel...')
 				results, all_yearly_df = run_historical_parallel(
 					windows, sim_years, float(inheritor_marginal_rate), s_params)
 				progress_placeholder.progress(1.0, text=f'{s_name}: complete')
-				return results, all_yearly_df
+				return results, all_yearly_df, scenario_window_start_dates
 			else:
 				mc_results, all_yearly_df = run_monte_carlo(
 					num_runs=int(monte_carlo_runs),
@@ -1305,10 +1387,11 @@ def main():
 					taxable_log_volatility=float(taxable_log_volatility),
 					bond_log_drift=float(bond_log_drift),
 					bond_log_volatility=float(bond_log_volatility),
+					return_mode=return_mode,
 					**s_params,
 				)
 				progress_placeholder.progress(1.0, text=f'{s_name}: complete')
-				return mc_results, all_yearly_df
+				return mc_results, all_yearly_df, None
 
 		if num_scenarios > 1:
 			# Multi-scenario run
@@ -1320,10 +1403,14 @@ def main():
 					text=f'Scenario {s_num + 1}/{len(all_scenarios)}: {s_name}')
 				s_params = build_scenario_params(sim_params, ovr,
 					stock_mu=stock_mu, stock_sigma=stock_sigma,
-					bond_mu=bond_mu, bond_sigma=bond_sigma)
-				results, all_yearly_df = run_one_scenario(s_params, s_name, run_bar)
+					bond_mu=bond_mu, bond_sigma=bond_sigma,
+					use_actual_allocation_columns=use_actual_allocation_columns,
+					use_historical_allocation_factors=return_mode != 'Simulated (lognormal)')
+				results, all_yearly_df, scenario_window_start_dates = run_one_scenario(s_params, s_name, run_bar)
+				if s_num == 0:
+					window_start_dates = scenario_window_start_dates
 				_base_sched_ms = st.session_state.get('_base_withdrawal_schedule', [])
-				_spend_target_ms = _base_sched_ms[0] if _base_sched_ms else 0.0
+				_spend_target_ms = float(np.mean(_base_sched_ms)) if _base_sched_ms else 0.0
 				summary = compute_scenario_summary(s_name, results, all_yearly_df,
 					float(inheritor_marginal_rate), float(ending_balance_goal),
 					spending_target=_spend_target_ms)
@@ -1338,13 +1425,15 @@ def main():
 		else:
 			# Single scenario run (backward compatible)
 			run_bar = st.progress(0, text='Running...')
-			results, all_yearly_df = run_one_scenario(sim_params, 'Baseline', run_bar)
+			results, all_yearly_df, window_start_dates = run_one_scenario(sim_params, 'Baseline', run_bar)
 			sim_mode_label = 'historical_dist' if is_historical else 'simulated'
 			_base_sched = st.session_state.get('_base_withdrawal_schedule', [])
-			_spending_target = _base_sched[0] if _base_sched else 0.0
+			_spending_target = float(np.mean(_base_sched)) if _base_sched else 0.0
 			dist_results = store_distribution_results(results, all_yearly_df, sim_mode_label,
 				float(ending_balance_goal), spending_target=_spending_target,
-				essential_spending=float(essential_spending))
+				essential_spending=float(essential_spending),
+				acceptable_spending=float(acceptable_spending),
+				redline_spending=float(redline_spending))
 			for k, v in dist_results.items():
 				st.session_state[k] = v
 			if is_historical:
@@ -1355,6 +1444,9 @@ def main():
 		st.session_state['_sim_params'] = sim_params
 		st.session_state['_sim_years'] = sim_years
 		st.session_state['_is_historical'] = is_historical
+		st.session_state['_return_mode'] = return_mode
+		st.session_state['_historical_allocation_source'] = historical_allocation_source
+		st.session_state['_use_actual_allocation_columns'] = use_actual_allocation_columns
 		st.session_state['_monte_carlo_runs'] = int(monte_carlo_runs)
 		st.session_state['_inheritor_marginal_rate'] = float(inheritor_marginal_rate)
 		st.session_state['_ending_balance_goal'] = float(ending_balance_goal)
@@ -1486,6 +1578,7 @@ def main():
 				withdrawal_schedule=withdrawal_schedule,
 				window_start_dates=st.session_state.get('window_start_dates'),
 				funded_goals=st.session_state.get('_funded_goals'),
+				essential_spending=essential_spending,
 			)
 		else:
 			# Base spending cards (always shown)
@@ -1833,7 +1926,10 @@ def main():
 				for rid in run_ids:
 					label = f"Start {window_dates.get(rid, rid)}"
 					options[label] = rid
-				selected_label = st.selectbox('Select run to display below', list(options.keys()))
+				option_labels = list(options.keys())
+				default_run_label = 'Start 1929-09'
+				default_run_idx = option_labels.index(default_run_label) if default_run_label in option_labels else 0
+				selected_label = st.selectbox('Select run to display below', option_labels, index=default_run_idx)
 				selected_run_idx = options[selected_label]
 				st.subheader(f'Single run detail — {selected_label}')
 			elif sim_mode == 'simulated':
@@ -1955,9 +2051,13 @@ def main():
 		st.bar_chart(chart_df)
 
 		st.subheader('After-tax spending over time — single run')
+		st.caption(f'Average annual after-tax spending for this run: {currency_fmt.format(avg_annual_after_tax)}')
 		spending_src = df[['year', 'after_tax_spending', 'total_taxes',
 						   'ss_income_total', 'pension_income_real', 'annuity_income_real', 'other_income']].copy()
 		spending_src['goal'] = [withdrawal_schedule[i] if i < len(withdrawal_schedule) else withdrawal_schedule[-1] for i in range(len(spending_src))]
+		essential_goal = float(essential_spending or 0.0)
+		if essential_goal > 0:
+			spending_src['essential_goal'] = essential_goal
 		# Net portfolio withdrawals = after_tax_spending minus income streams (so stacked bars add up exactly)
 		spending_src['Net Portfolio Withdrawals'] = (spending_src['after_tax_spending']
 			- spending_src['ss_income_total'] - spending_src['pension_income_real']
@@ -1987,10 +2087,20 @@ def main():
 			tooltip=[alt.Tooltip('year:O', title='Year'),
 					 alt.Tooltip('goal:Q', title='Spending Goal', format='$,.0f')]
 		)
+		essential_goal_line = None
+		if essential_goal > 0:
+			essential_goal_line = alt.Chart(spending_src).mark_line(color='#d97706', strokeDash=[3, 3], strokeWidth=2).encode(
+				x=alt.X('year:O'),
+				y=alt.Y('essential_goal:Q'),
+				tooltip=[alt.Tooltip('year:O', title='Year'),
+						 alt.Tooltip('essential_goal:Q', title='Essential Spending Goal', format='$,.0f')]
+			)
 		# Invisible points for total-level tooltip with full breakdown
 		tip_fields = [alt.Tooltip('year:O', title='Year'),
 					  alt.Tooltip('after_tax_spending:Q', title='Total Spending', format='$,.0f'),
 					  alt.Tooltip('goal:Q', title='Goal', format='$,.0f')]
+		if essential_goal > 0:
+			tip_fields.append(alt.Tooltip('essential_goal:Q', title='Essential Goal', format='$,.0f'))
 		for sc in source_cols:
 			tip_fields.append(alt.Tooltip(f'{sc}:Q', title=sc, format='$,.0f'))
 		tip_fields.append(alt.Tooltip('total_taxes:Q', title='Taxes Paid', format='$,.0f'))
@@ -1999,8 +2109,14 @@ def main():
 			y=alt.Y('after_tax_spending:Q'),
 			tooltip=tip_fields,
 		).add_params(nearest)
-		st.altair_chart((stacked_bars + goal_line + total_tip).interactive(), use_container_width=True)
-		st.caption('Stacked bars show income sources. Dashed line = spending goal. Hover for details.')
+		spending_chart = stacked_bars + goal_line
+		if essential_goal_line is not None:
+			spending_chart = spending_chart + essential_goal_line
+		st.altair_chart((spending_chart + total_tip).interactive(), use_container_width=True)
+		caption = 'Stacked bars show income sources. Black dashed line = spending goal.'
+		if essential_goal > 0:
+			caption += ' Orange dashed line = essential spending goal.'
+		st.caption(caption + ' Hover for details.')
 
 		st.subheader('Account balances over time — single run')
 		bal_df = currency_round[['year','end_taxable_total','end_tda_total','end_roth']].set_index('year')
@@ -2215,80 +2331,82 @@ def main():
 				st.caption('Spousal top-up = max(0, 50% of other\'s PIA − own PIA), reduced for early claiming. '
 					'Shown with other person at their current claiming age.')
 
-			if st.button('Run Claiming Age Analysis', key='run_ss_analysis'):
-				sim_years = int(years)
-				is_historical = return_mode == 'Historical (master_global_factors)'
-				grid_results = []
-				st.session_state.pop('ss_analysis_results', None)
+				if st.button('Run Claiming Age Analysis', key='run_ss_analysis'):
+					sim_years = int(years)
+					is_historical = return_mode == 'Historical (master_global_factors)'
+					grid_results = []
+					st.session_state.pop('ss_analysis_results', None)
 
-				if is_historical:
-					all_hist_windows, _ = get_all_historical_windows(sim_years)
-					n_windows = len(all_hist_windows)
-					target_per = max(50, 20000 // n_combos)
-					stride = max(1, n_windows // target_per)
-					sampled_indices = list(range(0, n_windows, stride))
-				else:
-					mc_runs = max(25, min(200, 10000 // n_combos))
+					if is_historical:
+						all_hist_windows, _ = get_all_historical_windows(
+							sim_years, target_stock_pct, use_actual_allocation_columns)
+						n_windows = len(all_hist_windows)
+						target_per = max(50, 20000 // n_combos)
+						stride = max(1, n_windows // target_per)
+						sampled_indices = list(range(0, n_windows, stride))
+					else:
+						mc_runs = max(25, min(200, 10000 // n_combos))
 
-				progress = st.progress(0, text='SS analysis: starting...')
-				combo_idx = 0
-				for p1_ca in p1_ages:
-					p1_adj = _fra_benefit_p1 * ss_adjustment_factor(p1_ca, _fra_p1)
-					for p2_ca in p2_ages:
-						progress.progress(combo_idx / n_combos,
-							text=f'P1={p1_ca}, P2={p2_ca} ({combo_idx+1}/{n_combos})')
-						p2_adj = _fra_benefit_p2 * ss_adjustment_factor(p2_ca, _fra_p2)
+					progress = st.progress(0, text='SS analysis: starting...')
+					combo_idx = 0
+					for p1_ca in p1_ages:
+						p1_adj = _fra_benefit_p1 * ss_adjustment_factor(p1_ca, _fra_p1)
+						for p2_ca in p2_ages:
+							progress.progress(combo_idx / n_combos,
+								text=f'P1={p1_ca}, P2={p2_ca} ({combo_idx+1}/{n_combos})')
+							p2_adj = _fra_benefit_p2 * ss_adjustment_factor(p2_ca, _fra_p2)
 
-						sp = dict(sim_params)
-						sp['ss_income_annual'] = p1_adj
-						sp['ss_start_age_p1'] = p1_ca
-						sp['ss_income_spouse_annual'] = p2_adj
-						sp['ss_start_age_p2'] = p2_ca
+							sp = dict(sim_params)
+							sp['ss_income_annual'] = p1_adj
+							sp['ss_start_age_p1'] = p1_ca
+							sp['ss_income_spouse_annual'] = p2_adj
+							sp['ss_start_age_p2'] = p2_ca
 
-						if is_historical:
-							results = []
-							_run_spending = []
-							for idx in sampled_indices:
-								stock_rets, bond_rets = all_hist_windows[idx]
-								run_pp = compute_run_pp_factors(idx, sim_years)
-								df_run = simulate_withdrawals(
-									years=sim_years, stock_return_series=stock_rets,
-									bond_return_series=bond_rets, pp_factors_run=run_pp, **sp)
-								df_run['total_portfolio'] = (df_run['end_taxable_total']
-									+ df_run['end_tda_total'] + df_run['end_roth'])
-								results.append(compute_summary_metrics(df_run, float(inheritor_marginal_rate)))
-								_run_spending.append(df_run['after_tax_spending'].mean())
-							mc_df = pd.DataFrame(results)
-							median_spending = float(np.median(_run_spending))
-						else:
-							results, _ay = run_monte_carlo(
-								num_runs=mc_runs, years=sim_years,
-								inheritor_rate=float(inheritor_marginal_rate),
-								taxable_log_drift=float(taxable_log_drift),
-								taxable_log_volatility=float(taxable_log_volatility),
-								bond_log_drift=float(bond_log_drift),
-								bond_log_volatility=float(bond_log_volatility),
-								**sp)
-							mc_df = pd.DataFrame(results)
-							median_spending = float(_ay.groupby('run')['after_tax_spending'].mean().median())
-							del _ay
+							if is_historical:
+								results = []
+								_run_spending = []
+								for idx in sampled_indices:
+									stock_rets, bond_rets = all_hist_windows[idx]
+									run_pp = compute_run_pp_factors(idx, sim_years)
+									df_run = simulate_withdrawals(
+										years=sim_years, stock_return_series=stock_rets,
+										bond_return_series=bond_rets, pp_factors_run=run_pp, **sp)
+									df_run['total_portfolio'] = (df_run['end_taxable_total']
+										+ df_run['end_tda_total'] + df_run['end_roth'])
+									results.append(compute_summary_metrics(df_run, float(inheritor_marginal_rate)))
+									_run_spending.append(df_run['after_tax_spending'].mean())
+								mc_df = pd.DataFrame(results)
+								median_spending = float(np.median(_run_spending))
+							else:
+								results, _ay = run_monte_carlo(
+									num_runs=mc_runs, years=sim_years,
+									inheritor_rate=float(inheritor_marginal_rate),
+									taxable_log_drift=float(taxable_log_drift),
+									taxable_log_volatility=float(taxable_log_volatility),
+									bond_log_drift=float(bond_log_drift),
+									bond_log_volatility=float(bond_log_volatility),
+									return_mode=return_mode,
+									**sp)
+								mc_df = pd.DataFrame(results)
+								median_spending = float(_ay.groupby('run')['after_tax_spending'].mean().median())
+								del _ay
 
-						grid_results.append({
-							'p1_age': p1_ca, 'p2_age': p2_ca,
-							'p1_benefit': p1_adj, 'p2_benefit': p2_adj,
-							'median_ending': float(np.percentile(mc_df['after_tax_end'], 50)),
-							'median_spending': median_spending,
-						})
-						combo_idx += 1
+							grid_results.append({
+								'p1_age': p1_ca, 'p2_age': p2_ca,
+								'p1_benefit': p1_adj, 'p2_benefit': p2_adj,
+								'median_ending': float(np.percentile(mc_df['after_tax_end'], 50)),
+								'median_spending': median_spending,
+							})
+							combo_idx += 1
 
-				progress.progress(1.0, text='SS analysis: complete!')
-				st.session_state['ss_analysis_grid'] = grid_results
-				st.session_state['ss_analysis_meta'] = {
-					'p1_ages': p1_ages, 'p2_ages': p2_ages,
-					'fra_benefit_p1': _fra_benefit_p1, 'fra_benefit_p2': _fra_benefit_p2,
-					'fra_p1': _fra_p1, 'fra_p2': _fra_p2,
-					'baseline_p1': int(ss_start_age_p1), 'baseline_p2': int(ss_start_age_p2),
-				}
+					progress.progress(1.0, text='SS analysis: complete!')
+					st.session_state['ss_analysis_grid'] = grid_results
+					st.session_state['ss_analysis_meta'] = {
+						'p1_ages': p1_ages, 'p2_ages': p2_ages,
+						'fra_benefit_p1': _fra_benefit_p1, 'fra_benefit_p2': _fra_benefit_p2,
+						'fra_p1': _fra_p1, 'fra_p2': _fra_p2,
+						'baseline_p1': int(ss_start_age_p1), 'baseline_p2': int(ss_start_age_p2),
+					}
 
 			if 'ss_analysis_grid' in st.session_state:
 				grid = st.session_state['ss_analysis_grid']
@@ -2404,66 +2522,68 @@ def main():
 					 'Annual Benefit': f'${_fra_benefit * ss_adjustment_factor(ca, _fra):,.0f}'}
 					for ca in _claim_ages]).set_index('Claiming Age'))
 
-			if st.button('Run Claiming Age Analysis', key='run_ss_analysis'):
-				sim_years = int(years)
-				is_historical = return_mode == 'Historical (master_global_factors)'
-				ss_analysis_results = []
-				st.session_state.pop('ss_analysis_grid', None)
-				st.session_state.pop('ss_analysis_meta', None)
-
-				if is_historical:
-					hist_windows, _ = get_all_historical_windows(sim_years)
-
-				n_ages = len(_claim_ages)
-				progress_bar = st.progress(0, text='SS analysis: starting...')
-				for i, ca in enumerate(_claim_ages):
-					progress_bar.progress(i / n_ages, text=f'SS analysis: age {ca}...')
-					adj_benefit = _fra_benefit * ss_adjustment_factor(ca, _fra)
-					sp = dict(sim_params)
-					if _person_label == 'Person 1':
-						sp['ss_income_annual'] = adj_benefit
-						sp['ss_start_age_p1'] = ca
-					else:
-						sp['ss_income_spouse_annual'] = adj_benefit
-						sp['ss_start_age_p2'] = ca
+				if st.button('Run Claiming Age Analysis', key='run_ss_analysis'):
+					sim_years = int(years)
+					is_historical = return_mode == 'Historical (master_global_factors)'
+					ss_analysis_results = []
+					st.session_state.pop('ss_analysis_grid', None)
+					st.session_state.pop('ss_analysis_meta', None)
 
 					if is_historical:
-						results, all_yearly_df = run_historical_parallel(
-							hist_windows, sim_years, float(inheritor_marginal_rate), sp)
-					else:
-						mc_runs = min(int(monte_carlo_runs), 200)
-						results, all_yearly_df = run_monte_carlo(
-							num_runs=mc_runs, years=sim_years,
-							inheritor_rate=float(inheritor_marginal_rate),
-							taxable_log_drift=float(taxable_log_drift),
-							taxable_log_volatility=float(taxable_log_volatility),
-							bond_log_drift=float(bond_log_drift),
-							bond_log_volatility=float(bond_log_volatility),
-							**sp)
+						hist_windows, _ = get_all_historical_windows(
+							sim_years, target_stock_pct, use_actual_allocation_columns)
 
-					_base_sched_ss = st.session_state.get('_base_withdrawal_schedule', [])
-					_spend_target_ss = _base_sched_ss[0] if _base_sched_ss else 0.0
-					summary = compute_scenario_summary(
-						f'Age {ca} (${adj_benefit:,.0f})', results, all_yearly_df,
-						float(inheritor_marginal_rate), float(ending_balance_goal),
-						spending_target=_spend_target_ss)
-					# Store claiming age and benefit for display
-					summary['_claiming_age'] = ca
-					summary['_annual_benefit'] = adj_benefit
-					_ayd = summary['all_yearly_df']
-					_inh_rate = float(inheritor_marginal_rate)
-					_ayd['after_tax_portfolio'] = (_ayd['end_taxable_total'] + _ayd['end_roth']
-						+ _ayd['end_tda_total'] * max(0.0, 1.0 - _inh_rate))
-					median_by_year = _ayd.groupby('year')[['total_portfolio', 'after_tax_portfolio', 'after_tax_spending']].median()
-					summary['median_yearly_years'] = median_by_year.index.tolist()
-					summary['median_yearly_portfolio'] = median_by_year['total_portfolio'].tolist()
-					summary['median_yearly_portfolio_at'] = median_by_year['after_tax_portfolio'].tolist()
-					summary['median_yearly_spending'] = median_by_year['after_tax_spending'].tolist()
-					# Pre-tax ending: median of last-year total_portfolio across runs
-					_run_ends = _ayd.groupby('run')['total_portfolio'].last()
-					summary['_pretax_ending_p50'] = float(np.median(_run_ends))
-					del summary['all_yearly_df']
-					ss_analysis_results.append(summary)
+					n_ages = len(_claim_ages)
+					progress_bar = st.progress(0, text='SS analysis: starting...')
+					for i, ca in enumerate(_claim_ages):
+						progress_bar.progress(i / n_ages, text=f'SS analysis: age {ca}...')
+						adj_benefit = _fra_benefit * ss_adjustment_factor(ca, _fra)
+						sp = dict(sim_params)
+						if _person_label == 'Person 1':
+							sp['ss_income_annual'] = adj_benefit
+							sp['ss_start_age_p1'] = ca
+						else:
+							sp['ss_income_spouse_annual'] = adj_benefit
+							sp['ss_start_age_p2'] = ca
+
+						if is_historical:
+							results, all_yearly_df = run_historical_parallel(
+								hist_windows, sim_years, float(inheritor_marginal_rate), sp)
+						else:
+							mc_runs = min(int(monte_carlo_runs), 200)
+							results, all_yearly_df = run_monte_carlo(
+								num_runs=mc_runs, years=sim_years,
+								inheritor_rate=float(inheritor_marginal_rate),
+								taxable_log_drift=float(taxable_log_drift),
+								taxable_log_volatility=float(taxable_log_volatility),
+								bond_log_drift=float(bond_log_drift),
+								bond_log_volatility=float(bond_log_volatility),
+								return_mode=return_mode,
+								**sp)
+
+						_base_sched_ss = st.session_state.get('_base_withdrawal_schedule', [])
+						_spend_target_ss = _base_sched_ss[0] if _base_sched_ss else 0.0
+						summary = compute_scenario_summary(
+							f'Age {ca} (${adj_benefit:,.0f})', results, all_yearly_df,
+							float(inheritor_marginal_rate), float(ending_balance_goal),
+							spending_target=_spend_target_ss)
+						# Store claiming age and benefit for display
+						summary['_claiming_age'] = ca
+						summary['_annual_benefit'] = adj_benefit
+						_ayd = summary['all_yearly_df']
+						_inh_rate = float(inheritor_marginal_rate)
+						_ayd['after_tax_portfolio'] = (_ayd['end_taxable_total'] + _ayd['end_roth']
+							+ _ayd['end_tda_total'] * max(0.0, 1.0 - _inh_rate))
+						median_by_year = _ayd.groupby('year')[['total_portfolio', 'after_tax_portfolio', 'after_tax_spending']].median()
+						summary['median_yearly_years'] = median_by_year.index.tolist()
+						summary['median_yearly_portfolio'] = median_by_year['total_portfolio'].tolist()
+						summary['median_yearly_portfolio_at'] = median_by_year['after_tax_portfolio'].tolist()
+						summary['median_yearly_spending'] = median_by_year['after_tax_spending'].tolist()
+						# Pre-tax ending: median of last-year total_portfolio across runs
+						_run_ends = _ayd.groupby('run')['total_portfolio'].last()
+						summary['_pretax_ending_p50'] = float(np.median(_run_ends))
+						del summary['all_yearly_df']
+						ss_analysis_results.append(summary)
 
 				progress_bar.progress(1.0, text='SS analysis: complete!')
 				st.session_state['ss_analysis_results'] = ss_analysis_results
@@ -2562,9 +2682,10 @@ def main():
 				with st.spinner('Computing growth distribution...'):
 					result = dollar_growth_distribution(
 						stock_pct=_growth_alloc / 100.0,
-						years=sim_years,
-						mode='historical' if is_hist else 'simulated',
-						stock_drift=float(taxable_log_drift),
+							years=sim_years,
+							mode='historical' if is_hist else 'simulated',
+							use_actual_allocation_columns=use_actual_allocation_columns,
+							stock_drift=float(taxable_log_drift),
 						stock_vol=float(taxable_log_volatility),
 						bond_drift=float(bond_log_drift),
 						bond_vol=float(bond_log_volatility),
@@ -2625,9 +2746,10 @@ def main():
 					with st.spinner('Computing year-by-year growth paths...'):
 						grid = dollar_growth_by_year(
 							stock_pct=_growth_alloc / 100.0,
-							max_years=int(gf_end),
-							mode='historical' if is_hist else 'simulated',
-							stock_drift=float(taxable_log_drift),
+								max_years=int(gf_end),
+								mode='historical' if is_hist else 'simulated',
+								use_actual_allocation_columns=use_actual_allocation_columns,
+								stock_drift=float(taxable_log_drift),
 							stock_vol=float(taxable_log_volatility),
 							bond_drift=float(bond_log_drift),
 							bond_vol=float(bond_log_volatility),
@@ -2666,6 +2788,87 @@ def main():
 	# ── Spending Finder ─────────────────────────────────────────
 	if sim_mode is not None and '_sim_params' in st.session_state:
 		st.markdown('---')
+		reserve_analysis = st.session_state.get('mc_essential_reserve_analysis')
+		if reserve_analysis and st.checkbox('Essential Reserve Analysis', value=True, key='_show_essential_reserve_analysis'):
+			st.caption('Separate real-dollar reserve bucket needed to prevent any year below essential spending.')
+			ra = reserve_analysis
+			c1, c2, c3, c4 = st.columns(4)
+			c1.metric('Ideal', currency_fmt.format(ra['ideal_spending']))
+			c2.metric('Essential', currency_fmt.format(ra['essential_spending']))
+			c3.metric('Reserve needed', currency_fmt.format(ra['reserve_needed']))
+			c4.metric('Min year after reserve', currency_fmt.format(ra['after_reserve']['minimum_year']))
+
+			def _row(label, section):
+				ideal_stats = section['ideal']
+				ess_stats = section['essential']
+				return {
+					'Case': label,
+					'Years below ideal': ideal_stats['years_below'],
+					'% years below ideal': ideal_stats['pct_years_below'] * 100,
+					'Runs below ideal': ideal_stats['runs_below'],
+					'% runs below ideal': ideal_stats['pct_runs_below'] * 100,
+					'Years below essential': ess_stats['years_below'],
+					'% years below essential': ess_stats['pct_years_below'] * 100,
+					'Runs below essential': ess_stats['runs_below'],
+					'% runs below essential': ess_stats['pct_runs_below'] * 100,
+					'Minimum year': section['minimum_year'],
+				}
+			reserve_df = pd.DataFrame([
+				_row('Before reserve', ra['before_reserve']),
+				_row('After reserve', ra['after_reserve']),
+			])
+			st.dataframe(reserve_df.style.format({
+				'% years below ideal': '{:.2f}%',
+				'% runs below ideal': '{:.2f}%',
+				'% years below essential': '{:.2f}%',
+				'% runs below essential': '{:.2f}%',
+				'Minimum year': currency_fmt,
+			}), use_container_width=True, hide_index=True)
+
+		if st.checkbox('Reserve Protected Floor Solver', key='_show_reserve_floor_solver'):
+			st.caption('Enter a separate reserve amount. The solver finds the highest essential floor that reserve can fully protect across all tested runs.')
+			col_reserve, col_cap = st.columns(2)
+			base_sched = st.session_state.get('_base_withdrawal_schedule', [])
+			default_ideal = float(ideal_spending or (base_sched[0] if base_sched else 0.0))
+			with col_reserve:
+				reserve_solver_amount = st.number_input('Available reserve ($)', min_value=0.0,
+					value=50000.0, step=5000.0, key='reserve_solver_amount')
+			with col_cap:
+				reserve_solver_cap = st.number_input('Do not solve above ($)', min_value=0.0,
+					value=default_ideal, step=1000.0, key='reserve_solver_cap',
+					help='Usually the ideal spending amount. The solved floor will not exceed this value.')
+			if st.button('Solve Protected Essential Floor', key='run_reserve_floor_solver'):
+				all_yearly_for_solver = st.session_state.get('mc_all_yearly')
+				if all_yearly_for_solver is None or all_yearly_for_solver.empty:
+					st.warning('Run a simulation first.')
+				else:
+					solved = solve_essential_floor_for_reserve(
+						all_yearly_for_solver,
+						reserve_amount=float(reserve_solver_amount),
+						max_floor=float(reserve_solver_cap),
+					)
+					analysis = solved['analysis']
+					st.success(
+						f"With a {currency_fmt.format(reserve_solver_amount)} reserve, "
+						f"the protected essential floor is **{currency_fmt.format(solved['essential_floor'])}/yr**."
+					)
+					c1, c2, c3, c4 = st.columns(4)
+					c1.metric('Reserve needed', currency_fmt.format(solved['reserve_needed']))
+					c2.metric('Unused reserve', currency_fmt.format(solved['unused_reserve']))
+					c3.metric('Below floor after reserve', f"{analysis['after_reserve']['essential']['years_below']} years")
+					c4.metric('Minimum after reserve', currency_fmt.format(analysis['after_reserve']['minimum_year']))
+					worst = analysis.get('worst_reserve_run', {})
+					st.caption(
+						f"Worst protected run needs {currency_fmt.format(analysis['reserve_needed'])}; "
+						f"max below-floor years in one run: {analysis['max_breach_years_in_one_run']}."
+					)
+					if worst:
+						start_txt = f" starting {worst.get('start_date')}" if worst.get('start_date') else ''
+						st.caption(
+							f"Worst run{start_txt}: {int(worst.get('essential_breach_years', 0))} top-up years, "
+							f"worst pre-reserve spending {currency_fmt.format(float(worst.get('worst_spending', 0.0)))}."
+						)
+
 		if st.checkbox('Spending Finder', key='_show_spending_finder'):
 			st.caption('Find the spending level that gives you a target probability of meeting your spending goal.')
 			col_target, col_guess, col_tol = st.columns(3)
@@ -2697,6 +2900,7 @@ def main():
 				stored_params = st.session_state['_sim_params']
 				sim_years = st.session_state['_sim_years']
 				is_hist = st.session_state['_is_historical']
+				_sf_return_mode = st.session_state.get('_return_mode', 'Simulated (lognormal)')
 				mc_runs = st.session_state['_monte_carlo_runs']
 				inheritor_rate = st.session_state['_inheritor_marginal_rate']
 				base_sched = st.session_state.get('_base_withdrawal_schedule', [])
@@ -2714,17 +2918,29 @@ def main():
 						test_params = dict(stored_params)
 						orig_sched = list(test_params['withdrawal_schedule'])
 						scale = spend_amt / original_spending if original_spending > 0 else 1.0
-						test_params['withdrawal_schedule'] = [v * scale for v in orig_sched]
+						test_sched = [v * scale for v in orig_sched]
+						test_params['withdrawal_schedule'] = test_sched
+						# Grade against the scaled schedule's planned average
+						# (== spend_amt for flat plans), $1 solver tolerance
+						planned_avg = float(np.mean(test_sched)) if test_sched else spend_amt
 						if is_hist:
-							windows, _ = get_all_historical_windows(sim_years)
+							windows, _ = get_all_historical_windows(
+								sim_years, test_params.get('target_stock_pct', target_stock_pct),
+								use_actual_allocation_columns)
 							results, all_yearly_df = run_historical_parallel(
 								windows, sim_years, inheritor_rate, test_params)
 						else:
 							results, all_yearly_df = run_monte_carlo(
-								num_runs=mc_runs, years=sim_years, **test_params)
+								num_runs=mc_runs, years=sim_years,
+								inheritor_rate=float(inheritor_rate),
+								taxable_log_drift=float(taxable_log_drift),
+								taxable_log_volatility=float(taxable_log_volatility),
+								bond_log_drift=float(bond_log_drift),
+								bond_log_volatility=float(bond_log_volatility),
+								return_mode=_sf_return_mode, **test_params)
 						run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
-						ideal_rate = float((run_avg >= spend_amt).mean())
-						ess_rate = float((run_avg >= ess_floor).mean()) if ess_floor > 0 else 1.0
+						ideal_rate = float((run_avg >= planned_avg - 1.0).mean())
+						ess_rate = float((run_avg >= ess_floor - 1.0).mean()) if ess_floor > 0 else 1.0
 						min_avg = float(run_avg.min())
 						return ideal_rate, ess_rate, min_avg
 
@@ -2757,23 +2973,15 @@ def main():
 						has_guess = spend_find_guess > 0 and spend_find_guess != original_spending
 						# Set search bounds based on guess result
 						if _meets_both(guess_rate, guess_ess_rate):
-							# Guess is too conservative — search upward
 							lo = guess
-							if has_guess:
-								hi = guess * 1.2
-							else:
-								hi = guess * 2.0
+							hi = guess * 1.2 if has_guess else guess * 2.0
 							for _ in range(5):
 								r, er, _ = _run_with_spending(hi)
 								if not _meets_both(r, er):
 									break
 								hi = lo + (hi - lo) * 1.5 if has_guess else hi * 1.5
 						else:
-							# Guess is too aggressive — search downward
-							if has_guess:
-								lo = guess * 0.8
-							else:
-								lo = 0.0
+							lo = guess * 0.8 if has_guess else 0.0
 							hi = guess
 							if has_guess:
 								for _ in range(5):
@@ -2802,7 +3010,6 @@ def main():
 						result_spending = round((lo + hi) / 2.0 / 1000) * 1000
 						diff = result_spending - original_spending
 
-						# Run once more at result to get final rates for display
 						final_ideal, final_ess, final_min = _run_with_spending(result_spending)
 						if diff > 0:
 							msg = f'You can increase spending to {result_spending:,.0f} (+{diff:,.0f}/yr)'
@@ -2821,21 +3028,21 @@ def main():
 						st.session_state['_spend_finder_result'] = result_spending
 						st.session_state['_spend_finder_ess_floor'] = final_min
 
-			# Show "Use this value" button if a result exists
-			if '_spend_finder_result' in st.session_state:
-				found_val = st.session_state['_spend_finder_result']
-				found_ess = st.session_state.get('_spend_finder_ess_floor')
-				btn_label = f'Use ${found_val:,.0f} ideal'
+		# Show "Use this value" button if a result exists
+		if '_spend_finder_result' in st.session_state:
+			found_val = st.session_state['_spend_finder_result']
+			found_ess = st.session_state.get('_spend_finder_ess_floor')
+			btn_label = f'Use ${found_val:,.0f} ideal'
+			if found_ess:
+				btn_label += f' / ${found_ess:,.0f} essential'
+			btn_label += ' and re-run'
+			if st.button(btn_label, key='use_spend_finder'):
+				st.session_state['_pending_spend_finder'] = found_val
 				if found_ess:
-					btn_label += f' / ${found_ess:,.0f} essential'
-				btn_label += ' and re-run'
-				if st.button(btn_label, key='use_spend_finder'):
-					st.session_state['_pending_spend_finder'] = found_val
-					if found_ess:
-						st.session_state['_pending_spend_finder_ess'] = found_ess
-					st.session_state.pop('_spend_finder_result', None)
-					st.session_state.pop('_spend_finder_ess_floor', None)
-					st.rerun()
+					st.session_state['_pending_spend_finder_ess'] = found_ess
+				st.session_state.pop('_spend_finder_result', None)
+				st.session_state.pop('_spend_finder_ess_floor', None)
+				st.rerun()
 
 	# ── Balance Decline Finder ──────────────────────────────────
 	if sim_mode is not None and '_sim_params' in st.session_state:
@@ -2859,10 +3066,11 @@ def main():
 				stored_params = st.session_state['_sim_params']
 				sim_years = st.session_state['_sim_years']
 				is_hist = st.session_state['_is_historical']
+				_sf_return_mode = st.session_state.get('_return_mode', 'Simulated (lognormal)')
 				mc_runs = st.session_state['_monte_carlo_runs']
 				inheritor_rate = st.session_state['_inheritor_marginal_rate']
 				base_sched = st.session_state.get('_base_withdrawal_schedule', [])
-				spending_target = base_sched[0] if base_sched else 0.0
+				spending_target = float(np.mean(base_sched)) if base_sched else 0.0
 				target_rate = bd_target_pct / 100.0
 
 				# Balance keys to scale uniformly
@@ -2886,14 +3094,22 @@ def main():
 							if k in test_params:
 								test_params[k] = stored_params[k] * factor
 						if is_hist:
-							windows, _ = get_all_historical_windows(sim_years)
+							windows, _ = get_all_historical_windows(
+								sim_years, test_params.get('target_stock_pct', target_stock_pct),
+								use_actual_allocation_columns)
 							_, all_yearly_df = run_historical_parallel(
 								windows, sim_years, inheritor_rate, test_params)
 						else:
 							_, all_yearly_df = run_monte_carlo(
-								num_runs=mc_runs, years=sim_years, **test_params)
+								num_runs=mc_runs, years=sim_years,
+								inheritor_rate=float(inheritor_rate),
+								taxable_log_drift=float(taxable_log_drift),
+								taxable_log_volatility=float(taxable_log_volatility),
+								bond_log_drift=float(bond_log_drift),
+								bond_log_volatility=float(bond_log_volatility),
+								return_mode=_sf_return_mode, **test_params)
 						run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
-						return float((run_avg >= spending_target).mean())
+						return float((run_avg >= spending_target - 1.0).mean())
 
 					guess_decline = float(bd_guess)
 					tol = float(bd_tol)
@@ -2976,12 +3192,7 @@ def main():
 						return 0.5 * (1.0 + _math.erf(x / _math.sqrt(2.0)))
 
 					_stock_pct = stored_params.get('target_stock_pct', 0.6)
-					mg_df = load_master_global()
-					stock_f = mg_df['LBM 100E'].dropna().values
-					bond_f = mg_df['LBM 100 F'].dropna().values
-					n_f = min(len(stock_f), len(bond_f))
-					stock_f = stock_f[:n_f]
-					bond_f = bond_f[:n_f]
+					allocation_f = load_portfolio_factors(_stock_pct, use_actual_allocation_columns)
 					horizon_months = int(bd_months)
 					decline_used = result_decline
 
@@ -2999,12 +3210,10 @@ def main():
 							monthly[t + 12] = monthly[t] * factors_12mo[t + 1] / factors_12mo[t]
 						return monthly
 
-					stock_monthly = _extract_monthly(stock_f)
-					bond_monthly = _extract_monthly(bond_f)
-					n_months = min(len(stock_monthly), len(bond_monthly))
-					blended_monthly = _stock_pct * stock_monthly[:n_months] + (1 - _stock_pct) * bond_monthly[:n_months]
+					allocation_monthly = _extract_monthly(allocation_f)
+					n_months = len(allocation_monthly)
 					# Cumulative wealth index (prepend 1.0 as starting value)
-					wealth = np.concatenate([[1.0], np.cumprod(blended_monthly)])
+					wealth = np.concatenate([[1.0], np.cumprod(allocation_monthly)])
 					# Skip first 12 months (seeded approximation) for cleaner empirical data
 					skip = 12
 					if horizon_months < n_months - skip:
@@ -3019,8 +3228,7 @@ def main():
 						n_declines = 0
 
 					# ── Simulated (parametric lognormal) ──
-					blended_annual = _stock_pct * stock_f + (1 - _stock_pct) * bond_f
-					annual_log_rets = np.log(blended_annual)
+					annual_log_rets = np.log(allocation_f)
 					mu_annual = float(np.mean(annual_log_rets))
 					sigma_annual = float(np.std(annual_log_rets))
 					frac = horizon_months / 12.0
@@ -3066,10 +3274,11 @@ def main():
 				stored_params = st.session_state['_sim_params']
 				sim_years = st.session_state['_sim_years']
 				is_hist = st.session_state['_is_historical']
+				_sf_return_mode = st.session_state.get('_return_mode', 'Simulated (lognormal)')
 				mc_runs = st.session_state['_monte_carlo_runs']
 				inheritor_rate = st.session_state['_inheritor_marginal_rate']
 				base_sched = st.session_state.get('_base_withdrawal_schedule', [])
-				spending_target = base_sched[0] if base_sched else 0.0
+				spending_target = float(np.mean(base_sched)) if base_sched else 0.0
 				target_rate = bi_target_pct / 100.0
 
 				_balance_keys = ['taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start',
@@ -3090,14 +3299,22 @@ def main():
 							if k in test_params:
 								test_params[k] = stored_params[k] * factor
 						if is_hist:
-							windows, _ = get_all_historical_windows(sim_years)
+							windows, _ = get_all_historical_windows(
+								sim_years, test_params.get('target_stock_pct', target_stock_pct),
+								use_actual_allocation_columns)
 							_, all_yearly_df = run_historical_parallel(
 								windows, sim_years, inheritor_rate, test_params)
 						else:
 							_, all_yearly_df = run_monte_carlo(
-								num_runs=mc_runs, years=sim_years, **test_params)
+								num_runs=mc_runs, years=sim_years,
+								inheritor_rate=float(inheritor_rate),
+								taxable_log_drift=float(taxable_log_drift),
+								taxable_log_volatility=float(taxable_log_volatility),
+								bond_log_drift=float(bond_log_drift),
+								bond_log_volatility=float(bond_log_volatility),
+								return_mode=_sf_return_mode, **test_params)
 						run_avg = all_yearly_df.groupby('run')['after_tax_spending'].mean()
-						return float((run_avg >= spending_target).mean())
+						return float((run_avg >= spending_target - 1.0).mean())
 
 					guess_increase = float(bi_guess)
 					tol = float(bi_tol)
@@ -3180,12 +3397,7 @@ def main():
 						return 0.5 * (1.0 + _math.erf(x / _math.sqrt(2.0)))
 
 					_stock_pct = stored_params.get('target_stock_pct', 0.6)
-					mg_df = load_master_global()
-					stock_f = mg_df['LBM 100E'].dropna().values
-					bond_f = mg_df['LBM 100 F'].dropna().values
-					n_f = min(len(stock_f), len(bond_f))
-					stock_f = stock_f[:n_f]
-					bond_f = bond_f[:n_f]
+					allocation_f = load_portfolio_factors(_stock_pct, use_actual_allocation_columns)
 					horizon_months = int(bi_months)
 					increase_used = result_increase
 
@@ -3200,11 +3412,9 @@ def main():
 							monthly[t + 12] = monthly[t] * factors_12mo[t + 1] / factors_12mo[t]
 						return monthly
 
-					stock_monthly = _extract_monthly(stock_f)
-					bond_monthly = _extract_monthly(bond_f)
-					n_months = min(len(stock_monthly), len(bond_monthly))
-					blended_monthly = _stock_pct * stock_monthly[:n_months] + (1 - _stock_pct) * bond_monthly[:n_months]
-					wealth = np.concatenate([[1.0], np.cumprod(blended_monthly)])
+					allocation_monthly = _extract_monthly(allocation_f)
+					n_months = len(allocation_monthly)
+					wealth = np.concatenate([[1.0], np.cumprod(allocation_monthly)])
 					skip = 12
 					if horizon_months < n_months - skip:
 						w = wealth[skip:]
@@ -3218,8 +3428,7 @@ def main():
 						n_gains = 0
 
 					# ── Simulated (parametric lognormal) ──
-					blended_annual = _stock_pct * stock_f + (1 - _stock_pct) * bond_f
-					annual_log_rets = np.log(blended_annual)
+					annual_log_rets = np.log(allocation_f)
 					mu_annual = float(np.mean(annual_log_rets))
 					sigma_annual = float(np.std(annual_log_rets))
 					frac = horizon_months / 12.0
