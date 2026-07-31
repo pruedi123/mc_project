@@ -283,9 +283,35 @@ if __name__ == '__main__':
     print("\n=== PHASE 1: Auto-calculate spending ===")
     portfolio_total = plan['taxable_start'] + plan['tda_start'] + plan['tda_spouse_start'] + plan['roth_start']
     four_pct = portfolio_total * 0.04
-    income_sum = (plan.get('ss_income', 0) + plan.get('ss_income_spouse', 0) +
-        plan.get('pension_income', 0) + plan.get('pension_income_spouse', 0) + plan.get('other_income', 0) +
+
+    def _worst_draw_avg_pp(horizon, cola=0.0):
+        """Average real value multiplier for a $1/yr nominal income stream over
+        the horizon, under the single worst rolling historical CPI window.
+        A fixed pension counted at face value overstates what it funds — under
+        the worst inflation draw a no-COLA dollar averages ~42 cents of
+        purchasing power across 30 years. SS is excluded from this (ss_cola=0
+        already means inflation-tracking in this engine's real-dollar terms)."""
+        from sim_engine import CPI_MO_FACTORS, compute_run_pp_factors
+        n_starts = len(CPI_MO_FACTORS) - horizon * 12 + 1
+        worst = None
+        for s in range(n_starts):
+            pp = compute_run_pp_factors(s, horizon)
+            avg = sum(((1 + cola) ** y) * pp[y] for y in range(horizon)) / horizon
+            if worst is None or avg < worst:
+                worst = avg
+        return worst if worst is not None else 1.0
+
+    ss_sum = plan.get('ss_income', 0) + plan.get('ss_income_spouse', 0)
+    fixed_sum = (plan.get('pension_income', 0) + plan.get('pension_income_spouse', 0) +
+        plan.get('other_income', 0) +
         sim_params.get('annuity_income_p1', 0.0) + sim_params.get('annuity_income_p2', 0.0))
+    if withdrawal_rate_override is not None and fixed_sum > 0:
+        pp_mult = _worst_draw_avg_pp(sim_years)
+        income_sum = ss_sum + fixed_sum * pp_mult
+        print(f"  Fixed income streams discounted to worst-CPI-draw average value: "
+              f"${fixed_sum:,.0f} x {pp_mult:.2f} = ${fixed_sum * pp_mult:,.0f}")
+    else:
+        income_sum = ss_sum + fixed_sum
     if withdrawal_rate_override is not None:
         # Classic withdrawal-rate goal (4%, 4.5%, etc.) instead of a solved
         # number — replaces any entered/multi-period schedule with one flat

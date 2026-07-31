@@ -1515,6 +1515,7 @@ def simulate_withdrawals(start_age_primary: int,
 						 blended_mu: float = 0.0,
 						 blended_sigma: float = 0.0,
 						 guardrail_max_spending_pct: float = -1.0,
+						 guardrail_year1_literal: bool = False,
 						 taxes_enabled: bool = True,
 						 investment_fee_bps: float = 0.0,
 						 goal_schedule: Optional[Sequence[float]] = None,
@@ -1631,7 +1632,13 @@ def simulate_withdrawals(start_age_primary: int,
 		income_schedule.append(yr_inc['total_real_income'])
 
 	# Guardrail: compute initial scaling factor via binary search
-	if guardrails_enabled:
+	if guardrails_enabled and guardrail_year1_literal:
+		# Start year 1 at the schedule exactly as entered (base + flex, unscaled).
+		# The parametric solve otherwise inflates year 1 to whatever the portfolio
+		# can support at the target success rate, which front-loads spending the
+		# client never asked for. Guardrail checks still run normally from year 2.
+		current_scale_factor = 1.0
+	elif guardrails_enabled:
 		total_portfolio_init = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
 		current_scale_factor = find_sustainable_scale_factor(
 			total_portfolio_init, list(withdrawal_schedule), blended_mu, blended_sigma,
