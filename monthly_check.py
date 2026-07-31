@@ -67,6 +67,34 @@ def age_plan(plan, elapsed_years, balances, pinned_legacy):
     return aged
 
 
+def rescale_schedule(params, original_spending, spend_amt):
+    """Reproduce find_spending's schedule scaling: essential dollars are a
+    fixed floor; only the flexible + base portion moves toward spend_amt."""
+    test_params = dict(params)
+    goal_schedule = params.get('goal_schedule')
+    flex_goal_schedule = params.get('flex_goal_schedule')
+    base_schedule = params['withdrawal_schedule']
+    n = len(base_schedule)
+    if goal_schedule is not None or flex_goal_schedule is not None:
+        essential_arr = goal_schedule if goal_schedule is not None else [0.0] * n
+        flex_arr = flex_goal_schedule if flex_goal_schedule is not None else [0.0] * n
+        essential_avg = float(np.mean(essential_arr))
+        scalable_original = original_spending - essential_avg
+        s = max(0.0, (spend_amt - essential_avg) / scalable_original) if scalable_original > 0 else 1.0
+        new_flex = [f * s for f in flex_arr]
+        sched = []
+        for i in range(n):
+            base_i = base_schedule[i] - essential_arr[i] - flex_arr[i]
+            sched.append(essential_arr[i] + new_flex[i] + base_i * s)
+        test_params['withdrawal_schedule'] = sched
+        if flex_goal_schedule is not None:
+            test_params['flex_goal_schedule'] = new_flex
+    else:
+        scale = spend_amt / original_spending if original_spending > 0 else 1.0
+        test_params['withdrawal_schedule'] = [v * scale for v in base_schedule]
+    return test_params
+
+
 def hit_probabilities(move_frac, target_stock_pct, horizons=(3, 6)):
     """Historical probability of an h-month portfolio move at least as far as
     move_frac (negative = decline), from the true monthly return panel."""
@@ -314,24 +342,6 @@ def main():
     sr_now = float((run_avg >= spending - 1.0).mean())
     print(f'Remaining-plan success at current balances: {sr_now * 100:.0f}% ({time.time() - t0:.1f}s)')
 
-    print('\n-- Re-drawing the band --')
-    decline_pct = find_decline(sim_params, spending, 0.75, is_historical, windows,
-                               sim_years, inheritor_rate, aged, guess_decline=20.0)
-    increase_pct = find_increase(sim_params, spending, 0.95, is_historical, windows,
-                                 sim_years, inheritor_rate, aged, guess_increase=10.0)
-    lower = total * (1.0 - decline_pct / 100.0)
-    upper = total * (1.0 + increase_pct / 100.0)
-
-    print('\n-- Stressed spending at the lower rail --')
-    stressed_params = dict(sim_params)
-    for k in ('taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start'):
-        stressed_params[k] = sim_params.get(k, 0.0) * (1.0 - decline_pct / 100.0)
-    stressed_spending, _, _ = find_spending(stressed_params, spending, 0.85, spending * 0.85,
-                                            is_historical, windows, sim_years, inheritor_rate, aged)
-
-    decline_probs = hit_probabilities(-(decline_pct / 100.0), target_stock_pct)
-    increase_probs = hit_probabilities(increase_pct / 100.0, target_stock_pct)
-
     raise_deferred = False
     if sr_now < 0.75:
         verdict = 'CUT'
@@ -354,6 +364,33 @@ def main():
     else:
         verdict = 'OK'
         new_spending = spending
+
+    # The published band always describes the GO-FORWARD plan: on a change
+    # month the rails are re-drawn at the adjusted spending, so the client
+    # never sees rails their new spending has already moved away from.
+    if verdict == 'OK':
+        band_params, band_target = sim_params, spending
+        print('\n-- Re-drawing the band --')
+    else:
+        band_params = rescale_schedule(sim_params, spending, new_spending)
+        band_target = float(np.mean(band_params['withdrawal_schedule']))
+        print(f'\n-- Re-drawing the band at the adjusted spending ({usd(band_target)}) --')
+    decline_pct = find_decline(band_params, band_target, 0.75, is_historical, windows,
+                               sim_years, inheritor_rate, aged, guess_decline=20.0)
+    increase_pct = find_increase(band_params, band_target, 0.95, is_historical, windows,
+                                 sim_years, inheritor_rate, aged, guess_increase=10.0)
+    lower = total * (1.0 - decline_pct / 100.0)
+    upper = total * (1.0 + increase_pct / 100.0)
+
+    print('\n-- Stressed spending at the lower rail --')
+    stressed_params = dict(band_params)
+    for k in ('taxable_start', 'tda_start', 'tda_spouse_start', 'roth_start'):
+        stressed_params[k] = band_params.get(k, 0.0) * (1.0 - decline_pct / 100.0)
+    stressed_spending, _, _ = find_spending(stressed_params, band_target, 0.85, band_target * 0.85,
+                                            is_historical, windows, sim_years, inheritor_rate, aged)
+
+    decline_probs = hit_probabilities(-(decline_pct / 100.0), target_stock_pct)
+    increase_probs = hit_probabilities(increase_pct / 100.0, target_stock_pct)
 
     history_path = history_path or str(Path(plan_path).with_suffix('')) + '_checks.jsonl'
     prior = []
@@ -385,8 +422,7 @@ def main():
         print(f'  Odds of hitting upper   {increase_probs[3] * 100:.1f}% (3-mo) | {increase_probs[6] * 100:.1f}% (6-mo)')
     print(f'  History                  {n_checks} checks, {n_changes} spending changes')
     if verdict != 'OK':
-        print('  Note: band shown is at the pre-adjustment spending; the next')
-        print('  check re-draws it once the plan file carries the new amount.')
+        print('  Band shown is drawn at the adjusted (go-forward) spending.')
     print(f'{"=" * 56}')
     print(f'History appended: {history_path}')
 
