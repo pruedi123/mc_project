@@ -9,10 +9,16 @@ sys.path.insert(0, '/Users/paulruedi/Desktop/Updated Web Calcs/mc_project')
 from sim_engine import (
     get_all_historical_windows, run_historical_parallel,
     store_distribution_results, load_portfolio_factors, should_use_actual_allocation_columns,
-    PP_FACTORS, compute_run_pp_factors, simulate_withdrawals,
+    PP_FACTORS, compute_run_pp_factors, simulate_withdrawals, set_mc_seed,
 )
-from spending_safety import essential_reserve_analysis
+from spending_safety import essential_reserve_analysis, solve_essential_floor_for_reserve
 from plan_to_sim_params import build_sim_params_from_plan
+
+# Pin the guardrail inner-MC so repeated runs on identical inputs give
+# identical results (same canonical seed used by main.py and the fitting
+# room app) — without this, every run_full_process.py invocation draws from
+# an unseeded RNG and can return a different answer for the same plan.
+set_mc_seed(20260705)
 
 
 def build_sim_params(plan):
@@ -59,10 +65,12 @@ def find_spending(params, original_spending, target_pct, guess, is_historical, w
         # $1 tolerance: the withdrawal solver targets net spending +/- $0.50
         return float((run_avg >= planned_avg - 1.0).mean()), float(run_avg.min())
 
-    rate, min_avg = _run(guess)
-    if abs(rate - target_pct) <= 0.01:
-        return round(guess / 1000) * 1000, rate, min_avg
-
+    rate, _ = _run(guess)
+    # No early-return here even when the first guess already lands within
+    # tolerance of target_pct — a guess this close to a HIGH target (e.g.
+    # 100%) may still be far below the true achievable ceiling (a modest
+    # guess like the UI default can trivially clear a loose success bar),
+    # so we must always bracket-and-bisect to find the actual boundary.
     if rate >= target_pct:
         lo, hi = guess, guess * 1.5
         for _ in range(5):
@@ -109,9 +117,9 @@ def find_decline(params, spending_target, target_rate, is_historical, windows, s
         return float((run_avg >= spending_target - 1.0).mean())
 
     rate = _run(guess_decline)
-    if abs(rate - target_rate) <= 0.01:
-        return guess_decline
-
+    # No early-return on the first guess — see find_spending for why this
+    # shortcut is unsafe (a guess already near target_rate can still be far
+    # from the true boundary the bracket-and-bisect search would find).
     if rate > target_rate:
         lo, hi = guess_decline, min(guess_decline * 1.5, 90.0)
         for _ in range(5):
@@ -156,9 +164,9 @@ def find_increase(params, spending_target, target_rate, is_historical, windows, 
         return float((run_avg >= spending_target - 1.0).mean())
 
     rate = _run(guess_increase)
-    if abs(rate - target_rate) <= 0.01:
-        return guess_increase
-
+    # No early-return on the first guess — see find_spending for why this
+    # shortcut is unsafe (a guess already near target_rate can still be far
+    # from the true boundary the bracket-and-bisect search would find).
     if rate < target_rate:
         lo, hi = guess_increase, min(guess_increase * 1.5, 200.0)
         for _ in range(5):
@@ -193,9 +201,11 @@ def find_increase(params, spending_target, target_rate, is_historical, windows, 
 if __name__ == '__main__':
     # ── Load plan JSON ──
     # Usage: python run_full_process.py [plan.json] [--target-pct 0.90] [--shortfall-pct 80]
+    #        [--reserve-amount 50000]
     target_pct_override = 0.90
     shortfall_pct = 80.0
     redline_override = None
+    reserve_amount_override = None
     skip_next = False
     positional_args = []
     for i, a in enumerate(sys.argv[1:], 1):
@@ -210,6 +220,9 @@ if __name__ == '__main__':
             skip_next = True
         elif a == '--redline':
             redline_override = float(sys.argv[i + 1])
+            skip_next = True
+        elif a == '--reserve-amount':
+            reserve_amount_override = float(sys.argv[i + 1])
             skip_next = True
         elif not a.startswith('--'):
             positional_args.append(a)
@@ -256,6 +269,9 @@ if __name__ == '__main__':
     ideal_spending = float(plan.get('ideal_spending') or plan.get('spending', {}).get('ideal') or original_spending)
     acceptable_spending = float(plan.get('acceptable_spending') or plan.get('spending', {}).get('acceptable') or ideal_spending * 0.90)
     redline_spending = float(redline_override or plan.get('redline_spending') or plan.get('essential_spending') or plan.get('spending', {}).get('redline') or ideal_spending * 0.80)
+    # 0/absent = skip the reserve-protected floor solve entirely (opt-in,
+    # since most plans don't carry a stated cash-reserve bucket).
+    reserve_amount = float(reserve_amount_override if reserve_amount_override is not None else (plan.get('reserve_amount') or 0.0))
 
     # ── Phase 2: Initial simulation ──
     print("\n=== PHASE 2: Initial simulation ===")
@@ -295,6 +311,26 @@ if __name__ == '__main__':
     after_ess = reserve_analysis['after_reserve']['essential']
     print(f"  Essential reserve needed: ${reserve_analysis['reserve_needed']:,.0f} "
           f"({before_ess['runs_below']} runs below before, {after_ess['runs_below']} after)")
+
+    # ── Reserve Protected Floor Solver (opt-in via --reserve-amount or plan['reserve_amount']) ──
+    # Same solve_essential_floor_for_reserve used by main.py's interactive
+    # "Reserve Protected Floor Solver" and the fitting-room site's export —
+    # given a stated cash reserve held OUTSIDE the portfolio, finds the
+    # highest essential floor that reserve can fully protect across every
+    # historical run, rather than essential_reserve_analysis's reverse
+    # direction (fixed floor -> reserve needed).
+    reserve_floor_result = None
+    if reserve_amount > 0:
+        print(f"\n=== Reserve Protected Floor Solver (${reserve_amount:,.0f} reserve) ===")
+        t1 = time.time()
+        reserve_floor_result = solve_essential_floor_for_reserve(
+            all_yearly2, reserve_amount=reserve_amount, max_floor=found_spending)
+        rf_analysis = reserve_floor_result['analysis']
+        print(f"  >> Protected floor: ${reserve_floor_result['essential_floor']:,.0f}/yr "
+              f"(reserve needed: ${reserve_floor_result['reserve_needed']:,.0f}, "
+              f"unused: ${reserve_floor_result['unused_reserve']:,.0f}) ({time.time()-t1:.1f}s)")
+        print(f"     Minimum year after reserve: ${rf_analysis['after_reserve']['minimum_year']:,.0f}, "
+              f"max breach-years in one run: {rf_analysis['max_breach_years_in_one_run']}")
 
     # After-tax ending balance distribution
     after_tax_ends = np.array([r['after_tax_end'] for r in results2])
@@ -437,6 +473,12 @@ if __name__ == '__main__':
 
     # ── Final Summary ──
     elapsed = time.time() - t0
+    reserve_floor_line = ""
+    if reserve_floor_result is not None:
+        reserve_floor_line = (
+            f"  Reserve-protected floor      ${reserve_floor_result['essential_floor']:,.0f}/yr "
+            f"(${reserve_amount:,.0f} reserve)\n"
+        )
     print(f"""
 {'='*60}
            FULL PROCESS SUMMARY
@@ -445,7 +487,7 @@ if __name__ == '__main__':
   Optimal spending (90%)      ${found_spending:,.0f}/yr
   Essential reserve needed    ${reserve_analysis['reserve_needed']:,.0f}
   Essential floor (100%)      ${found_min:,.0f}/yr
-  Decline to reach 75%        {decline_pct:.1f}% (-${dollar_drop:,.0f})
+{reserve_floor_line}  Decline to reach 75%        {decline_pct:.1f}% (-${dollar_drop:,.0f})
   Decline prob (3-mo)         Hist: {empirical_prob*100:.1f}% | Sim: {simulated_prob*100:.1f}%
   Increase to reach 95%       {increase_pct:.1f}% (+${dollar_gain:,.0f})
   Increase prob (3-mo)        Hist: {empirical_prob_up*100:.1f}% | Sim: {simulated_prob_up*100:.1f}%
