@@ -234,6 +234,15 @@ def build_sim_params_from_plan(plan: dict, return_mode: str | None = None) -> Di
         taxable_start,
     )
 
+    # Default estate goal: maintain the starting balance — investable portfolio
+    # (after any mortgage payoff) plus the stated cash reserve. An explicit
+    # "legacy_target" in the plan overrides; 0 means no estate goal.
+    if "legacy_target" in plan:
+        legacy_target = float(plan.get("legacy_target") or 0.0)
+    else:
+        legacy_target = (taxable_start + tda_start + tda_spouse_start + roth_start
+                         + float(plan.get("reserve_amount") or 0.0))
+
     sim_params = dict(
         start_age_primary=int(plan["start_age"]),
         start_age_spouse=int(plan["start_age_spouse"]),
@@ -292,7 +301,7 @@ def build_sim_params_from_plan(plan: dict, return_mode: str | None = None) -> Di
         guardrail_max_spending_pct=float(plan.get("guardrail_max_spending_pct", 25.0)),
         guardrail_year1_literal=bool(plan.get("guardrail_year1_literal", False)),
         guardrail_cap_release_underwater=bool(plan.get("guardrail_cap_release_underwater", False)),
-        legacy_target=float(plan.get("legacy_target", 0.0)),
+        legacy_target=legacy_target,
         taxes_enabled=bool(plan.get("taxes_enabled", True)),
         goal_schedule=goals["goal_schedule"],
         flex_goal_schedule=goals["flex_goal_schedule"],

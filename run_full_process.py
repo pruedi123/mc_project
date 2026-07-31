@@ -265,7 +265,18 @@ if __name__ == '__main__':
     print(f"Portfolio: taxable=${plan['taxable_start']:,.0f}  TDA=${plan['tda_start']:,.0f}  "
           f"TDA-spouse=${plan['tda_spouse_start']:,.0f}  Roth=${plan['roth_start']:,.0f}")
 
+    # Resolve the reserve override before translation so the default legacy
+    # goal (starting portfolio + stated cash reserve) can see it.
+    if reserve_amount_override is not None:
+        plan['reserve_amount'] = reserve_amount_override
+
     sim_params, sim_years, target_stock_pct, base_spending, use_actual_allocation_columns, translated = build_sim_params(plan)
+    _legacy = float(sim_params.get('legacy_target', 0.0))
+    if 'legacy_target' in plan:
+        print(f"Legacy goal: ${_legacy:,.0f} (from plan)" if _legacy > 0
+              else "Legacy goal: none (plan sets 0)")
+    else:
+        print(f"Legacy goal: ${_legacy:,.0f} (default: starting portfolio + reserve)")
     inheritor_rate = translated['inheritor_marginal_rate']
     ending_balance_goal = translated['ending_balance_goal']
     is_historical = 'Historical' in plan.get('return_mode', 'Historical')
