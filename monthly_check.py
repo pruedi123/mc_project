@@ -117,6 +117,18 @@ def usd(v):
     return f'${v:,.0f}'
 
 
+MONTH_NAMES = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
+               'August', 'September', 'October', 'November', 'December')
+
+
+def next_anniversary_label(plan_start, elapsed_years):
+    """Month-name label for the start of the next plan year — the point where
+    a year lops off the horizon and the band re-draws structurally."""
+    y, m = parse_month(plan_start)
+    total = (y * 12 + (m - 1)) + (elapsed_years + 1) * 12
+    return f'{MONTH_NAMES[total % 12]} {total // 12}'
+
+
 def render_report(ctx, out_path):
     """Lean one-page client check-in: verdict, band, what-would-change-it.
     No success percentages — dollar band + hit likelihood only."""
@@ -147,17 +159,22 @@ def render_report(ctx, out_path):
         floor_note = (f"<p class=\"floor-note\"><strong>{usd(ctx['essential'])}</strong> of your spending is "
                       f"protected as essential &mdash; it is never reduced by the guardrails.</p>")
     dp = ctx['decline_probs']
+    h2 = ctx['months_to_anniv']
+    anniv = ctx['anniv_label']
+    h2_desc = f"the {h2} month{'s' if h2 != 1 else ''} before your plan re-sets for its next year in {anniv}"
     if dp:
-        drop_freq = (f"A drop that size within three months has happened in {dp[3] * 100:.1f}% of "
-                     f"all three-month stretches since 1927; within six months, {dp[6] * 100:.1f}%."
-                     if max(dp.values()) > 0 else
-                     "A drop that size within a single quarter &mdash; or even six months &mdash; "
-                     "has never happened in 99 years of market history.")
+        if max(dp.values()) > 0:
+            drop_freq = (f"A drop that size within three months has happened in {dp[3] * 100:.1f}% of "
+                         f"all three-month stretches since 1927. The odds of it happening in "
+                         f"{h2_desc}: {dp.get(h2, dp[3]) * 100:.1f}%.")
+        else:
+            drop_freq = (f"A drop that size has never happened within three months &mdash; or within "
+                         f"{h2_desc} &mdash; in 99 years of market history.")
     else:
         drop_freq = ''
     up = ctx['increase_probs']
-    up_freq = (f"Historically, {up[3] * 100:.1f}% of three-month stretches and {up[6] * 100:.1f}% of "
-               f"six-month stretches gained this much." if up else '')
+    up_freq = (f"Historically, {up[3] * 100:.1f}% of three-month stretches gained this much; the odds "
+               f"of it happening in {h2_desc}: {up.get(h2, up[3]) * 100:.1f}%." if up else '')
     history_line = ''
     if ctx['n_checks'] > 0:
         changes = ctx['n_changes']
@@ -389,8 +406,14 @@ def main():
     stressed_spending, _, _ = find_spending(stressed_params, band_target, 0.85, band_target * 0.85,
                                             is_historical, windows, sim_years, inheritor_rate, aged)
 
-    decline_probs = hit_probabilities(-(decline_pct / 100.0), target_stock_pct)
-    increase_probs = hit_probabilities(increase_pct / 100.0, target_stock_pct)
+    # Horizons: 3 months as the steady near-term gauge, plus the months left
+    # until the plan's next anniversary — the odds a change lands before this
+    # plan year rolls, which naturally shrink as the year progresses.
+    months_to_anniv = 12 - month_of_year
+    anniv_label = next_anniversary_label(plan_start, elapsed_years)
+    horizons = (3, months_to_anniv) if months_to_anniv != 3 else (3,)
+    decline_probs = hit_probabilities(-(decline_pct / 100.0), target_stock_pct, horizons)
+    increase_probs = hit_probabilities(increase_pct / 100.0, target_stock_pct, horizons)
 
     history_path = history_path or str(Path(plan_path).with_suffix('')) + '_checks.jsonl'
     prior = []
@@ -418,8 +441,13 @@ def main():
   Spending                 {usd(new_spending)}/yr  ({usd(new_spending / 12)}/month)
   If it falls to the rail  {usd(stressed_spending)}/yr""")
     if decline_probs:
-        print(f'  Odds of hitting lower   {decline_probs[3] * 100:.1f}% (3-mo) | {decline_probs[6] * 100:.1f}% (6-mo)')
-        print(f'  Odds of hitting upper   {increase_probs[3] * 100:.1f}% (3-mo) | {increase_probs[6] * 100:.1f}% (6-mo)')
+        def _fmt_probs(probs):
+            parts = [f'{probs[3] * 100:.1f}% (3-mo)']
+            if months_to_anniv != 3:
+                parts.append(f'{probs[months_to_anniv] * 100:.1f}% (by {anniv_label}, {months_to_anniv} mo)')
+            return ' | '.join(parts)
+        print(f'  Odds of hitting lower   {_fmt_probs(decline_probs)}')
+        print(f'  Odds of hitting upper   {_fmt_probs(increase_probs)}')
     print(f'  History                  {n_checks} checks, {n_changes} spending changes')
     if verdict != 'OK':
         print('  Band shown is drawn at the adjusted (go-forward) spending.')
@@ -434,6 +462,7 @@ def main():
             'stressed_spending': stressed_spending, 'essential': essential,
             'legacy': pinned_legacy, 'decline_probs': decline_probs,
             'increase_probs': increase_probs,
+            'months_to_anniv': months_to_anniv, 'anniv_label': anniv_label,
             'n_checks': n_checks, 'n_changes': n_changes,
         }, report_path)
         print(f'Report written: {report_path}')
