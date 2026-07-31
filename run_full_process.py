@@ -52,11 +52,37 @@ def run_sim(params, is_historical, windows, sim_years, inheritor_rate, plan):
 
 
 def find_spending(params, original_spending, target_pct, guess, is_historical, windows, sim_years, inheritor_rate, plan, tol=1000.0, max_iter=15):
+    goal_schedule = params.get('goal_schedule')
+    flex_goal_schedule = params.get('flex_goal_schedule')
+
     def _run(spend_amt):
         test_params = dict(params)
-        scale = spend_amt / original_spending if original_spending > 0 else 1.0
-        test_schedule = [v * scale for v in test_params['withdrawal_schedule']]
-        test_params['withdrawal_schedule'] = test_schedule
+        base_schedule = test_params['withdrawal_schedule']
+        if goal_schedule is not None or flex_goal_schedule is not None:
+            # Essential dollars are a fixed floor (never scaled, matching how
+            # compute_prioritized_target treats them at simulate time) — only
+            # the flexible + base portion moves toward spend_amt. Scaling the
+            # combined schedule uniformly here would silently drive the
+            # implied base below zero once spend_amt dips under the fixed
+            # essential+flex total, breaking the guardrail's cut-priority math.
+            n = len(base_schedule)
+            essential_arr = goal_schedule if goal_schedule is not None else [0.0] * n
+            flex_arr = flex_goal_schedule if flex_goal_schedule is not None else [0.0] * n
+            essential_avg = float(np.mean(essential_arr))
+            scalable_original = original_spending - essential_avg
+            scalable_scale = max(0.0, (spend_amt - essential_avg) / scalable_original) if scalable_original > 0 else 1.0
+            new_flex = [f * scalable_scale for f in flex_arr]
+            test_schedule = []
+            for i in range(n):
+                base_i = base_schedule[i] - essential_arr[i] - flex_arr[i]
+                test_schedule.append(essential_arr[i] + new_flex[i] + base_i * scalable_scale)
+            test_params['withdrawal_schedule'] = test_schedule
+            if flex_goal_schedule is not None:
+                test_params['flex_goal_schedule'] = new_flex
+        else:
+            scale = spend_amt / original_spending if original_spending > 0 else 1.0
+            test_schedule = [v * scale for v in base_schedule]
+            test_params['withdrawal_schedule'] = test_schedule
         # Grade against the scaled schedule's planned AVERAGE (== spend_amt for
         # flat plans) so go-go/slow-go schedules aren't judged on period 1 alone.
         planned_avg = float(np.mean(test_schedule)) if test_schedule else spend_amt
@@ -201,11 +227,12 @@ def find_increase(params, spending_target, target_rate, is_historical, windows, 
 if __name__ == '__main__':
     # ── Load plan JSON ──
     # Usage: python run_full_process.py [plan.json] [--target-pct 0.90] [--shortfall-pct 80]
-    #        [--reserve-amount 50000]
+    #        [--reserve-amount 50000] [--withdrawal-rate 0.04]
     target_pct_override = 0.90
     shortfall_pct = 80.0
     redline_override = None
     reserve_amount_override = None
+    withdrawal_rate_override = None
     skip_next = False
     positional_args = []
     for i, a in enumerate(sys.argv[1:], 1):
@@ -223,6 +250,9 @@ if __name__ == '__main__':
             skip_next = True
         elif a == '--reserve-amount':
             reserve_amount_override = float(sys.argv[i + 1])
+            skip_next = True
+        elif a == '--withdrawal-rate':
+            withdrawal_rate_override = float(sys.argv[i + 1])
             skip_next = True
         elif not a.startswith('--'):
             positional_args.append(a)
@@ -256,7 +286,17 @@ if __name__ == '__main__':
     income_sum = (plan.get('ss_income', 0) + plan.get('ss_income_spouse', 0) +
         plan.get('pension_income', 0) + plan.get('pension_income_spouse', 0) + plan.get('other_income', 0) +
         sim_params.get('annuity_income_p1', 0.0) + sim_params.get('annuity_income_p2', 0.0))
-    if base_spending <= 0:
+    if withdrawal_rate_override is not None:
+        # Classic withdrawal-rate goal (4%, 4.5%, etc.) instead of a solved
+        # number — replaces any entered/multi-period schedule with one flat
+        # rate-based figure, since the point is to stress-test the plain
+        # textbook heuristic against history, not layer it onto other goals.
+        rate_dollars = portfolio_total * withdrawal_rate_override
+        auto_spending = round((rate_dollars + income_sum) / 1000) * 1000
+        sim_params['withdrawal_schedule'] = [auto_spending] * len(sim_params['withdrawal_schedule'])
+        print(f"  {withdrawal_rate_override*100:.1f}% of ${portfolio_total:,.0f} = ${rate_dollars:,.0f} + "
+              f"${income_sum:,.0f} income = ${auto_spending:,.0f}/yr")
+    elif base_spending <= 0:
         auto_spending = round((four_pct + income_sum) / 1000) * 1000
         # Layer auto-spending on top of the translated schedule (which may
         # already carry add_goal amounts) instead of replacing it.
@@ -284,14 +324,23 @@ if __name__ == '__main__':
     initial_success = dist.get('mc_spending_success_rate', 0)
     print(f"  Spending ${original_spending:,.0f}/yr -> {initial_success*100:.0f}% ideal success ({time.time()-t1:.1f}s)")
 
-    # ── Phase 3: Spending Finder ──
-    print(f"\n=== PHASE 3: Find spending at {target_pct_override*100:.0f}% ideal success ===")
-    t1 = time.time()
-    found_spending, found_rate, found_min = find_spending(
-        sim_params, original_spending, target_pct=target_pct_override, guess=original_spending,
-        is_historical=is_historical, windows=windows, sim_years=sim_years,
-        inheritor_rate=inheritor_rate, plan=plan)
-    print(f"  >> ${found_spending:,.0f}/yr ({found_rate*100:.0f}% ideal) | Essential floor: ${found_min:,.0f} ({time.time()-t1:.1f}s)")
+    # ── Phase 3: Spending Finder (skipped in withdrawal-rate mode) ──
+    if withdrawal_rate_override is not None:
+        print(f"\n=== PHASE 3: Skipped (using the {withdrawal_rate_override*100:.1f}% withdrawal-rate goal as-is) ===")
+        run_avg_initial = all_yearly.groupby('run')['after_tax_spending'].mean()
+        found_spending = auto_spending
+        found_rate = initial_success
+        found_min = float(run_avg_initial.min())
+        print(f"  >> ${found_spending:,.0f}/yr entered | Historical worst 30-yr avg: ${found_min:,.0f} "
+              f"| Median 30-yr avg: ${run_avg_initial.median():,.0f}")
+    else:
+        print(f"\n=== PHASE 3: Find spending at {target_pct_override*100:.0f}% ideal success ===")
+        t1 = time.time()
+        found_spending, found_rate, found_min = find_spending(
+            sim_params, original_spending, target_pct=target_pct_override, guess=original_spending,
+            is_historical=is_historical, windows=windows, sim_years=sim_years,
+            inheritor_rate=inheritor_rate, plan=plan)
+        print(f"  >> ${found_spending:,.0f}/yr ({found_rate*100:.0f}% ideal) | Essential floor: ${found_min:,.0f} ({time.time()-t1:.1f}s)")
 
     # ── Phase 4: Re-run with found spending ──
     print("\n=== PHASE 4: Re-run simulation at found spending ===")
@@ -311,6 +360,18 @@ if __name__ == '__main__':
     after_ess = reserve_analysis['after_reserve']['essential']
     print(f"  Essential reserve needed: ${reserve_analysis['reserve_needed']:,.0f} "
           f"({before_ess['runs_below']} runs below before, {after_ess['runs_below']} after)")
+
+    withdrawal_rate_stats = None
+    if withdrawal_rate_override is not None:
+        run_avg2 = all_yearly2.groupby('run')['after_tax_spending'].mean()
+        withdrawal_rate_stats = {
+            'lowest_single_year': float(all_yearly2['after_tax_spending'].min()),
+            'lowest_30yr_avg': float(run_avg2.min()),
+            'median_30yr_avg': float(run_avg2.median()),
+        }
+        print(f"\n  Lowest single year (any window):   ${withdrawal_rate_stats['lowest_single_year']:,.0f}")
+        print(f"  Lowest 30-yr average (worst window): ${withdrawal_rate_stats['lowest_30yr_avg']:,.0f}")
+        print(f"  Median 30-yr average (50th pctile):   ${withdrawal_rate_stats['median_30yr_avg']:,.0f}")
 
     # ── Reserve Protected Floor Solver (opt-in via --reserve-amount or plan['reserve_amount']) ──
     # Same solve_essential_floor_for_reserve used by main.py's interactive
@@ -479,15 +540,28 @@ if __name__ == '__main__':
             f"  Reserve-protected floor      ${reserve_floor_result['essential_floor']:,.0f}/yr "
             f"(${reserve_amount:,.0f} reserve)\n"
         )
+    if withdrawal_rate_override is not None:
+        spending_label = f"Spending ({withdrawal_rate_override*100:.1f}% rule)"
+        floor_label = "Lowest 30-yr average"
+        floor_value = withdrawal_rate_stats['lowest_30yr_avg']
+        withdrawal_rate_line = (
+            f"  Lowest single year           ${withdrawal_rate_stats['lowest_single_year']:,.0f}\n"
+            f"  Median 30-yr average         ${withdrawal_rate_stats['median_30yr_avg']:,.0f}\n"
+        )
+    else:
+        spending_label = "Optimal spending (90%)"
+        floor_label = "Essential floor (100%)"
+        floor_value = found_min
+        withdrawal_rate_line = ""
     print(f"""
 {'='*60}
            FULL PROCESS SUMMARY
 {'='*60}
   Starting portfolio          ${orig_total:,.0f}
-  Optimal spending (90%)      ${found_spending:,.0f}/yr
+  {spending_label + ' ' * max(0, 28 - len(spending_label))}${found_spending:,.0f}/yr
   Essential reserve needed    ${reserve_analysis['reserve_needed']:,.0f}
-  Essential floor (100%)      ${found_min:,.0f}/yr
-{reserve_floor_line}  Decline to reach 75%        {decline_pct:.1f}% (-${dollar_drop:,.0f})
+  {floor_label + ' ' * max(0, 28 - len(floor_label))}${floor_value:,.0f}/yr
+{withdrawal_rate_line}{reserve_floor_line}  Decline to reach 75%        {decline_pct:.1f}% (-${dollar_drop:,.0f})
   Decline prob (3-mo)         Hist: {empirical_prob*100:.1f}% | Sim: {simulated_prob*100:.1f}%
   Increase to reach 95%       {increase_pct:.1f}% (+${dollar_gain:,.0f})
   Increase prob (3-mo)        Hist: {empirical_prob_up*100:.1f}% | Sim: {simulated_prob_up*100:.1f}%
