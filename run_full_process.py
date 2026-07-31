@@ -497,9 +497,10 @@ if __name__ == '__main__':
     reduced_total = orig_total * decline_factor
     dollar_drop = orig_total - reduced_total
 
-    # Historical probability of this decline (3-month horizon)
+    # Historical probability of this decline (3- and 6-month horizons) from the
+    # monthly wealth path implied by the 12-month rolling allocation factors.
     allocation_f = load_portfolio_factors(target_stock_pct, use_actual_allocation_columns)
-    horizon_months = 3
+    GUARDRAIL_HORIZONS = (3, 6)
 
     def _extract_monthly(factors_12mo):
         nn = len(factors_12mo)
@@ -511,25 +512,60 @@ if __name__ == '__main__':
             monthly[t + 12] = monthly[t] * factors_12mo[t + 1] / factors_12mo[t]
         return monthly
 
-    allocation_monthly = _extract_monthly(allocation_f)
-    wealth = np.concatenate([[1.0], np.cumprod(allocation_monthly)])
-    w = wealth[12:]
-    rolling_rets = w[horizon_months:] / w[:len(w) - horizon_months] - 1.0
-    n_declines = int(np.sum(rolling_rets <= -(decline_pct / 100.0)))
-    empirical_prob = n_declines / len(rolling_rets) if len(rolling_rets) > 0 else 0.0
+    # Prefer the true monthly return panel (bootstrap-returns) — the 12-month
+    # rolling workbook factors cannot recover short-horizon moves, and the
+    # flat-seed reconstruction badly overstates 3/6-month decline frequency.
+    _PANEL_CSV = '/Users/paulruedi/Desktop/Updated Web Calcs/bootstrap-returns/data/global_panel.csv'
+    w = None
+    monthly_source = 'reconstructed from 12-mo factors'
+    try:
+        _panel = pd.read_csv(_PANEL_CSV)
+        _pct = target_stock_pct * 100.0 if target_stock_pct <= 1.0 else float(target_stock_pct)
+        _col = f"{int(round(_pct / 10.0) * 10)}E"
+        if _col in _panel.columns:
+            _r = _panel[_col].to_numpy(dtype=float)
+            w = np.concatenate([[1.0], np.cumprod(1.0 + _r)])
+            monthly_source = f'true monthly panel, {_col}'
+    except Exception:
+        pass
+    if w is None:
+        allocation_monthly = _extract_monthly(allocation_f)
+        wealth = np.concatenate([[1.0], np.cumprod(allocation_monthly)])
+        w = wealth[12:]
 
     def _norm_cdf(x):
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
     annual_log_rets = np.log(allocation_f)
     mu = float(np.mean(annual_log_rets))
     sigma = float(np.std(annual_log_rets))
-    frac = horizon_months / 12.0
-    mu_h = mu * frac; sigma_h = sigma * np.sqrt(frac)
-    log_thr = np.log(1.0 - decline_pct / 100.0)
-    simulated_prob = _norm_cdf((log_thr - mu_h) / sigma_h)
+
+    def _move_probs(move_frac):
+        """{horizon_months: (historical, lognormal)} probability of a rolling
+        return <= move_frac (declines, move_frac < 0) or >= it (gains).
+        Historical = share of all overlapping monthly-start windows."""
+        out = {}
+        for h in GUARDRAIL_HORIZONS:
+            rolling = w[h:] / w[:len(w) - h] - 1.0
+            if len(rolling) == 0:
+                out[h] = (0.0, 0.0)
+                continue
+            emp = float(np.mean(rolling <= move_frac if move_frac < 0 else rolling >= move_frac))
+            frac = h / 12.0
+            mu_h = mu * frac; sigma_h = sigma * np.sqrt(frac)
+            z = (np.log(1.0 + move_frac) - mu_h) / sigma_h
+            out[h] = (emp, _norm_cdf(z) if move_frac < 0 else 1.0 - _norm_cdf(z))
+        return out
+
+    def _prob_line(probs):
+        hist = " / ".join(f"{probs[h][0]*100:.1f}% ({h}-mo)" for h in GUARDRAIL_HORIZONS)
+        sim = " / ".join(f"{probs[h][1]*100:.1f}% ({h}-mo)" for h in GUARDRAIL_HORIZONS)
+        return f"Historical prob ({monthly_source}): {hist} | Simulated: {sim}"
+
+    decline_probs = _move_probs(-(decline_pct / 100.0))
+    empirical_prob, simulated_prob = decline_probs[3]
 
     print(f"  >> {decline_pct:.1f}% decline (${orig_total:,.0f} -> ${reduced_total:,.0f}, -${dollar_drop:,.0f})")
-    print(f"     Historical prob: {empirical_prob*100:.1f}% | Simulated prob: {simulated_prob*100:.1f}% (3-month horizon)")
+    print(f"     {_prob_line(decline_probs)}")
     print(f"     ({time.time()-t1:.1f}s)")
 
     # ── Phase 5b: Balance Increase Finder (95% target) ──
@@ -542,14 +578,12 @@ if __name__ == '__main__':
     increased_total = orig_total * increase_factor
     dollar_gain = increased_total - orig_total
 
-    # Historical probability of this gain (3-month horizon, same rolling series as decline)
-    n_gains = int(np.sum(rolling_rets >= (increase_pct / 100.0)))
-    empirical_prob_up = n_gains / len(rolling_rets) if len(rolling_rets) > 0 else 0.0
-    log_thr_up = np.log(1.0 + increase_pct / 100.0)
-    simulated_prob_up = 1.0 - _norm_cdf((log_thr_up - mu_h) / sigma_h)
+    # Historical probability of this gain (same monthly wealth path as decline)
+    increase_probs = _move_probs(increase_pct / 100.0)
+    empirical_prob_up, simulated_prob_up = increase_probs[3]
 
     print(f"  >> {increase_pct:.1f}% increase (${orig_total:,.0f} -> ${increased_total:,.0f}, +${dollar_gain:,.0f})")
-    print(f"     Historical prob: {empirical_prob_up*100:.1f}% | Simulated prob: {simulated_prob_up*100:.1f}% (3-month horizon)")
+    print(f"     {_prob_line(increase_probs)}")
     print(f"     ({time.time()-t1:.1f}s)")
 
     # ── Phase 6: Stressed Spending (85% target at declined balances) ──
@@ -599,9 +633,9 @@ if __name__ == '__main__':
   Essential reserve needed    ${reserve_analysis['reserve_needed']:,.0f}
   {floor_label + ' ' * max(0, 28 - len(floor_label))}${floor_value:,.0f}/yr
 {withdrawal_rate_line}{reserve_floor_line}  Decline to reach 75%        {decline_pct:.1f}% (-${dollar_drop:,.0f})
-  Decline prob (3-mo)         Hist: {empirical_prob*100:.1f}% | Sim: {simulated_prob*100:.1f}%
+  Decline prob (hist)         {decline_probs[3][0]*100:.1f}% (3-mo) | {decline_probs[6][0]*100:.1f}% (6-mo)
   Increase to reach 95%       {increase_pct:.1f}% (+${dollar_gain:,.0f})
-  Increase prob (3-mo)        Hist: {empirical_prob_up*100:.1f}% | Sim: {simulated_prob_up*100:.1f}%
+  Increase prob (hist)        {increase_probs[3][0]*100:.1f}% (3-mo) | {increase_probs[6][0]*100:.1f}% (6-mo)
   Stressed portfolio           ${reduced_total:,.0f}
   Stressed spending (85%)     ${stressed_spending:,.0f}/yr
   Spending change if decline  {'+'if spending_delta>=0 else '-'}${abs(spending_delta):,.0f}/yr ({spending_delta/found_spending*100:+.1f}%)
