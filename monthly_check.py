@@ -98,19 +98,21 @@ def render_report(ctx, out_path):
         verdict_html = (
             f"<h1><span class=\"check\">&#10003;</span>You're OK.</h1>"
             f"<p class=\"walkaway\">Your plan is on track. You can spend "
-            f"<strong>{usd(ctx['spending'])} this year</strong> ({usd(ctx['spending'] / 12)}/month), "
-            f"just as planned. Nothing needs to change.</p>")
+            f"<strong>{usd(ctx['spending'] / 12)} this month</strong>, just as planned &mdash; "
+            f"{usd(ctx['spending'])} for the year. Nothing needs to change.</p>")
     elif ctx['verdict'] == 'CUT':
         verdict_html = (
             f"<h1>A change this month.</h1>"
             f"<p class=\"walkaway\">Markets pulled your portfolio below its lower guardrail, so spending "
-            f"adjusts to <strong>{usd(ctx['new_spending'])} a year</strong> ({usd(ctx['new_spending'] / 12)}/month) "
+            f"adjusts to <strong>{usd(ctx['new_spending'] / 12)} a month</strong> "
+            f"({usd(ctx['new_spending'])} for the year) "
             f"until the plan recovers. This is the guardrail doing its job &mdash; not the plan failing.</p>")
     else:
         verdict_html = (
             f"<h1>Good news: a raise may be available.</h1>"
             f"<p class=\"walkaway\">Your portfolio is above its upper guardrail. The remaining plan supports "
-            f"about <strong>{usd(ctx['new_spending'])} a year</strong> &mdash; we'll confirm the raise after "
+            f"about <strong>{usd(ctx['new_spending'] / 12)} a month</strong> "
+            f"({usd(ctx['new_spending'])} a year) &mdash; we'll confirm the raise after "
             f"checking your family goal is still safe.</p>")
     floor_note = ''
     if ctx['essential'] > 0:
