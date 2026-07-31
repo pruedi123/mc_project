@@ -1516,6 +1516,7 @@ def simulate_withdrawals(start_age_primary: int,
 						 blended_sigma: float = 0.0,
 						 guardrail_max_spending_pct: float = -1.0,
 						 guardrail_year1_literal: bool = False,
+						 guardrail_cap_release_underwater: bool = False,
 						 taxes_enabled: bool = True,
 						 investment_fee_bps: float = 0.0,
 						 goal_schedule: Optional[Sequence[float]] = None,
@@ -1664,6 +1665,17 @@ def simulate_withdrawals(start_age_primary: int,
 		'prefer_tda_before_taxable': prefer_tda_before_taxable,
 	}
 
+	# Spending-cap release: armed only when a guardrail re-solve actually CUTS
+	# spending, anchored to the portfolio peak seen before that decline (real
+	# dollars). While armed, the raise cap is suspended so recovery re-solves
+	# can restore what the cut took away; it disarms — and the cap re-engages —
+	# once the portfolio climbs back to that pre-decline peak. Anchoring to a
+	# perpetually-ratcheting high-water mark instead is pathological: capped
+	# spending lets the portfolio balloon, any routine dip then sits "below
+	# peak," and the release fires everywhere, destroying the cap.
+	guardrail_hwm = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
+	cap_release_ref = None
+
 	# Track year of death for qualifying surviving spouse filing status
 	primary_death_year = None
 	spouse_death_year = None
@@ -1765,7 +1777,17 @@ def simulate_withdrawals(start_age_primary: int,
 					flex_goal_schedule=remaining_flex_goals,
 					flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential,
 					flex_capped_base_schedule=remaining_fcb, flex_cap_max_schedule=remaining_fcm)
+				# Recovered to the pre-decline peak: disarm the release and clamp
+				# any makeup raise back under the cap immediately — otherwise an
+				# above-cap scale lingers until the next rail trip and the ceiling
+				# is only nominally re-engaged.
+				if cap_release_ref is not None and total_portfolio_now >= cap_release_ref:
+					cap_release_ref = None
+					if guardrail_max_spending_pct >= 0:
+						max_scale = 1.0 + guardrail_max_spending_pct / 100.0
+						current_scale_factor = min(current_scale_factor, max_scale)
 				if sr < guardrail_lower or sr > guardrail_upper:
+					prior_scale = current_scale_factor
 					current_scale_factor = find_sustainable_scale_factor(
 						total_portfolio_now, remaining_schedule, blended_mu, blended_sigma,
 						guardrail_target, guardrail_inner_sims, income_schedule=remaining_income,
@@ -1773,10 +1795,15 @@ def simulate_withdrawals(start_age_primary: int,
 						flex_goal_schedule=remaining_flex_goals,
 						flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential,
 						flex_capped_base_schedule=remaining_fcb, flex_cap_max_schedule=remaining_fcm)
-					# Apply max spending cap to scale factor
-					if guardrail_max_spending_pct >= 0:
+					if (guardrail_cap_release_underwater and cap_release_ref is None and
+							current_scale_factor < prior_scale):
+						cap_release_ref = guardrail_hwm
+					cap_suspended = (guardrail_cap_release_underwater and
+						cap_release_ref is not None)
+					if guardrail_max_spending_pct >= 0 and not cap_suspended:
 						max_scale = 1.0 + guardrail_max_spending_pct / 100.0
 						current_scale_factor = min(current_scale_factor, max_scale)
+				guardrail_hwm = max(guardrail_hwm, total_portfolio_now)
 
 		start_stocks_mv = stocks_mv
 		start_bonds_mv = bonds_mv
