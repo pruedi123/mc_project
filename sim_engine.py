@@ -650,10 +650,13 @@ def compute_prioritized_target(scale_factor, base, flex_goals, essential_goals,
 
 def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu, blended_sigma, n_sims=200, income_schedule=None, goal_schedule=None,
 						 flex_goal_schedule=None, flex_goal_min_pct=0.5, base_is_essential=False,
-						 flex_capped_base_schedule=None, flex_cap_max_schedule=None):
+						 flex_capped_base_schedule=None, flex_cap_max_schedule=None,
+						 terminal_target=0.0):
 	"""Fast vectorized MC to estimate probability portfolio survives the remaining schedule.
 	If goal_schedule is provided, only the base portion (schedule - goals) is scaled;
-	goals are added unscaled on top."""
+	goals are added unscaled on top.
+	terminal_target: success additionally requires ending above this balance
+	(real dollars) — used for legacy-aware raise checks."""
 	years_remaining = len(remaining_schedule)
 	if years_remaining <= 0:
 		return 1.0
@@ -676,14 +679,16 @@ def forward_success_rate(portfolio, remaining_schedule, scale_factor, blended_mu
 		balances *= growth_factors[:, y]
 		balances -= net_draw
 		balances = np.maximum(balances, 0.0)
-	return float(np.mean(balances > 0))
+	return float(np.mean(balances > terminal_target))
 
 def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, blended_sigma, target_success=0.85, n_sims=200, tol=0.005, income_schedule=None, goal_schedule=None,
 								 flex_goal_schedule=None, flex_goal_min_pct=0.5, base_is_essential=False,
-								 flex_capped_base_schedule=None, flex_cap_max_schedule=None):
+								 flex_capped_base_schedule=None, flex_cap_max_schedule=None,
+								 terminal_target=0.0):
 	"""Binary search for the scaling factor on the remaining withdrawal schedule
 	that gives target_success survival rate.
-	If goal_schedule is provided, only the base portion is scaled; goals are unscaled."""
+	If goal_schedule is provided, only the base portion is scaled; goals are unscaled.
+	terminal_target: survival additionally requires ending above this balance."""
 	years_remaining = len(remaining_schedule)
 	if portfolio <= 0 or years_remaining <= 0:
 		return 0.0
@@ -706,7 +711,7 @@ def find_sustainable_scale_factor(portfolio, remaining_schedule, blended_mu, ble
 			balances *= growth_factors[:, y]
 			balances -= net_draw
 			balances = np.maximum(balances, 0.0)
-		return float(np.mean(balances > 0))
+		return float(np.mean(balances > terminal_target))
 
 	lo, hi = 0.0, 3.0
 	# expand hi if needed
@@ -1517,6 +1522,7 @@ def simulate_withdrawals(start_age_primary: int,
 						 guardrail_max_spending_pct: float = -1.0,
 						 guardrail_year1_literal: bool = False,
 						 guardrail_cap_release_underwater: bool = False,
+						 legacy_target: float = 0.0,
 						 taxes_enabled: bool = True,
 						 investment_fee_bps: float = 0.0,
 						 goal_schedule: Optional[Sequence[float]] = None,
@@ -1641,6 +1647,8 @@ def simulate_withdrawals(start_age_primary: int,
 		current_scale_factor = 1.0
 	elif guardrails_enabled:
 		total_portfolio_init = float(taxable_start) + float(tda_start) + float(tda_spouse_start) + float(roth_start)
+		# Initial solve is legacy-aware: starting spending should not overpromise
+		# against a terminal estate goal that raises would later have to defend.
 		current_scale_factor = find_sustainable_scale_factor(
 			total_portfolio_init, list(withdrawal_schedule), blended_mu, blended_sigma,
 			guardrail_target, guardrail_inner_sims, income_schedule=income_schedule,
@@ -1648,7 +1656,8 @@ def simulate_withdrawals(start_age_primary: int,
 			flex_goal_schedule=list(flex_goal_schedule) if flex_goal_schedule else None,
 			flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential,
 			flex_capped_base_schedule=list(flex_capped_base_schedule) if flex_capped_base_schedule else None,
-			flex_cap_max_schedule=list(flex_cap_max_schedule) if flex_cap_max_schedule else None)
+			flex_cap_max_schedule=list(flex_cap_max_schedule) if flex_cap_max_schedule else None,
+			terminal_target=legacy_target)
 		# Apply max spending cap to scale factor
 		if guardrail_max_spending_pct >= 0:
 			max_scale = 1.0 + guardrail_max_spending_pct / 100.0
@@ -1771,12 +1780,13 @@ def simulate_withdrawals(start_age_primary: int,
 			remaining_fcb = list(flex_capped_base_schedule[y-1:]) if flex_capped_base_schedule else None
 			remaining_fcm = list(flex_cap_max_schedule[y-1:]) if flex_cap_max_schedule else None
 			if len(remaining_schedule) > 1 and total_portfolio_now > 0:
-				sr = forward_success_rate(total_portfolio_now, remaining_schedule,
-					current_scale_factor, blended_mu, blended_sigma, guardrail_inner_sims,
-					income_schedule=remaining_income, goal_schedule=remaining_goals,
+				_sr_kwargs = dict(income_schedule=remaining_income, goal_schedule=remaining_goals,
 					flex_goal_schedule=remaining_flex_goals,
 					flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential,
 					flex_capped_base_schedule=remaining_fcb, flex_cap_max_schedule=remaining_fcm)
+				sr = forward_success_rate(total_portfolio_now, remaining_schedule,
+					current_scale_factor, blended_mu, blended_sigma, guardrail_inner_sims,
+					**_sr_kwargs)
 				# Recovered to the pre-decline peak: disarm the release and clamp
 				# any makeup raise back under the cap immediately — otherwise an
 				# above-cap scale lingers until the next rail trip and the ceiling
@@ -1786,15 +1796,41 @@ def simulate_withdrawals(start_age_primary: int,
 					if guardrail_max_spending_pct >= 0:
 						max_scale = 1.0 + guardrail_max_spending_pct / 100.0
 						current_scale_factor = min(current_scale_factor, max_scale)
-				if sr < guardrail_lower or sr > guardrail_upper:
+				# Asymmetric legacy handling: cuts are tested against SURVIVAL only
+				# (the retiree is never cut to protect the heirs). Raises come in
+				# two tiers: recovery back to the entered plan (scale 1.0) needs
+				# only the survival test — restoring what a decline took away is
+				# not a luxury, and gating it on the legacy would pin a crushed
+				# retiree at the floor for the heirs' benefit. Raises ABOVE plan
+				# must additionally defend the legacy target, so lifestyle upside
+				# only flows from genuine surplus above the estate goal.
+				needs_cut = sr < guardrail_lower
+				needs_raise = False
+				raise_terminal = 0.0
+				recovery_clamp = False
+				if not needs_cut and sr > guardrail_upper:
+					if legacy_target > 0:
+						sr_legacy = forward_success_rate(total_portfolio_now, remaining_schedule,
+							current_scale_factor, blended_mu, blended_sigma, guardrail_inner_sims,
+							terminal_target=legacy_target, **_sr_kwargs)
+						if sr_legacy > guardrail_upper:
+							needs_raise = True
+							raise_terminal = legacy_target
+						elif current_scale_factor < 1.0:
+							needs_raise = True
+							recovery_clamp = True
+						# else: at/above plan with the legacy not yet secure — hold
+					else:
+						needs_raise = True
+				if needs_cut or needs_raise:
 					prior_scale = current_scale_factor
 					current_scale_factor = find_sustainable_scale_factor(
 						total_portfolio_now, remaining_schedule, blended_mu, blended_sigma,
-						guardrail_target, guardrail_inner_sims, income_schedule=remaining_income,
-						goal_schedule=remaining_goals,
-						flex_goal_schedule=remaining_flex_goals,
-						flex_goal_min_pct=flex_goal_min_pct, base_is_essential=base_is_essential,
-						flex_capped_base_schedule=remaining_fcb, flex_cap_max_schedule=remaining_fcm)
+						guardrail_target, guardrail_inner_sims,
+						terminal_target=(raise_terminal if needs_raise else 0.0),
+						**_sr_kwargs)
+					if recovery_clamp:
+						current_scale_factor = min(current_scale_factor, 1.0)
 					if (guardrail_cap_release_underwater and cap_release_ref is None and
 							current_scale_factor < prior_scale):
 						cap_release_ref = guardrail_hwm

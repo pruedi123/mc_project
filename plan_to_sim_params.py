@@ -292,6 +292,7 @@ def build_sim_params_from_plan(plan: dict, return_mode: str | None = None) -> Di
         guardrail_max_spending_pct=float(plan.get("guardrail_max_spending_pct", 25.0)),
         guardrail_year1_literal=bool(plan.get("guardrail_year1_literal", False)),
         guardrail_cap_release_underwater=bool(plan.get("guardrail_cap_release_underwater", False)),
+        legacy_target=float(plan.get("legacy_target", 0.0)),
         taxes_enabled=bool(plan.get("taxes_enabled", True)),
         goal_schedule=goals["goal_schedule"],
         flex_goal_schedule=goals["flex_goal_schedule"],
